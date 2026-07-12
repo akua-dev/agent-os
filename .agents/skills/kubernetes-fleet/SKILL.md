@@ -20,6 +20,7 @@ Load this skill only when the current firstmate is running in Kubernetes or is e
 - Render the package with `akua render`, inspect or edit its ordinary YAML when useful, and apply it with `kubectl`.
 - Treat AI credentials as explicit per-mate grants, never as ambient inheritance merely because Firstmate can read them.
 - Create or select a Kubernetes Secret only after the grant is authorized, then pass its name as the package's `piAuthSecret` input.
+- Probe the selected model route before launching work; when quota is unavailable, use another explicitly granted provider or report the capacity blocker instead of repeatedly spawning agents.
 - Give every launched Herdr agent a task-unique name, close only a confirmed dead restored pane before reuse, and never replace a live agent.
 - Grade completion by the promised artifact or delivered Git state; Herdr `idle` alone is not a completion signal.
 - The package is optional; direct `akua render`, raw YAML, and `kubectl` remain supported.

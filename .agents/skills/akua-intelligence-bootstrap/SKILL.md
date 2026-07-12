@@ -58,9 +58,11 @@ Use the Platform MCP `search` tool again before a mutation so current schemas ou
     The Secret's `authorization` key contains the complete header consumed through `AKUA_AUTH_HEADER_FILE`.
 11. Render `tools/agent-os/packages/firstmate/package.k` with `akua render`, inspect the ordinary YAML, and apply it with `kubectl`.
 12. Verify the StatefulSet is ready, Herdr responds, the persistent home is writable, the `in-cluster` context is cluster-admin only in this intelligence cluster, and the Pod can list its Akua workspace through `curl -H @"$AKUA_AUTH_HEADER_FILE"`.
-13. From the clustered Firstmate, inventory all workspace token IDs and prove the new token can perform the required Akua and Kubernetes reads.
-14. Only after that handoff succeeds, revoke the known local bootstrap token and prove it now receives an authentication failure.
-15. Destroy every protected temporary file and record only non-secret resource IDs, operation IDs, timestamps, states, image digest, test results, costs, and interventions.
+13. Probe the approved primary model route with a bounded request and record only provider, model, result, timing, and cost.
+    If there is no independently approved fallback provider, record the single-provider availability risk instead of presenting the fleet as quota-resilient.
+14. From the clustered Firstmate, inventory all workspace token IDs and prove the new token can perform the required Akua and Kubernetes reads.
+15. Only after that handoff succeeds, revoke the known local bootstrap token and prove it now receives an authentication failure.
+16. Destroy every protected temporary file and record only non-secret resource IDs, operation IDs, timestamps, states, image digest, test results, costs, and interventions.
 
 ## Recovery and cleanup
 
@@ -77,6 +79,7 @@ The bootstrap is complete only when current external state proves all of these:
 - Akua operation IDs reached `SUCCEEDED`;
 - the worker is ready in Akua and Kubernetes;
 - the Firstmate StatefulSet and Herdr server are ready;
+- at least one approved model route completes a bounded request;
 - the home and installed-tool paths survive a Pod replacement;
 - the clustered token works from the Pod;
 - the bootstrap token is revoked and fails authentication;
