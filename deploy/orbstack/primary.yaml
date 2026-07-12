@@ -34,7 +34,6 @@ spec:
         app.kubernetes.io/name: agent-os
         app.kubernetes.io/component: firstmate
     spec:
-      hostUsers: false
       serviceAccountName: agent-os-firstmate
       securityContext:
         fsGroup: 0

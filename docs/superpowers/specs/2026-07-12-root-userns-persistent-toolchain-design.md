@@ -1,19 +1,19 @@
-# Root user-namespace and persistent toolchain design
+# Local root agents and persistent toolchain design
 
 **Date:** 2026-07-12
 
 ## Purpose
 
-Agent OS Pods must be able to administer their own container environment without becoming root on the Kubernetes node.
+Agent OS Pods must be able to administer their own container environment in the isolated local OrbStack cluster.
 The image must already contain the complete Firstmate toolchain so a fresh controller can begin useful work without an installation round.
 Tools and authentication added by an agent at runtime must survive Pod replacement.
 
 ## Decisions
 
-Every Agent OS Pod runs as UID 0 inside a Kubernetes Pod user namespace.
-Every Pod sets `hostUsers: false`, so Kubernetes maps container UID 0 to a distinct unprivileged host UID range.
-The deployment fails closed when the node, filesystem, container runtime, or cluster configuration cannot provide Pod user namespaces.
-No Agent OS Pod uses privileged mode, a host user namespace, a host PID namespace, a host IPC namespace, a host network namespace, a raw block device, or a host-path mount.
+Every Agent OS Pod runs as UID 0 inside its container.
+OrbStack's built-in Kubernetes uses cri-dockerd and rejects `hostUsers: false`, so the local demo does not request a Pod user namespace.
+Container root is therefore root on the dedicated OrbStack VM node for this local demo.
+No Agent OS Pod uses privileged mode, a host PID namespace, a host IPC namespace, a host network namespace, a raw block device, or a host-path mount.
 
 The image remains the reproducible baseline.
 Each agent receives its own PVC-backed home and persistent `/usr/local` tree for runtime adaptation.
@@ -59,17 +59,16 @@ An agent that needs an additional durable CLI should prefer `/usr/local` or a pe
 
 ## Pod security and authority
 
-The primary and crewmate containers set `runAsUser: 0` and `runAsGroup: 0` inside their Pod user namespace.
-The init container uses the same user namespace and container-root identity to seed the persistent tool tree.
-The Pods use the runtime's normal namespaced capabilities and do not request privileged mode.
+The primary and crewmate containers set `runAsUser: 0` and `runAsGroup: 0`.
+The init container uses the same container-root identity to seed the persistent tool tree.
+The Pods use the runtime's normal container isolation and do not request privileged mode.
 
 The Firstmate ServiceAccount retains cluster-admin only for the isolated local Agent OS cluster.
 Crewmates continue to receive no Kubernetes ServiceAccount token by default.
 Container root and Kubernetes API authority remain separate controls.
 
-Kubernetes v1.34 marks Pod user namespaces beta.
-The target node must use a compatible Linux kernel, idmapped-mount filesystem, containerd 2.0 or later or another supported CRI runtime, and a compatible OCI runtime.
-The local demo must verify the actual UID map rather than infer support from the Kubernetes version.
+This root policy is explicitly limited to the disposable, agents-only local OrbStack VM cluster.
+A remote or shared Agent OS cluster must define and verify its own stronger runtime isolation before reusing this policy.
 
 ## Startup flow
 
@@ -82,17 +81,15 @@ The local demo must verify the actual UID map rather than infer support from the
 
 ## Failure behavior
 
-The demo must refuse to claim readiness when Pod user namespaces are unavailable.
-The verification path checks `/proc/self/uid_map` and proves that container UID 0 maps to a nonzero host UID range.
 The image build stops on missing releases, unsupported architectures, checksum failures, or missing baseline commands.
 The init container stops startup if it cannot seed the persistent tool tree.
-No fallback silently removes `hostUsers: false` or grants privileged mode.
+No fallback grants privileged mode, host namespaces, or host mounts.
 
 ## Verification
 
-Static tests assert that both primary and generated crewmate Pod specs use `hostUsers: false` and container UID 0.
+Static tests assert that both primary and generated crewmate Pod specs use container UID 0 without requesting the unsupported `hostUsers: false` field.
 Container tests assert every baseline command is present and Firstmate bootstrap emits no `MISSING:` diagnostics.
-Runtime tests prove the Pod UID map is remapped, root can write to normal container paths, and durable installs can write to both persistent prefixes.
+Runtime tests prove root can write to normal container paths and durable installs can write to both persistent prefixes.
 Persistence tests write one tool below `/home/agent/.local/bin` and one below `/usr/local/bin`, replace the Pod, and execute both tools afterward.
 Isolation tests prove crewmates have distinct PVCs and no ServiceAccount token.
 Authentication verification checks that GitHub CLI configuration survives Pod replacement without embedding credentials in the image.
@@ -105,5 +102,5 @@ It does not define production-cluster RBAC beyond retaining the existing local-d
 
 ## Sources
 
-- Kubernetes v1.34 user-namespace documentation: <https://v1-34.docs.kubernetes.io/docs/concepts/workloads/pods/user-namespaces/>.
+- Kubernetes v1.34 user-namespace documentation, which records cri-dockerd as unsupported: <https://v1-34.docs.kubernetes.io/docs/concepts/workloads/pods/user-namespaces/>.
 - Firstmate's universal toolchain contract: `docs/configuration.md` under `Toolchain` and `bin/fm-bootstrap.sh`.
