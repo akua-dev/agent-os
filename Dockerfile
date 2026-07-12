@@ -85,13 +85,19 @@ RUN npm install --global \
 
 ENV FM_HOME=/home/agent \
     HOME=/home/agent \
+    XDG_CONFIG_HOME=/home/agent/.config \
+    XDG_DATA_HOME=/home/agent/.local/share \
+    XDG_CACHE_HOME=/home/agent/.cache \
+    NPM_CONFIG_PREFIX=/usr/local \
+    BUN_INSTALL=/home/agent/.bun \
+    CARGO_HOME=/home/agent/.cargo \
+    PATH=/home/agent/.local/bin:/home/agent/.bun/bin:/home/agent/.cargo/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin \
     HERDR_SESSION=default
 
-RUN mkdir -p /home/agent /opt/agent-os \
-  && chown -R node:node /home/agent /opt/agent-os
+RUN mkdir -p /home/agent /opt/agent-os /opt/image-usr-local \
+  && cp -a /usr/local/. /opt/image-usr-local/
 
-COPY --chown=node:node . /opt/agent-os
+COPY . /opt/agent-os
 
-USER node
 WORKDIR /opt/agent-os
 ENTRYPOINT ["/opt/agent-os/bin/agent-os-container-entrypoint.sh"]
