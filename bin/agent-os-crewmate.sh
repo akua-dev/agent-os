@@ -53,12 +53,21 @@ metadata:
     app.kubernetes.io/component: crewmate
     agent-os.akua.dev/crewmate: $ID
 spec:
+  hostUsers: false
   automountServiceAccountToken: false
   securityContext:
-    fsGroup: 1000
-    runAsGroup: 1000
-    runAsNonRoot: true
-    runAsUser: 1000
+    fsGroup: 0
+    runAsGroup: 0
+    runAsUser: 0
+  initContainers:
+    - name: agent-os-init
+      image: $IMAGE
+      imagePullPolicy: Never
+      command:
+        - /opt/agent-os/bin/agent-os-init.sh
+      volumeMounts:
+        - name: home
+          mountPath: /persistent-agent
   containers:
     - name: crewmate
       image: $IMAGE
@@ -78,6 +87,9 @@ spec:
       volumeMounts:
         - name: home
           mountPath: /home/agent
+        - name: home
+          mountPath: /usr/local
+          subPath: usr-local
   volumes:
     - name: home
       persistentVolumeClaim:
