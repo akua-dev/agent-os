@@ -10,6 +10,7 @@ mkdir -p \
   "$PERSISTENT_ROOT/.cache" \
   "$PERSISTENT_ROOT/.local/bin" \
   "$PERSISTENT_ROOT/.local/share" \
+  "$PERSISTENT_ROOT/.pi/agent" \
   "$PERSISTENT_ROOT/.bun" \
   "$PERSISTENT_ROOT/.cargo" \
   "$PERSISTENT_ROOT/usr-local"

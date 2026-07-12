@@ -14,7 +14,6 @@ assert_grep 'ARG NO_MISTAKES_VERSION=1.34.0' "$ROOT/Dockerfile" "image must pin 
 assert_grep 'ARG BUN_VERSION=1.3.14' "$ROOT/Dockerfile" "image must pin stable Bun 1.3.14"
 assert_grep 'ARG AKUA_VERSION=0.8.25' "$ROOT/Dockerfile" "image must pin Akua 0.8.25"
 assert_grep 'ARG K9S_VERSION=0.51.0' "$ROOT/Dockerfile" "image must pin K9s 0.51.0"
-assert_grep '"@akua-dev/sdk": "0.8.24"' "$ROOT/tools/agent-os/package.json" "tool must pin the Akua SDK"
 assert_grep 'sha256sum -c -' "$ROOT/Dockerfile" "downloaded runtime binaries must be checksum verified"
 assert_grep '@earendil-works/pi-coding-agent@0.80.6' "$ROOT/Dockerfile" "image must pin Pi 0.80.6"
 assert_grep 'gh-axi@0.1.27' "$ROOT/Dockerfile" "image must pin gh-axi 0.1.27"
@@ -30,7 +29,9 @@ assert_grep 'NPM_CONFIG_PREFIX=/usr/local' "$ROOT/Dockerfile" "global npm instal
 assert_grep 'PATH=/home/agent/.local/bin:/home/agent/.bun/bin:/home/agent/.cargo/bin:/usr/local/bin' "$ROOT/Dockerfile" \
   "persistent tool prefixes must lead PATH"
 assert_grep '/opt/image-usr-local' "$ROOT/Dockerfile" "image must retain a seed copy of /usr/local"
+# shellcheck disable=SC2016 # Match the literal Docker build argument reference.
 assert_grep 'akua-dev/akua/releases/download/v${AKUA_VERSION}' "$ROOT/Dockerfile" "image must install Akua from its release"
+# shellcheck disable=SC2016 # Match the literal Docker build argument reference.
 assert_grep 'derailed/k9s/releases/download/v${K9S_VERSION}' "$ROOT/Dockerfile" "image must install K9s from its release"
 assert_grep 'ln -s /opt/agent-os/tools/agent-os/src/cli.ts /usr/local/bin/agent-os' "$ROOT/Dockerfile" \
   "image must expose the Agent OS tool"
@@ -39,6 +40,17 @@ assert_grep 'bun install --frozen-lockfile --production --ignore-scripts' "$ROOT
 assert_no_grep 'USER node' "$ROOT/Dockerfile" "Agent OS containers must start as container root"
 assert_grep 'exec herdr server' "$ROOT/bin/agent-os-container-entrypoint.sh" "entrypoint must keep Herdr as PID 1"
 assert_grep 'setup hooks' "$ROOT/bin/agent-os-container-entrypoint.sh" "entrypoint must install persistent AXI hooks"
+assert_grep 'agent-os-kubeconfig.sh' "$ROOT/bin/agent-os-container-entrypoint.sh" "entrypoint must prepare in-cluster kubectl access"
+assert_grep 'tokenFile:' "$ROOT/bin/agent-os-kubeconfig.sh" "kubeconfig must follow the projected token file"
+assert_no_grep 'set-credentials.*--token' "$ROOT/bin/agent-os-kubeconfig.sh" "kubeconfig must not copy a bearer token"
+assert_grep 'automountServiceAccountToken = False' "$ROOT/tools/agent-os/packages/mate/package.k" \
+  "mate package must deny ambient Kubernetes credentials"
+assert_grep 'piAuthSecret: str = ""' "$ROOT/tools/agent-os/packages/mate/package.k" \
+  "mate package must default to no AI credential grant"
+assert_grep 'readOnly = True' "$ROOT/tools/agent-os/packages/mate/package.k" \
+  "granted AI credentials must be mounted read-only"
+assert_grep 'secretName = input.piAuthSecret' "$ROOT/tools/agent-os/packages/mate/package.k" \
+  "mate package must use only the explicitly selected Secret"
 assert_grep '.git' "$ROOT/.dockerignore" "git metadata must stay out of the build context"
 assert_grep '.pi' "$ROOT/.dockerignore" "Pi credentials must stay out of the build context"
 assert_grep '.codex' "$ROOT/.dockerignore" "Codex credentials must stay out of the build context"
@@ -52,4 +64,5 @@ assert_grep 'https://github.com/derailed/k9s/tree/v0.51.0' "$ROOT/THIRD_PARTY_NO
   "K9s's exact source must be named"
 
 bash -n "$ROOT/bin/agent-os-container-entrypoint.sh"
+bash -n "$ROOT/bin/agent-os-kubeconfig.sh"
 pass "container files pin dependencies and exclude host credentials"

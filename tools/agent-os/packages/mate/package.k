@@ -8,6 +8,7 @@ schema Input:
     address: str
     image: str = "agent-os:dev"
     imagePullPolicy: "Always" | "IfNotPresent" | "Never" = "IfNotPresent"
+    piAuthSecret: str = ""
     storage: str = "10Gi"
     cpuRequest: str = "250m"
     memoryRequest: str = "512Mi"
@@ -24,6 +25,21 @@ labels = {
     "app.kubernetes.io/component" = "mate"
     "agent-os.akua.dev/mate" = input.mateId
 }
+
+piAuthMounts = [{
+    name = "pi-auth"
+    mountPath = "/home/agent/.pi/agent/auth.json"
+    subPath = "auth.json"
+    readOnly = True
+}] if input.piAuthSecret else []
+
+piAuthVolumes = [{
+    name = "pi-auth"
+    secret = {
+        secretName = input.piAuthSecret
+        defaultMode = 256
+    }
+}] if input.piAuthSecret else []
 
 resources = [
     {
@@ -90,12 +106,12 @@ resources = [
                 volumeMounts = [
                     { name = "home", mountPath = "/home/agent" },
                     { name = "home", mountPath = "/usr/local", subPath = "usr-local" },
-                ]
+                ] + piAuthMounts
             }]
             volumes = [{
                 name = "home"
                 persistentVolumeClaim = { claimName = "agent-os-mate-${input.mateId}-home" }
-            }]
+            }] + piAuthVolumes
         }
     },
 ]
