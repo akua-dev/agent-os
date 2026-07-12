@@ -45,6 +45,11 @@ An agent distro is a portable directory of instructions, skills, tooling, polici
 There is no app to install: the cloned repo is the distro - `AGENTS.md`, bundled firstmate skills, and helper scripts that any terminal coding agent can follow.
 Launching a supported harness inside it instantiates your first mate - and makes you the captain.
 
+This Agent OS fork also packages the distro for Kubernetes: one persistent
+first mate can allocate isolated, persistent crewmate containers using ordinary
+`kubectl`, while Herdr keeps every agent terminal visible. Start locally with
+the [OrbStack Kubernetes demo](docs/kubernetes.md).
+
 ## Features
 
 - **One liaison** - you talk only to the first mate; it dispatches, supervises, escalates only real decisions, and reports plain outcomes.
@@ -188,6 +193,7 @@ Firstmate's skills live in two separate places with different audiences:
 
 ## Documentation
 
+- [docs/kubernetes.md](docs/kubernetes.md) - run the Agent OS controller and isolated crewmates on local OrbStack Kubernetes.
 - [docs/architecture.md](docs/architecture.md) - how the crew, supervision, worktrees, secondmates, and project modes work.
 - [docs/configuration.md](docs/configuration.md) - environment variables, `FM_HOME`, runtime backend selection, optional X mode, the files you set, and harness support.
 - [docs/wedge-alarm.md](docs/wedge-alarm.md) - configure the active alert for a wedged away-mode escalation delivery.

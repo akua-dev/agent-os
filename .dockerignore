@@ -1,0 +1,16 @@
+.git
+.github
+.pi
+.codex
+.claude
+.grok
+.opencode
+.no-mistakes
+.env
+config
+data
+projects
+state
+worktrees
+.worktrees
+
