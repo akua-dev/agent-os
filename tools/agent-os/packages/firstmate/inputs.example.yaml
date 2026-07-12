@@ -1,0 +1,5 @@
+namespace: agent-os
+image: ghcr.io/akua-dev/agent-os:latest
+imagePullPolicy: IfNotPresent
+clusterAdmin: true
+akuaAuthSecret: agent-os-firstmate-akua-auth

@@ -765,6 +765,7 @@ These skills are not captain-invocable; they are conditional operating reference
 - `firstmate-codexapp` - load before coordinating a visible Codex Desktop thread, evaluating a Codex App backend request, or reconciling Codex Desktop host-tool smoke evidence for Firstmate work.
 - `firstmate-coding-guidelines` - load before changing firstmate's shared, tracked material, as defined by section 1's list, whether editing directly or briefing a crewmate for a firstmate-repo task.
 - `kubernetes-fleet` - load before creating, supervising, recovering, or deleting Kubernetes-backed crewmates.
+- `akua-intelligence-bootstrap` - load before provisioning, recovering, or handing off a Firstmate in an Akua-managed intelligence cluster.
 
 ## 14. X mode
 

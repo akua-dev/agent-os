@@ -62,6 +62,12 @@ assert_grep 'https://github.com/akua-dev/akua/tree/v0.8.25' "$ROOT/THIRD_PARTY_N
   "Akua's exact source must be named"
 assert_grep 'https://github.com/derailed/k9s/tree/v0.51.0' "$ROOT/THIRD_PARTY_NOTICES.md" \
   "K9s's exact source must be named"
+assert_grep 'ghcr.io/akua-dev/agent-os' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "release workflow must publish the image expected by the Akua packages"
+assert_grep 'linux/amd64,linux/arm64' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "release workflow must build the two supported container architectures"
+assert_grep "push: \${{ github.event_name != 'pull_request' }}" "$ROOT/.github/workflows/agent-os-image.yml" \
+  "pull requests must build but never publish images"
 
 bash -n "$ROOT/bin/agent-os-container-entrypoint.sh"
 bash -n "$ROOT/bin/agent-os-kubeconfig.sh"

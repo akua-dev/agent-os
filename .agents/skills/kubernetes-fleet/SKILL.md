@@ -15,6 +15,7 @@ Load this skill only when the current firstmate is running in Kubernetes or is e
 - Keep every crewmate general-purpose; its brief, tools, and authority specialize it for the current task.
 - A crewmate normally communicates only with its parent through its terminal, status files, reports, and delivered Git state.
 - The image includes Akua's CLI and the prepared mate package lives at `tools/agent-os/packages/mate/`.
+- The optional persistent controller package lives at `tools/agent-os/packages/firstmate/`; load `akua-intelligence-bootstrap` before using it against Akua-managed infrastructure.
 - Use the bundled K9s terminal UI when it makes live Kubernetes inspection faster than individual `kubectl` reads.
 - Render the package with `akua render`, inspect or edit its ordinary YAML when useful, and apply it with `kubectl`.
 - Treat AI credentials as explicit per-mate grants, never as ambient inheritance merely because Firstmate can read them.
