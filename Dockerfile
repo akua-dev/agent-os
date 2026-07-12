@@ -8,6 +8,7 @@ ARG TREEHOUSE_VERSION=2.0.0
 ARG NO_MISTAKES_VERSION=1.34.0
 ARG BUN_VERSION=1.3.14
 ARG AKUA_VERSION=0.8.25
+ARG K9S_VERSION=0.51.0
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -105,6 +106,21 @@ RUN set -eu; \
   rm -f "/tmp/${asset}" /tmp/akua; \
   mkdir -p /usr/share/licenses/akua; \
   curl -fsSL "https://raw.githubusercontent.com/akua-dev/akua/v${AKUA_VERSION}/LICENSE" -o /usr/share/licenses/akua/LICENSE
+
+RUN set -eu; \
+  case "$TARGETARCH" in \
+    amd64) sha=c3752ad51a5a4015a113819c4eeb6e55a4d0e4b8e652494797532f6fc8161dd7 ;; \
+    arm64) sha=3ee05c82e5f9198928a4e86133608ba6a2c10a2244d6a7789e820f78319d640c ;; \
+    *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+  esac; \
+  asset="k9s_Linux_${TARGETARCH}.tar.gz"; \
+  curl -fsSL "https://github.com/derailed/k9s/releases/download/v${K9S_VERSION}/${asset}" -o "/tmp/${asset}"; \
+  echo "$sha  /tmp/${asset}" | sha256sum -c -; \
+  tar -xzf "/tmp/${asset}" -C /tmp k9s; \
+  install -m 0755 /tmp/k9s /usr/local/bin/k9s; \
+  rm -f "/tmp/${asset}" /tmp/k9s; \
+  mkdir -p /usr/share/licenses/k9s; \
+  curl -fsSL "https://raw.githubusercontent.com/derailed/k9s/v${K9S_VERSION}/LICENSE" -o /usr/share/licenses/k9s/LICENSE
 
 RUN npm install --global \
   @earendil-works/pi-coding-agent@0.80.6 \

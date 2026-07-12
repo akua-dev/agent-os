@@ -15,3 +15,10 @@ Akua is available under the Apache License 2.0.
 The image includes Akua's license at `/usr/share/licenses/akua/LICENSE`.
 The exact source is available at <https://github.com/akua-dev/akua/tree/v0.8.25>.
 Agent OS invokes Akua through its documented CLI.
+
+## K9s
+
+The Agent OS demo image includes an unmodified K9s 0.51.0 executable as a separate program.
+K9s is available under the Apache License 2.0.
+The image includes K9s's license at `/usr/share/licenses/k9s/LICENSE`.
+The exact source is available at <https://github.com/derailed/k9s/tree/v0.51.0>.

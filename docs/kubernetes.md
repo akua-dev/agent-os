@@ -35,7 +35,7 @@ bin/agent-os-local.sh status
 bin/agent-os-local.sh shell
 ```
 
-The image includes Firstmate's complete required toolchain, including `gh`, `rg`, `fd`, Akua, treehouse, no-mistakes, and every required AXI CLI.
+The image includes Firstmate's complete required toolchain, including `gh`, `rg`, `fd`, Akua, `kubectl`, K9s, treehouse, no-mistakes, and every required AXI CLI.
 Authenticate GitHub inside the primary with `gh auth login`.
 Authenticate Pi using `/login` and the provider flow you choose.
 Host credentials are intentionally excluded from the image and are never copied automatically.
