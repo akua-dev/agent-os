@@ -1,0 +1,22 @@
+{
+  "name": "@akua-dev/agent-os-tool",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "agent-os": "./src/cli.ts"
+  },
+  "scripts": {
+    "check": "bun run typecheck && bun test",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@multiformats/multiaddr": "13.0.3"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "typescript": "7.0.2"
+  },
+  "packageManager": "bun@1.3.14"
+}
