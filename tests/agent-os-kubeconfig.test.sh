@@ -24,7 +24,11 @@ assert_grep 'current-context: in-cluster' "$config" "kubeconfig must select the 
 assert_grep 'namespace: agent-os-eval' "$config" "kubeconfig must select the Agent OS namespace"
 assert_grep "tokenFile: $tmp/serviceaccount/token" "$config" "kubeconfig must follow the rotating token file"
 assert_no_grep 'demo-token' "$config" "kubeconfig must not copy token contents"
-[ "$(stat -f '%Lp' "$config" 2>/dev/null || stat -c '%a' "$config")" = 600 ] || fail "kubeconfig must be mode 600"
+case $(uname -s) in
+  Darwin) mode=$(stat -f '%Lp' "$config") ;;
+  *) mode=$(stat -c '%a' "$config") ;;
+esac
+[ "$mode" = 600 ] || fail "kubeconfig must be mode 600"
 
 printf '%s\n' sentinel > "$config"
 HOME="$tmp/home" \

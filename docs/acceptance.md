@@ -10,6 +10,7 @@ Update it from real runs; planned behavior and model narration never count as pr
 | Direct Akua-managed KaaS and Hetzner bootstrap | Public endpoint study and `akua-intelligence-bootstrap` skill | Not yet run |
 | Distinct clustered token and bootstrap-token revocation | Explicit Secret mount in the Firstmate package and handoff procedure | Not yet run |
 | Firstmate-native Akua worker lifecycle | Native endpoint routing in the bootstrap skill | Not yet run |
+| Replaceable usable model supply | Pi auth is explicit, but the live demo has one Codex provider and current quota exhaustion | Blocked until an approved route has capacity |
 | Same-Pod general-purpose crewmate | Existing Firstmate Herdr backend | Not yet captured as acceptance evidence |
 | Separate persistent crewmate Pod with explicit authority | Mate package, no ServiceAccount token by default, explicit Pi Secret grant | Package proven; full task run incomplete |
 | Parent-only supervision and human attach | Firstmate contract, Herdr CLI, live workspaces | Mechanism proven; distributed task trace incomplete |
