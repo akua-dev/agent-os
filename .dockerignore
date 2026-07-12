@@ -13,4 +13,5 @@ projects
 state
 worktrees
 .worktrees
-
+node_modules
+.repos
