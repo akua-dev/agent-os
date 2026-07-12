@@ -1,19 +1,19 @@
-# Root User Namespace and Persistent Toolchain Implementation Plan
+# Local Root Agents and Persistent Toolchain Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Run every Agent OS Pod as container root mapped to an unprivileged host UID while providing Firstmate's complete baseline toolchain and preserving runtime-installed tools across Pod replacement.
+**Goal:** Run every local Agent OS Pod as container root while providing Firstmate's complete baseline toolchain and preserving runtime-installed tools across Pod replacement.
 
-**Architecture:** Extend the reproducible image with exact binary and npm package versions, then seed the image's `/usr/local` tree into each agent PVC from an init container. The main container mounts that tree at `/usr/local`, uses the same PVC for `/home/agent`, and runs as UID 0 inside a Pod user namespace selected by `hostUsers: false`.
+**Architecture:** Extend the reproducible image with exact binary and npm package versions, then seed the image's `/usr/local` tree into each agent PVC from an init container. The main container mounts that tree at `/usr/local`, uses the same PVC for `/home/agent`, and runs as UID 0 on the isolated local OrbStack VM node.
 
-**Tech Stack:** Docker, Bash, Kubernetes v1.34, Kustomize, StatefulSet, Pods, PVCs, Linux user namespaces, Herdr, Pi, Node.js, npm.
+**Tech Stack:** Docker, Bash, Kubernetes v1.34, Kustomize, StatefulSet, Pods, PVCs, Herdr, Pi, Node.js, npm.
 
 ## Global Constraints
 
-- Every primary and crewmate Pod sets `hostUsers: false`, `runAsUser: 0`, and `runAsGroup: 0`.
+- Every primary and crewmate Pod sets `runAsUser: 0` and `runAsGroup: 0`.
+- OrbStack's unsupported `hostUsers: false` field is omitted from this isolated local demo.
 - The primary retains the existing local-demo `cluster-admin` ServiceAccount binding, while crewmates receive no Kubernetes credentials by default.
 - No Pod uses privileged mode, host PID, host IPC, host networking, raw block devices, or host-path mounts.
-- The deployment fails closed when the Pod UID map does not map container UID 0 to a nonzero host UID.
 - Each agent has its own PVC-backed `/home/agent` and `/usr/local`; no persistent state is shared between agents.
 - Runtime additions in `/usr/local` and persistent home prefixes survive Pod replacement.
 - Runtime `apt` changes outside the persistent prefixes remain intentionally ephemeral.
@@ -128,7 +128,7 @@ git commit -m "feat: bundle the Firstmate toolchain"
 
 ---
 
-### Task 2: Add the user-namespace and persistent-prefix initializer
+### Task 2: Add the persistent-prefix initializer
 
 **Files:**
 - Create: `bin/agent-os-init.sh`
@@ -137,12 +137,12 @@ git commit -m "feat: bundle the Firstmate toolchain"
 - Modify: `bin/agent-os-container-entrypoint.sh`
 
 **Interfaces:**
-- Consumes: `AGENT_OS_UID_MAP_PATH`, defaulting to `/proc/self/uid_map`; `AGENT_OS_PERSISTENT_ROOT`, defaulting to `/persistent-agent`.
-- Produces: a PVC root used as `/home/agent` and a seeded `$AGENT_OS_PERSISTENT_ROOT/usr-local`; exit zero only for a remapped UID 0 range.
+- Consumes: `AGENT_OS_PERSISTENT_ROOT`, defaulting to `/persistent-agent`, and `AGENT_OS_IMAGE_USR_LOCAL`, defaulting to `/opt/image-usr-local`.
+- Produces: a PVC root used as `/home/agent` and a seeded `$AGENT_OS_PERSISTENT_ROOT/usr-local`.
 
 - [ ] **Step 1: Write failing initializer tests**
 
-Create `tests/agent-os-init.test.sh` with fixtures for a mapped and host UID map:
+Create `tests/agent-os-init.test.sh` with image-baseline and runtime-added fixtures:
 
 ```bash
 #!/usr/bin/env bash
@@ -151,12 +151,9 @@ set -u
 
 TMP=$(fm_test_tmproot agent-os-init)
 mkdir -p "$TMP/source/bin" "$TMP/persistent/.local/bin" "$TMP/persistent/usr-local/bin"
-printf '0 100000 65536\n' > "$TMP/mapped"
-printf '0 0 4294967295\n' > "$TMP/host"
 printf 'baseline\n' > "$TMP/source/bin/baseline"
 printf 'runtime\n' > "$TMP/persistent/usr-local/bin/runtime-added"
 
-AGENT_OS_UID_MAP_PATH="$TMP/mapped" \
 AGENT_OS_IMAGE_USR_LOCAL="$TMP/source" \
 AGENT_OS_PERSISTENT_ROOT="$TMP/persistent" \
   "$ROOT/bin/agent-os-init.sh"
@@ -164,13 +161,7 @@ AGENT_OS_PERSISTENT_ROOT="$TMP/persistent" \
 assert_grep baseline "$TMP/persistent/usr-local/bin/baseline" "initializer must seed image tools"
 assert_grep runtime "$TMP/persistent/usr-local/bin/runtime-added" "initializer must preserve runtime tools"
 
-if AGENT_OS_UID_MAP_PATH="$TMP/host" \
-  AGENT_OS_IMAGE_USR_LOCAL="$TMP/source" \
-  AGENT_OS_PERSISTENT_ROOT="$TMP/persistent" \
-  "$ROOT/bin/agent-os-init.sh" >/dev/null 2>&1; then
-  fail "initializer must reject the host user namespace"
-fi
-pass "initializer verifies remapping and preserves persistent tools"
+pass "initializer preserves image and runtime-installed tools"
 ```
 
 - [ ] **Step 2: Run the test and observe the missing initializer**
@@ -243,7 +234,7 @@ git commit -m "feat: persist agent-installed tools"
 
 ---
 
-### Task 3: Run primary and crewmates as remapped container root
+### Task 3: Run primary and crewmates as local container root
 
 **Files:**
 - Modify: `deploy/orbstack/primary.yaml`
@@ -252,18 +243,18 @@ git commit -m "feat: persist agent-installed tools"
 
 **Interfaces:**
 - Consumes: image path `/opt/image-usr-local` and per-agent PVC.
-- Produces: Pod specs with `hostUsers: false`, root security context, init container `agent-os-init`, whole-PVC home mount, and `usr-local` subPath mount.
+- Produces: Pod specs with root security context, init container `agent-os-init`, whole-PVC home mount, and `usr-local` subPath mount.
 
 - [ ] **Step 1: Add failing manifest assertions**
 
 Extend `tests/agent-os-kubernetes.test.sh` for both rendered primary YAML and captured child YAML:
 
 ```bash
-assert_contains "$rendered" 'hostUsers: false' "primary must use a Pod user namespace"
+assert_not_contains "$rendered" 'hostUsers: false' "OrbStack demo must not request unsupported Pod user namespaces"
 assert_contains "$rendered" 'runAsUser: 0' "primary must run as container root"
 assert_contains "$rendered" 'name: agent-os-init' "primary must seed persistent tools"
 assert_contains "$rendered" 'mountPath: /usr/local' "primary must persist /usr/local"
-assert_grep 'hostUsers: false' "$STDIN_LOG" "children must use Pod user namespaces"
+assert_no_grep 'hostUsers: false' "$STDIN_LOG" "OrbStack children must not request unsupported Pod user namespaces"
 assert_grep 'runAsUser: 0' "$STDIN_LOG" "children must run as container root"
 assert_grep 'name: agent-os-init' "$STDIN_LOG" "children must seed persistent tools"
 assert_grep 'mountPath: /usr/local' "$STDIN_LOG" "children must persist /usr/local"
@@ -275,11 +266,10 @@ Retain the existing assertion for `automountServiceAccountToken: false`.
 
 Run: `bash tests/agent-os-kubernetes.test.sh`
 
-Expected: FAIL at `primary must use a Pod user namespace`.
+Expected: FAIL while the manifest still requests unsupported Pod user namespaces.
 
 - [ ] **Step 3: Update the primary StatefulSet**
 
-Set `spec.template.spec.hostUsers: false`.
 Replace the non-root security context with `runAsUser: 0` and `runAsGroup: 0`.
 Add an `agent-os-init` init container using `agent-os:dev`, command `/opt/agent-os/bin/agent-os-init.sh`, and a whole-PVC mount at `/persistent-agent`.
 Mount the PVC root at `/home/agent` and PVC subPath `usr-local` at `/usr/local` in the main container.
@@ -287,7 +277,7 @@ Do not set `privileged: true` or any host namespace option.
 
 - [ ] **Step 4: Update generated crewmate Pods**
 
-Make `bin/agent-os-crewmate.sh create` emit the same user-namespace, root, init-container, home, and `/usr/local` structure.
+Make `bin/agent-os-crewmate.sh create` emit the same root, init-container, home, and `/usr/local` structure.
 Keep the distinct child PVC and `automountServiceAccountToken: false` contract unchanged.
 
 - [ ] **Step 5: Run static Kubernetes tests**
@@ -306,19 +296,19 @@ Expected: all checks pass.
 
 ```bash
 git add deploy/orbstack/primary.yaml bin/agent-os-crewmate.sh tests/agent-os-kubernetes.test.sh
-git commit -m "feat: isolate root agents with user namespaces"
+git commit -m "feat: run local agents as container root"
 ```
 
 ---
 
-### Task 4: Prove the live user namespace and persistent tool lifecycle
+### Task 4: Prove the live root and persistent tool lifecycle
 
 **Files:**
 - Modify if evidence reveals a defect: files owned by Tasks 1 through 3 and their colocated tests.
 
 **Interfaces:**
 - Consumes: OrbStack context, `agent-os:dev`, namespace `agent-os-demo`.
-- Produces: empirical proof for remapped root, baseline completeness, and durable runtime tools.
+- Produces: empirical proof for container root, baseline completeness, and durable runtime tools.
 
 - [ ] **Step 1: Rebuild and deploy**
 
@@ -332,16 +322,15 @@ kubectl --context orbstack -n agent-os-demo rollout status statefulset/agent-os-
 
 Expected: the StatefulSet reaches `1/1` Ready.
 
-- [ ] **Step 2: Verify remapped container root**
+- [ ] **Step 2: Verify container root**
 
 Run:
 
 ```bash
 kubectl --context orbstack -n agent-os-demo exec statefulset/agent-os-firstmate -- id
-kubectl --context orbstack -n agent-os-demo exec statefulset/agent-os-firstmate -- cat /proc/self/uid_map
 ```
 
-Expected: `id` reports UID 0 and the UID map begins with container UID `0`, a nonzero host UID, and a range of at least `65536`.
+Expected: `id` reports UID 0.
 
 - [ ] **Step 3: Verify the complete baseline**
 
@@ -392,12 +381,11 @@ Run:
 kubectl --context orbstack -n agent-os-demo exec statefulset/agent-os-firstmate -- /opt/agent-os/bin/agent-os-crewmate.sh create root-proof
 kubectl --context orbstack -n agent-os-demo wait --for=condition=Ready pod/agent-os-crewmate-root-proof --timeout=180s
 kubectl --context orbstack -n agent-os-demo exec agent-os-crewmate-root-proof -- id
-kubectl --context orbstack -n agent-os-demo exec agent-os-crewmate-root-proof -- cat /proc/self/uid_map
 kubectl --context orbstack -n agent-os-demo exec agent-os-crewmate-root-proof -- test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token
 kubectl --context orbstack -n agent-os-demo exec statefulset/agent-os-firstmate -- /opt/agent-os/bin/agent-os-crewmate.sh delete root-proof
 ```
 
-Expected: child UID 0 is remapped, no ServiceAccount token exists, and cleanup removes its Pod and PVC.
+Expected: child UID 0 is active, no ServiceAccount token exists, and cleanup removes its Pod and PVC.
 
 - [ ] **Step 7: Convert any live defect into a failing test before fixing it**
 
@@ -427,12 +415,12 @@ git diff --cached --quiet || git commit -m "fix: complete the persistent root ag
 Document these verified facts in `docs/kubernetes.md`, one sentence per physical line:
 
 ```text
-Agents run as UID 0 inside a Pod user namespace and are mapped to unprivileged node UIDs.
+Agents run as UID 0 on the isolated local OrbStack VM node.
 The complete Firstmate baseline is part of the image.
 Tools installed below /home/agent persistent prefixes or /usr/local survive Pod replacement.
 apt remains available, but files it writes outside persistent prefixes are ephemeral.
 GitHub and model authentication live on the individual agent PVC.
-The deployment fails instead of falling back when user namespaces are unsupported.
+The Pods do not use privileged mode, host namespaces, or host mounts.
 ```
 
 - [ ] **Step 2: Run the complete focused verification set**

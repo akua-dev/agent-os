@@ -53,7 +53,6 @@ metadata:
     app.kubernetes.io/component: crewmate
     agent-os.akua.dev/crewmate: $ID
 spec:
-  hostUsers: false
   automountServiceAccountToken: false
   securityContext:
     fsGroup: 0
