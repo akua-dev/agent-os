@@ -48,7 +48,10 @@ Launching a supported harness inside it instantiates your first mate - and makes
 This Agent OS fork also packages the distro for Kubernetes: one persistent
 first mate can allocate isolated, persistent crewmate containers using ordinary
 `kubectl`, while Herdr keeps every agent terminal visible. Start locally with
-the [OrbStack Kubernetes demo](docs/kubernetes.md).
+the [OrbStack Kubernetes demo](docs/kubernetes.md), then use the optional
+[Firstmate Akua package](tools/agent-os/packages/firstmate/README.md) and the
+[focused bootstrap guidance](.agents/skills/akua-intelligence-bootstrap/SKILL.md)
+for a dedicated Akua-managed intelligence cluster.
 
 ## Features
 
@@ -194,6 +197,7 @@ Firstmate's skills live in two separate places with different audiences:
 ## Documentation
 
 - [docs/kubernetes.md](docs/kubernetes.md) - run the Agent OS controller and isolated crewmates on local OrbStack Kubernetes.
+- [docs/acceptance.md](docs/acceptance.md) - requirement-to-evidence ledger for the full distributed Agent OS proof.
 - [docs/architecture.md](docs/architecture.md) - how the crew, supervision, worktrees, secondmates, and project modes work.
 - [docs/configuration.md](docs/configuration.md) - environment variables, `FM_HOME`, runtime backend selection, optional X mode, the files you set, and harness support.
 - [docs/wedge-alarm.md](docs/wedge-alarm.md) - configure the active alert for a wedged away-mode escalation delivery.
