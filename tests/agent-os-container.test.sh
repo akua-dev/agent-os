@@ -13,6 +13,7 @@ assert_grep 'ARG TREEHOUSE_VERSION=2.0.0' "$ROOT/Dockerfile" "image must pin tre
 assert_grep 'ARG NO_MISTAKES_VERSION=1.34.0' "$ROOT/Dockerfile" "image must pin no-mistakes 1.34.0"
 assert_grep 'ARG BUN_VERSION=1.3.14' "$ROOT/Dockerfile" "image must pin stable Bun 1.3.14"
 assert_grep 'ARG AKUA_VERSION=0.8.25' "$ROOT/Dockerfile" "image must pin Akua 0.8.25"
+assert_grep 'ARG K9S_VERSION=0.51.0' "$ROOT/Dockerfile" "image must pin K9s 0.51.0"
 assert_grep '"@akua-dev/sdk": "0.8.24"' "$ROOT/tools/agent-os/package.json" "tool must pin the Akua SDK"
 assert_grep 'sha256sum -c -' "$ROOT/Dockerfile" "downloaded runtime binaries must be checksum verified"
 assert_grep '@earendil-works/pi-coding-agent@0.80.6' "$ROOT/Dockerfile" "image must pin Pi 0.80.6"
@@ -30,6 +31,7 @@ assert_grep 'PATH=/home/agent/.local/bin:/home/agent/.bun/bin:/home/agent/.cargo
   "persistent tool prefixes must lead PATH"
 assert_grep '/opt/image-usr-local' "$ROOT/Dockerfile" "image must retain a seed copy of /usr/local"
 assert_grep 'akua-dev/akua/releases/download/v${AKUA_VERSION}' "$ROOT/Dockerfile" "image must install Akua from its release"
+assert_grep 'derailed/k9s/releases/download/v${K9S_VERSION}' "$ROOT/Dockerfile" "image must install K9s from its release"
 assert_grep 'ln -s /opt/agent-os/tools/agent-os/src/cli.ts /usr/local/bin/agent-os' "$ROOT/Dockerfile" \
   "image must expose the Agent OS tool"
 assert_grep 'bun install --frozen-lockfile --production --ignore-scripts' "$ROOT/Dockerfile" \
@@ -46,6 +48,8 @@ assert_grep 'https://github.com/ogulcancelik/herdr/tree/v0.7.3' "$ROOT/THIRD_PAR
   "Herdr's exact corresponding source must be named"
 assert_grep 'https://github.com/akua-dev/akua/tree/v0.8.25' "$ROOT/THIRD_PARTY_NOTICES.md" \
   "Akua's exact source must be named"
+assert_grep 'https://github.com/derailed/k9s/tree/v0.51.0' "$ROOT/THIRD_PARTY_NOTICES.md" \
+  "K9s's exact source must be named"
 
 bash -n "$ROOT/bin/agent-os-container-entrypoint.sh"
 pass "container files pin dependencies and exclude host credentials"
