@@ -35,7 +35,7 @@ bin/agent-os-local.sh status
 bin/agent-os-local.sh shell
 ```
 
-The image includes Firstmate's complete required toolchain, including `gh`, `rg`, `fd`, treehouse, no-mistakes, and every required AXI CLI.
+The image includes Firstmate's complete required toolchain, including `gh`, `rg`, `fd`, Akua, treehouse, no-mistakes, and every required AXI CLI.
 Authenticate GitHub inside the primary with `gh auth login`.
 Authenticate Pi using `/login` and the provider flow you choose.
 Host credentials are intentionally excluded from the image and are never copied automatically.
@@ -63,6 +63,16 @@ bin/agent-os-crewmate.sh create scout-1
 bin/agent-os-crewmate.sh status scout-1
 bin/agent-os-crewmate.sh delete scout-1
 ```
+
+It can also render the prepared Akua package without spawning a subprocess from the TypeScript tool:
+
+```sh
+agent-os mate render scout-1 --namespace agent-os-demo --image agent-os:dev --out /tmp/scout-1
+kubectl apply -f /tmp/scout-1
+```
+
+This command uses `@akua-dev/sdk` and only writes ordinary manifests.
+Firstmate can inspect or edit those files, invoke the bundled `akua` CLI directly, modify the package, or author equivalent YAML without the helper.
 
 When run on a host, the crewmate helper requires an explicit context:
 

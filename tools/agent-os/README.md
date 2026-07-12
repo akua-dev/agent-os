@@ -23,6 +23,11 @@ bun run check
 bun run src/cli.ts address local task-x
 bun run src/cli.ts address k8s task-x
 bun run src/cli.ts address inspect /k8s/in-cluster/namespace/agent-os/mate/task-x/herdr
+bun run src/cli.ts mate render task-x --out /tmp/task-x
 ```
+
+Akua package operations inside this tool use the official `@akua-dev/sdk` in process.
+The prepared package under `packages/mate/` remains optional and renders editable Kubernetes YAML.
+The scoped official `Effect-TS/skills` installation guides typed Effect workflows; its Effect source checkout is local and ignored rather than committed as a snapshot.
 
 See `AGENTS.md` in this directory for the tool-specific development rules.

@@ -1,0 +1,5 @@
+[package]
+name = "agent-os-mate"
+version = "0.1.0"
+edition = "akua.dev/v1alpha1"
+strict_signing = true

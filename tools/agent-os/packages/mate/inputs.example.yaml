@@ -1,0 +1,5 @@
+mateId: scout-1
+namespace: agent-os-demo
+address: /k8s/in-cluster/namespace/agent-os-demo/mate/scout-1/herdr
+image: agent-os:dev
+imagePullPolicy: Never
