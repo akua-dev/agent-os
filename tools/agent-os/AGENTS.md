@@ -5,7 +5,7 @@ They govern development of the operating tool and must not be copied into the ro
 
 ## Purpose
 
-This tool incrementally moves complex fleet mechanics from Bash into a small Bun and TypeScript CLI.
+This tool owns only stable Agent OS primitives that the underlying general-purpose tools do not already provide.
 It extends Firstmate's existing files and lifecycle rather than introducing a parallel state store, controller, or agent model.
 Keep compatibility with the root distro's `data/`, `state/`, briefs, status events, and guarded teardown behavior.
 Use the Bun channel declared in `.bun-version`.
@@ -31,26 +31,30 @@ The address grammar and validation contract are owned by `src/address.ts` and it
 
 ## Command Execution
 
-Use the official `@akua-dev/sdk` for Akua operations implemented inside this TypeScript tool.
-Keep the bundled `akua` CLI available for Firstmate's direct and interactive use.
-Use Bun Shell's `$` for other finite calls to trusted CLIs such as `kubectl`, `herdr`, `treehouse`, and Git.
+Keep the bundled `akua` CLI available for Firstmate's direct use instead of proxying it through this tool.
+Use Bun Shell's `$` for finite calls to trusted CLIs only when implementing a genuinely missing Agent OS primitive.
 Interpolate dynamic values directly so Bun treats each value as a literal argument.
 Never use `{ raw: value }` for dynamic data.
 Avoid `bash -c` and validate values that an external command could interpret as flags.
 Keep non-zero exits throwing by default and use `.nothrow()` only for an expected negative probe.
 Set environment and working directory per command instead of mutating the global `$` instance.
 Use `Bun.spawn()` for interactive agents, servers, watches, live logs, cancellation, and other long-running processes.
-Existing Bash scripts may be invoked explicitly during migration, but new orchestration and state transitions belong in TypeScript.
+Existing Bash scripts may be invoked explicitly during migration, but do not move adaptable orchestration into TypeScript merely because it is currently written in Bash or instructions.
 
 ## Akua packages
 
 The prepared mate package lives at `packages/mate/` and renders ordinary Kubernetes YAML.
 Treat it as an editable convenience, not a required abstraction or controller.
-Firstmate may use `agent-os mate render`, invoke `akua render` itself, edit the result, or author equivalent YAML directly.
+Firstmate may invoke `akua render`, edit the result, change the package, or author equivalent YAML directly.
 
 ## Scope Discipline
 
-Prefer a thin adapter over a new framework.
+Prefer no adapter when an agent can reliably compose the underlying tools itself.
+When a stable safety boundary truly needs code, prefer the thinnest adapter that owns only that boundary.
+Do not wrap a capable general-purpose CLI merely to encode one Agent OS workflow.
+Prefer instructions, skills, and direct composition of Akua, Kubernetes, Herdr, Git, and other trusted tools.
+Add TypeScript only for a stable primitive the underlying tools do not already provide, such as the Agent OS address grammar, or when repeated failures prove a reusable safety boundary is missing.
+Keep policy and desired outcomes in instructions instead of hardcoding how an adaptable agent must sequence tools.
 Do not add a database, daemon, custom inter-agent protocol, Kubernetes controller, or duplicate task specification.
 Keep mates general-purpose and keep parent-only communication unchanged across local and remote addresses.
 Use Kubernetes APIs and later Agent Sandbox only as runtime resolvers behind the same logical address.

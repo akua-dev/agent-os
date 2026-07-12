@@ -64,21 +64,53 @@ bin/agent-os-crewmate.sh status scout-1
 bin/agent-os-crewmate.sh delete scout-1
 ```
 
-It can also render the prepared Akua package without spawning a subprocess from the TypeScript tool:
+The prepared package is an optional alternative when typed, editable manifests are useful:
 
 ```sh
-agent-os mate render scout-1 --namespace agent-os-demo --image agent-os:dev --out /tmp/scout-1
+akua render \
+  --package tools/agent-os/packages/mate/package.k \
+  --inputs tools/agent-os/packages/mate/inputs.example.yaml \
+  --out /tmp/scout-1
 kubectl apply -f /tmp/scout-1
 ```
 
-This command uses `@akua-dev/sdk` and only writes ordinary manifests.
-Firstmate can inspect or edit those files, invoke the bundled `akua` CLI directly, modify the package, or author equivalent YAML without the helper.
+Firstmate may inspect or edit the result, change the package, compose raw YAML, or use the compatibility helper.
+Agent OS does not wrap these capable tools into a second workflow CLI.
 
-When run on a host, the crewmate helper requires an explicit context:
+AI credentials are an explicit per-mate grant.
+Create or select a Kubernetes Secret containing an `auth.json` key, then pass only its name as the package's `piAuthSecret` input.
+The package mounts that file read-only and never discovers credentials by itself.
+
+```sh
+kubectl -n agent-os-demo create secret generic agent-os-mate-scout-1-pi-auth \
+  --from-file=auth.json=/home/agent/.pi/agent/auth.json
+```
+
+Do this only when copying that selected credential set was authorized.
+Prefer an already curated Secret when one exists.
+
+Give each launched Herdr agent a task-unique name and an explicit completion artifact in its brief.
+Use ordinary Herdr and Kubernetes commands to launch, inspect, steer, and retrieve it.
+
+```sh
+kubectl -n agent-os-demo exec agent-os-mate-scout-1 -- \
+  herdr agent start scout-1-research --cwd /home/agent --no-focus -- pi "$(cat /tmp/scout-1.prompt)"
+kubectl -n agent-os-demo exec agent-os-mate-scout-1 -- \
+  test -s /home/agent/data/scout-1.md
+```
+
+Do not treat Herdr `idle` alone as completion because a newly launched agent may briefly be idle before it starts work.
+Check the declared artifact or delivered Git state and read the pane when it is absent.
+Before reusing a name restored from a persistent Herdr session, verify that no agent process is live and close only the confirmed stale pane.
+
+When run on a host, the compatibility helper requires an explicit context:
 
 ```sh
 AGENT_OS_CONTEXT=orbstack bin/agent-os-crewmate.sh status scout-1
 ```
+
+Inside an authorized Firstmate Pod, Agent OS creates a rotation-safe kubeconfig that references the projected ServiceAccount token file.
+It never copies the token value into the kubeconfig.
 
 Destroying the demo requires confirmation and deletes only the demo namespace:
 

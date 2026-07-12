@@ -16,6 +16,8 @@ mkdir -p \
   "$HOME/.local/share" \
   "$HOME/.bun" \
   "$HOME/.cargo"
+
+"$(dirname "$0")/agent-os-kubeconfig.sh"
 if [ ! -e "$FM_HOME/config/backend" ]; then
   printf 'herdr\n' > "$FM_HOME/config/backend"
 fi
