@@ -143,7 +143,7 @@ RUN set -eu; \
 COPY image/npm/package.json image/npm/package-lock.json /opt/agent-os-npm/
 
 RUN echo "3646e31389155fbce155c828d8db46bc60ff2976c2d8d29e6633f260f56fd06d  /opt/agent-os-npm/package.json" | sha256sum -c - \
-  && echo "d815b10a3ea0bf79d55a9e2245b422cbb401bc9b38f27a4575a639ce2caabe1f  /opt/agent-os-npm/package-lock.json" | sha256sum -c - \
+  && echo "f77f31c67455d6f72e6411d5fa82669b9cc95306d518ff655b7c7795cfd41ca2  /opt/agent-os-npm/package-lock.json" | sha256sum -c - \
   && npm ci --omit=dev --ignore-scripts --no-audit --no-fund --prefix /opt/agent-os-npm \
   && mkdir -p /usr/local/lib/node_modules \
   && cp -a /opt/agent-os-npm/node_modules/. /usr/local/lib/node_modules/ \

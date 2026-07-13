@@ -32,6 +32,17 @@ assert_grep '"lockfileVersion": 3' "$ROOT/image/npm/package-lock.json" \
   "image runtime npm lock must use the reproducible current lock format"
 assert_grep '"integrity": "sha512-' "$ROOT/image/npm/package-lock.json" \
   "image runtime npm lock must checksum resolved artifacts"
+node - "$ROOT/image/npm/package-lock.json" <<'NODE' || fail "every fetched npm artifact must have committed integrity"
+const fs = require("fs");
+const lock = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const missing = Object.entries(lock.packages)
+  .filter(([, value]) => value.resolved && !value.integrity)
+  .map(([name]) => name);
+if (missing.length) {
+  console.error(`missing npm integrity: ${missing.join(", ")}`);
+  process.exit(1);
+}
+NODE
 assert_grep 'npm ci --omit=dev --ignore-scripts' "$ROOT/Dockerfile" \
   "image runtime npm installation must consume only the committed lock"
 assert_no_grep 'npm install --global' "$ROOT/Dockerfile" \

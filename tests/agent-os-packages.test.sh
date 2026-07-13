@@ -48,7 +48,9 @@ assert_grep '"agent-os.dev/rbac-mode" = input.rbac' "$FIRSTMATE/package.k" \
 assert_grep 'resources = ["pods", "persistentvolumeclaims"]' "$FIRSTMATE/package.k" \
   "runtime apply authority must exclude Pod subresources from patch access"
 assert_grep 'verbs = ["get", "list", "watch", "create", "delete", "patch"]' "$FIRSTMATE/package.k" \
-  "runtime RBAC must allow kubectl apply to patch retained crewmate PVCs"
+  "runtime RBAC must allow checkpoint updates on retained crewmate PVCs"
+assert_grep 'resources = ["leases"]' "$FIRSTMATE/package.k" \
+  "runtime RBAC must permit serialized crewmate lifecycle operations"
 assert_no_grep 'akuaAuthSecret' "$FIRSTMATE/package.k" \
   "the portable package must not require Akua authorization"
 assert_no_grep 'agent-os.akua.dev' "$FIRSTMATE/package.k" \
@@ -150,9 +152,13 @@ for invalid_image in \
   'registry.example/org:123/image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
   '[2001:db8::1]:5000/org:123/image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
   '[2001:db8::g]:5000/org/image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  '[1]:5000/org/image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  '[::::]:5000/org/image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  '[1::2::3]:5000/org/image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  '[::ffff:999.0.2.1]:5000/org/image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
   'prefix@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:suffix'; do
   invalid_inputs="$TMP/invalid-$(printf '%s' "$invalid_image" | tr '/:@' '---').yaml"
-  sed "s|^image: .*|image: $invalid_image|" "$INPUTS" > "$invalid_inputs"
+  sed "s|^image: .*|image: \"$invalid_image\"|" "$INPUTS" > "$invalid_inputs"
   if akua render --no-agent-mode --package "$FIRSTMATE/package.k" --inputs "$invalid_inputs" \
     --out "$TMP/invalid-rendered" >/dev/null 2>&1; then
     fail "the portable package accepted malformed digest reference '$invalid_image'"
@@ -174,6 +180,14 @@ sed 's|^image: .*|image: "[2001:db8::1]:5000/org/agent-os@sha256:aaaaaaaaaaaaaaa
 akua render --no-agent-mode --package "$FIRSTMATE/package.k" --inputs "$IPV6_INPUTS" \
   --out "$TMP/registry-ipv6-rendered" >/dev/null || \
   fail "the portable package must allow a bracketed IPv6 registry authority"
+for ipv6_registry in '::' '::1' '1::' '1:2:3:4:5:6:7:8' '::ffff:192.0.2.1'; do
+  ipv6_inputs="$TMP/registry-ipv6-$(printf '%s' "$ipv6_registry" | tr ':' '-').yaml"
+  sed "s|^image: .*|image: \"[$ipv6_registry]:5000/org/agent-os@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"|" \
+    "$INPUTS" > "$ipv6_inputs"
+  akua render --no-agent-mode --package "$FIRSTMATE/package.k" --inputs "$ipv6_inputs" \
+    --out "$TMP/registry-ipv6-$(printf '%s' "$ipv6_registry" | tr ':' '-')-rendered" >/dev/null || \
+    fail "the portable package rejected valid IPv6 registry '$ipv6_registry'"
+done
 pass "OCI references accept bracketed IPv6 registry authorities"
 
 assert_grep 'bin/agent-os-kubernetes.sh install' "$ROOT/docs/kubernetes.md" \

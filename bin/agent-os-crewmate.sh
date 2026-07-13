@@ -38,8 +38,11 @@ fi
 
 POD="agent-os-crewmate-$ID"
 PVC="$POD-home"
+LOCK="$POD-lifecycle"
 EXPECTED_POD="$POD"$'\t'"agent-os"$'\t'"$ID"$'\t'"$INSTALLATION_ID"
 EXPECTED_PVC="$PVC"$'\t'"agent-os"$'\t'"$ID"$'\t'"$INSTALLATION_ID"
+EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"$ID"$'\t'"$INSTALLATION_ID"
+LOCK_UID=
 
 kube() {
   "$KUBECTL" "${KUBECTL_ARGS[@]}" -n "$NAMESPACE" "$@"
@@ -53,12 +56,17 @@ resource_identity() {
 
 pod_record() {
   kube get pod "$POD" --ignore-not-found \
-    -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.labels.agent-os\.dev/operation-id}{"\t"}{.metadata.uid}'
+    -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.labels.agent-os\.dev/operation-id}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}'
 }
 
 pvc_record() {
   kube get pvc "$PVC" --ignore-not-found \
-    -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.annotations.agent-os\.dev/checkpoint-state}{"\t"}{.metadata.annotations.agent-os\.dev/checkpoint-at}{"\t"}{.metadata.annotations.agent-os\.dev/quiesced-operation}{"\t"}{.metadata.annotations.agent-os\.dev/checkpoint-operation}'
+    -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.annotations.agent-os\.dev/checkpoint-state}{"\t"}{.metadata.annotations.agent-os\.dev/checkpoint-at}{"\t"}{.metadata.annotations.agent-os\.dev/quiesced-operation}{"\t"}{.metadata.annotations.agent-os\.dev/checkpoint-operation}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}'
+}
+
+lock_record() {
+  kube get lease "$LOCK" --ignore-not-found \
+    -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.spec.holderIdentity}{"\t"}{.metadata.uid}'
 }
 
 require_owned_or_absent() {
@@ -110,18 +118,83 @@ render_resources() {
     "$TEMPLATE"
 }
 
+render_pvc() {
+  render_resources | awk '/^---$/ { exit } { print }'
+}
+
+render_pod() {
+  render_resources | awk 'found { print } /^---$/ { found=1 }'
+}
+
+render_lock() {
+  cat <<YAML
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: $LOCK
+  namespace: $NAMESPACE
+  labels:
+    app.kubernetes.io/managed-by: agent-os
+    agent-os.dev/crewmate: $ID
+  annotations:
+    agent-os.dev/installation-id: $INSTALLATION_ID
+spec:
+  holderIdentity: $OPERATION_ID
+  leaseDurationSeconds: 300
+YAML
+}
+
+release_lock() {
+  [ -n "$LOCK_UID" ] || return 0
+  printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s"}}\n' "$LOCK_UID" | \
+    kube delete --raw "/apis/coordination.k8s.io/v1/namespaces/$NAMESPACE/leases/$LOCK" -f - >/dev/null || true
+  LOCK_UID=
+}
+
+acquire_lock() {
+  local record identity holder
+  if ! render_lock | kube create -f - >/dev/null; then
+    record=$(lock_record)
+    identity=$(printf '%s' "$record" | cut -f1-4)
+    holder=$(printf '%s' "$record" | cut -f5)
+    if [ -z "$record" ] || [ "$identity" != "$EXPECTED_LOCK" ]; then
+      echo "error: lifecycle Lease '$LOCK' is absent or has foreign ownership after create conflict" >&2
+      exit 2
+    fi
+    if ! kube wait --for=delete "lease/$LOCK" --timeout=30s >/dev/null; then
+      echo "error: lifecycle operation '$holder' still holds Lease '$LOCK' after 30s" >&2
+      exit 3
+    fi
+    if ! render_lock | kube create -f - >/dev/null; then
+      echo "error: lifecycle Lease '$LOCK' changed during bounded acquisition" >&2
+      exit 3
+    fi
+  fi
+  record=$(lock_record)
+  identity=$(printf '%s' "$record" | cut -f1-4)
+  holder=$(printf '%s' "$record" | cut -f5)
+  LOCK_UID=$(printf '%s' "$record" | cut -f6)
+  if [ "$identity" != "$EXPECTED_LOCK" ] || [ "$holder" != "$OPERATION_ID" ] || [ -z "$LOCK_UID" ]; then
+    LOCK_UID=
+    echo "error: lifecycle Lease '$LOCK' did not verify after acquisition" >&2
+    exit 2
+  fi
+}
+
+trap release_lock EXIT
+
 cleanup_new_owned_pod() {
-  local before_uid=$1 after current identity after_operation after_uid
+  local expected_uid=${1:-} after current identity after_operation after_uid
   after=$(pod_record)
   if [ -z "$after" ]; then
-    echo "partial state: crewmate apply left no Pod; persistent home retained" >&2
+    echo "partial state: crewmate create left no Pod; persistent home retained" >&2
     return
   fi
   identity=$(printf '%s' "$after" | cut -f1-4)
   after_operation=$(printf '%s' "$after" | cut -f5)
   after_uid=$(printf '%s' "$after" | cut -f6)
   if [ "$identity" != "$EXPECTED_POD" ] || [ "$after_operation" != "$OPERATION_ID" ] || \
-    [ -z "$after_uid" ] || [ -n "$before_uid" ]; then
+    [ -z "$after_uid" ] || { [ -n "$expected_uid" ] && [ "$after_uid" != "$expected_uid" ]; }; then
     echo "partial state: replacement or ownership mismatch retained; persistent home retained" >&2
     return
   fi
@@ -139,24 +212,62 @@ cleanup_new_owned_pod() {
   kube wait --for=delete "pod/$POD" --timeout=180s
 }
 
-apply_and_wait() {
-  local before before_uid
-  before=$(pod_record)
-  before_uid=$(printf '%s' "$before" | cut -f6)
-  if ! render_resources | kube apply -f -; then
-    cleanup_new_owned_pod "$before_uid"
-    echo "error: crewmate resources were only partially applied" >&2
+create_and_wait() {
+  local pvc_before pvc_current pvc_uid pvc_rv pod pod_uid pod_rv
+  pvc_before=$(require_owned_pvc_or_absent)
+  if [ -z "$pvc_before" ]; then
+    if ! render_pvc | kube create -f - >/dev/null; then
+      echo "error: create-only PVC operation conflicted; no resource was adopted" >&2
+      exit 2
+    fi
+    pvc_before=$(require_owned_pvc_or_absent)
+  fi
+  pvc_current=$(require_owned_pvc_or_absent)
+  if [ -z "$pvc_before" ] || [ "$pvc_current" != "$pvc_before" ]; then
+    echo "error: PVC identity or resourceVersion changed before Pod creation" >&2
+    exit 2
+  fi
+  pvc_uid=$(printf '%s' "$pvc_before" | cut -f9)
+  pvc_rv=$(printf '%s' "$pvc_before" | cut -f10)
+  if [ -z "$pvc_uid" ] || [ -z "$pvc_rv" ]; then
+    echo "error: Pod creation requires exact PVC UID and resourceVersion evidence" >&2
+    exit 2
+  fi
+  if ! render_pod | kube create -f - >/dev/null; then
+    cleanup_new_owned_pod
+    echo "error: create-only Pod operation conflicted or was only partially acknowledged" >&2
+    exit 1
+  fi
+  pod=$(pod_record)
+  if [ "$(printf '%s' "$pod" | cut -f1-4)" != "$EXPECTED_POD" ] || \
+    [ "$(printf '%s' "$pod" | cut -f5)" != "$OPERATION_ID" ]; then
+    echo "error: created Pod did not retain the exact operation identity; no cleanup attempted" >&2
+    exit 1
+  fi
+  pod_uid=$(printf '%s' "$pod" | cut -f6)
+  pod_rv=$(printf '%s' "$pod" | cut -f7)
+  if [ -z "$pod_uid" ] || [ -z "$pod_rv" ]; then
+    echo "error: created Pod lacks exact UID or resourceVersion evidence" >&2
     exit 1
   fi
   if ! kube wait --for=condition=Ready "pod/$POD" --timeout=180s; then
-    cleanup_new_owned_pod "$before_uid"
+    cleanup_new_owned_pod "$pod_uid"
     echo "error: crewmate Pod did not become ready with the authorized AI Secret" >&2
     exit 1
   fi
 }
 
 preflight_create() {
-  require_owned_or_absent pod "$POD" "$EXPECTED_POD" >/dev/null
+  local identity
+  identity=$(resource_identity pod "$POD")
+  if [ -n "$identity" ] && [ "$identity" != "$EXPECTED_POD" ]; then
+    echo "error: pod '$POD' does not have the exact crewmate installation identity" >&2
+    exit 2
+  fi
+  if [ -n "$identity" ]; then
+    echo "error: crewmate Pod '$POD' already exists; use restart" >&2
+    exit 2
+  fi
   require_owned_pvc_or_absent >/dev/null
 }
 
@@ -172,21 +283,71 @@ preflight_existing_home() {
 }
 
 stop_owned_pod() {
-  local pod
-  pod=$(require_owned_or_absent pod "$POD" "$EXPECTED_POD")
+  local pod uid rv
+  pod=$(pod_record)
   if [ -z "$pod" ]; then
     return
   fi
-  kube delete pod "$POD" --ignore-not-found --wait=false
+  if [ "$(printf '%s' "$pod" | cut -f1-4)" != "$EXPECTED_POD" ]; then
+    echo "error: pod '$POD' does not have the exact crewmate installation identity" >&2
+    exit 2
+  fi
+  uid=$(printf '%s' "$pod" | cut -f6)
+  rv=$(printf '%s' "$pod" | cut -f7)
+  if [ -z "$uid" ] || [ -z "$rv" ]; then
+    echo "error: Pod deletion requires exact UID and resourceVersion evidence" >&2
+    exit 2
+  fi
+  printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s"}}\n' "$uid" | \
+    kube delete --raw "/api/v1/namespaces/$NAMESPACE/pods/$POD" -f -
   kube wait --for=delete "pod/$POD" --timeout=180s
 }
 
 invalidate_checkpoint_evidence() {
-  local pvc
+  local pvc uid rv patch
   pvc=$(require_owned_pvc_or_absent)
   [ -n "$pvc" ] || return
-  kube annotate pvc "$PVC" agent-os.dev/checkpoint-state=pending agent-os.dev/checkpoint-at- \
-    agent-os.dev/quiesced-operation="$OPERATION_ID" agent-os.dev/checkpoint-operation- --overwrite
+  uid=$(printf '%s' "$pvc" | cut -f9)
+  rv=$(printf '%s' "$pvc" | cut -f10)
+  if [ -z "$uid" ] || [ -z "$rv" ]; then
+    echo "error: checkpoint invalidation requires exact PVC UID and resourceVersion evidence" >&2
+    exit 2
+  fi
+  patch=$(printf '{"metadata":{"uid":"%s","resourceVersion":"%s","annotations":{"agent-os.dev/checkpoint-state":"pending","agent-os.dev/checkpoint-at":null,"agent-os.dev/quiesced-operation":null,"agent-os.dev/checkpoint-operation":null}}}' "$uid" "$rv")
+  kube patch pvc "$PVC" --type=merge -p "$patch" >/dev/null
+}
+
+record_quiesced_generation() {
+  local pvc uid rv patch
+  pvc=$(require_owned_pvc_or_absent)
+  [ -n "$pvc" ] || return
+  if [ "$(printf '%s' "$pvc" | cut -f5)" != pending ]; then
+    echo "error: checkpoint evidence changed before quiesced generation could be recorded" >&2
+    exit 2
+  fi
+  uid=$(printf '%s' "$pvc" | cut -f9)
+  rv=$(printf '%s' "$pvc" | cut -f10)
+  if [ -z "$uid" ] || [ -z "$rv" ]; then
+    echo "error: quiesced generation requires exact PVC UID and resourceVersion evidence" >&2
+    exit 2
+  fi
+  patch=$(printf '{"metadata":{"uid":"%s","resourceVersion":"%s","annotations":{"agent-os.dev/quiesced-operation":"%s"}}}' "$uid" "$rv" "$OPERATION_ID")
+  kube patch pvc "$PVC" --type=merge -p "$patch" >/dev/null
+}
+
+quiesce_owned_home() {
+  local pod
+  invalidate_checkpoint_evidence
+  stop_owned_pod
+  if ! pod=$(pod_record); then
+    echo "error: could not prove Pod absence after deletion" >&2
+    exit 3
+  fi
+  if [ -n "$pod" ]; then
+    echo "error: Pod '$POD' reappeared before quiesced checkpoint generation" >&2
+    exit 3
+  fi
+  record_quiesced_generation
 }
 
 record_purge() {
@@ -200,13 +361,19 @@ case "$COMMAND" in
   create)
     [ -z "$CONFIRM" ] || { echo "usage: $0 create <crewmate-id>" >&2; exit 2; }
     validate_ai_grant
+    acquire_lock
     preflight_create
-    apply_and_wait
+    create_and_wait
     ;;
   status)
     [ -z "$CONFIRM" ] || { echo "usage: $0 status <crewmate-id>" >&2; exit 2; }
-    if [ -z "$(require_owned_or_absent pod "$POD" "$EXPECTED_POD")" ]; then
+    pod=$(pod_record)
+    if [ -z "$pod" ]; then
       echo "error: crewmate Pod '$POD' does not exist" >&2
+      exit 2
+    fi
+    if [ "$(printf '%s' "$pod" | cut -f1-4)" != "$EXPECTED_POD" ]; then
+      echo "error: pod '$POD' does not have the exact crewmate installation identity" >&2
       exit 2
     fi
     require_owned_pvc_or_absent >/dev/null
@@ -214,17 +381,17 @@ case "$COMMAND" in
     ;;
   stop)
     [ -z "$CONFIRM" ] || { echo "usage: $0 stop <crewmate-id>" >&2; exit 2; }
+    acquire_lock
     require_owned_pvc_or_absent >/dev/null
-    stop_owned_pod
-    invalidate_checkpoint_evidence
+    quiesce_owned_home
     ;;
   restart)
     [ -z "$CONFIRM" ] || { echo "usage: $0 restart <crewmate-id>" >&2; exit 2; }
     validate_ai_grant
+    acquire_lock
     preflight_existing_home >/dev/null
-    stop_owned_pod
-    invalidate_checkpoint_evidence
-    apply_and_wait
+    quiesce_owned_home
+    create_and_wait
     ;;
   purge)
     echo "purge target: namespace/$NAMESPACE pod/$POD pvc/$PVC" >&2
@@ -232,7 +399,16 @@ case "$COMMAND" in
       echo "error: purge requires the purge-specific --yes confirmation" >&2
       exit 2
     fi
-    if [ -n "$(require_owned_or_absent pod "$POD" "$EXPECTED_POD")" ]; then
+    acquire_lock
+    if ! pod=$(pod_record); then
+      echo "error: could not prove crewmate Pod absence before purge" >&2
+      exit 3
+    fi
+    if [ -n "$pod" ]; then
+      if [ "$(printf '%s' "$pod" | cut -f1-4)" != "$EXPECTED_POD" ]; then
+        echo "error: pod '$POD' does not have the exact crewmate installation identity" >&2
+        exit 2
+      fi
       echo "error: stop the owned crewmate Pod and prove its absence before checkpointing for purge" >&2
       exit 2
     fi
@@ -253,6 +429,42 @@ case "$COMMAND" in
       echo "error: purge requires checkpoint evidence created for the current quiesced PVC generation" >&2
       exit 2
     fi
+    if ! command -v jq >/dev/null 2>&1; then
+      echo "error: jq is required to prove that the persistent home is detached" >&2
+      exit 2
+    fi
+    if ! pods_json=$(kube get pods -o json); then
+      echo "error: purge could not inventory Pods that may reference PVC '$PVC'" >&2
+      exit 3
+    fi
+    if ! attached=$(printf '%s' "$pods_json" | jq -r --arg claim "$PVC" \
+      '[.items[]? | any(.spec.volumes[]?; .persistentVolumeClaim.claimName == $claim)] | any'); then
+      echo "error: purge could not validate the Pod attachment inventory" >&2
+      exit 3
+    fi
+    if [ "$attached" = true ]; then
+      echo "error: purge refuses PVC '$PVC' while any Pod still references it" >&2
+      exit 2
+    fi
+    if ! pod=$(pod_record); then
+      echo "error: could not re-prove crewmate Pod absence during purge" >&2
+      exit 3
+    fi
+    if [ -n "$pod" ]; then
+      echo "error: crewmate Pod '$POD' reappeared during purge validation" >&2
+      exit 3
+    fi
+    current_pvc=$(require_owned_pvc_or_absent)
+    if [ "$current_pvc" != "$pvc" ]; then
+      echo "error: PVC identity, checkpoint, UID, or resourceVersion changed during purge validation" >&2
+      exit 3
+    fi
+    pvc_uid=$(printf '%s' "$pvc" | cut -f9)
+    pvc_rv=$(printf '%s' "$pvc" | cut -f10)
+    if [ -z "$pvc_uid" ] || [ -z "$pvc_rv" ]; then
+      echo "error: purge requires exact PVC UID and resourceVersion evidence" >&2
+      exit 2
+    fi
     evidence_file=${AGENT_OS_PURGE_EVIDENCE_FILE:-}
     if [ -z "$evidence_file" ] && [ -n "${FM_HOME:-}" ]; then
       evidence_file="$FM_HOME/data/crewmate-purge-evidence.log"
@@ -264,7 +476,10 @@ case "$COMMAND" in
     mkdir -p "$(dirname "$evidence_file")"
     exec 3>>"$evidence_file"
     record_purge purge-requested "$checkpoint_at"
-    kube delete pvc "$PVC" --ignore-not-found --wait=true --timeout=180s
+    printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s","resourceVersion":"%s"}}\n' \
+      "$pvc_uid" "$pvc_rv" | \
+      kube delete --raw "/api/v1/namespaces/$NAMESPACE/persistentvolumeclaims/$PVC" -f -
+    kube wait --for=delete "pvc/$PVC" --timeout=180s
     record_purge purge-complete "$checkpoint_at"
     ;;
   delete)

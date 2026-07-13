@@ -213,6 +213,16 @@ delete_namespace_rbac() {
 
 resource_observation() {
   local scope=$1 kind=$2 name=$3
+  if [ "$kind" = StatefulSet ]; then
+    "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get "$kind" "$name" --ignore-not-found \
+      -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.uid}{"\t"}{.metadata.labels.agent-os\.dev/operation-id}{"\t"}{"\t"}{.metadata.finalizers}{"\t"}{.spec.replicas}{"\t"}{.status.currentReplicas}{"\t"}{.status.readyReplicas}{"\t"}{.status.updatedReplicas}{"\t"}{.status.availableReplicas}{"\t"}{.status.currentRevision}{"\t"}{.status.updateRevision}{"\t"}{.metadata.generation}{"\t"}{.status.observedGeneration}'
+    return
+  fi
+  if [ "$kind" = Pod ]; then
+    "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get "$kind" "$name" --ignore-not-found \
+      -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.uid}{"\t"}{.metadata.labels.agent-os\.dev/operation-id}{"\t"}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\t"}{.metadata.finalizers}{"\t"}{range .status.containerStatuses[*]}{.name}{"="}{.state.waiting.reason}{.state.terminated.reason}{","}{end}'
+    return
+  fi
   if [ "$scope" = cluster ]; then
     "$KUBECTL" --context "$CONTEXT" get "$kind" "$name" --ignore-not-found \
       -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.uid}{"\t"}{.metadata.labels.agent-os\.dev/operation-id}{"\t"}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\t"}{.metadata.finalizers}'
@@ -223,12 +233,13 @@ resource_observation() {
 }
 
 lifecycle_command() {
+  local action=${1:-$COMMAND}
   printf 'AGENT_OS_CONTEXT=%q AGENT_OS_NAMESPACE=%q AGENT_OS_PACKAGE=%q AGENT_OS_INPUTS=%q AGENT_OS_AKUA=%q AGENT_OS_KUBECTL=%q %q %q' \
-    "$CONTEXT" "$NAMESPACE" "$PACKAGE" "$INPUTS" "$AKUA" "$KUBECTL" "$0" "$COMMAND"
+    "$CONTEXT" "$NAMESPACE" "$PACKAGE" "$INPUTS" "$AKUA" "$KUBECTL" "$0" "$action"
 }
 
 report_partial_observation() {
-  local kind=$1 name=$2 scope=$3 record managed installation uid operation ready finalizers prefix
+  local kind=$1 name=$2 scope=$3 record managed installation uid operation ready finalizers prefix details
   if ! record=$(resource_observation "$scope" "$kind" "$name"); then
     echo "partial apply: $kind/$name observation=unavailable expected-operation=$OPERATION_ID" >&2
     return
@@ -242,16 +253,111 @@ report_partial_observation() {
   uid=$(printf '%s' "$record" | cut -f4)
   operation=$(printf '%s' "$record" | cut -f5)
   ready=$(printf '%s' "$record" | cut -f6)
-  finalizers=$(printf '%s' "$record" | cut -f7-)
+  finalizers=$(printf '%s' "$record" | cut -f7)
   [ -n "$ready" ] || ready=unknown
   [ -n "$finalizers" ] || finalizers='[]'
   prefix='partial apply'
   [ "$kind" != ClusterRoleBinding ] || prefix='residual-authority'
-  echo "$prefix: $kind/$name uid=$uid operation=$operation ready=$ready ownership=$managed installation=$installation finalizers=$finalizers" >&2
+  details="ready=$ready"
+  if [ "$kind" = StatefulSet ]; then
+    details="desired=$(printf '%s' "$record" | cut -f8) current=$(printf '%s' "$record" | cut -f9) ready=$(printf '%s' "$record" | cut -f10) updated=$(printf '%s' "$record" | cut -f11) available=$(printf '%s' "$record" | cut -f12) current-revision=$(printf '%s' "$record" | cut -f13) update-revision=$(printf '%s' "$record" | cut -f14) generation=$(printf '%s' "$record" | cut -f15) observed-generation=$(printf '%s' "$record" | cut -f16)"
+  elif [ "$kind" = Pod ]; then
+    details="ready=$ready reasons=$(printf '%s' "$record" | cut -f8-)"
+  fi
+  echo "$prefix: $kind/$name uid=$uid operation=$operation $details ownership=$managed installation=$installation finalizers=$finalizers" >&2
+}
+
+partial_install_is_applicable() {
+  local file kind name identity expected namespace
+  if ! namespace=$(namespace_name 2>/dev/null); then
+    return 1
+  fi
+  if [ "$MANAGES_NAMESPACE" -eq 1 ]; then
+    if [ -n "$namespace" ]; then
+      if ! identity=$(namespace_identity 2>/dev/null); then
+        return 1
+      fi
+      [ "$identity" = "agent-os"$'\t'"$INSTALLATION_ID" ] || return 1
+    fi
+  else
+    [ -n "$namespace" ] || return 1
+    if ! identity=$(namespace_identity 2>/dev/null); then
+      return 1
+    fi
+    [ "$identity" = $'\t' ] || return 1
+  fi
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    kind=$(rendered_resource_field "$file" kind)
+    name=$(rendered_resource_field "$file" name)
+    case "$kind" in
+      Namespace) continue ;;
+      ClusterRoleBinding)
+        if ! identity=$("$KUBECTL" --context "$CONTEXT" get clusterrolebinding "$name" --ignore-not-found \
+          -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}' 2>/dev/null); then
+          return 1
+        fi
+        ;;
+      *)
+        if ! identity=$(live_resource_identity "$kind" "$name" 2>/dev/null); then
+          return 1
+        fi
+        ;;
+    esac
+    expected="$name"$'\t'"agent-os"$'\t'"$INSTALLATION_ID"
+    [ -z "$identity" ] || [ "$identity" = "$expected" ] || return 1
+  done < <(find "$OUT" -type f -name '*.yaml' -print)
+}
+
+partial_recovery_action() {
+  local state identity namespace
+  if ! namespace=$(namespace_name 2>/dev/null); then
+    return 1
+  fi
+  state=
+  if [ -n "$namespace" ] && ! state=$(workload_state 2>/dev/null); then
+    return 1
+  fi
+  if [ -n "$state" ]; then
+    identity=$(printf '%s' "$state" | cut -f1,4,5)
+    if [ "$identity" = "agent-os-firstmate"$'\t'"agent-os"$'\t'"$INSTALLATION_ID" ]; then
+      printf upgrade
+      return
+    fi
+    return 1
+  fi
+  if partial_install_is_applicable; then
+    printf install
+    return
+  fi
+  return 1
+}
+
+partial_cleanup_is_applicable() {
+  local binding workload mode marker identity namespace
+  if ! binding=$(resource_observation cluster ClusterRoleBinding "agent-os-firstmate-$NAMESPACE" 2>/dev/null); then
+    return 1
+  fi
+  [ -n "$binding" ] || return 1
+  identity=$(printf '%s' "$binding" | cut -f2,3)
+  [ "$identity" = "agent-os"$'\t'"$INSTALLATION_ID" ] || return 1
+  if ! namespace=$(namespace_name 2>/dev/null); then
+    return 1
+  fi
+  [ -n "$namespace" ] || return 0
+  if ! workload=$(workload_state 2>/dev/null); then
+    return 1
+  fi
+  [ -n "$workload" ] || return 0
+  identity=$(printf '%s' "$workload" | cut -f1,4,5)
+  [ "$identity" = "agent-os-firstmate"$'\t'"agent-os"$'\t'"$INSTALLATION_ID" ] || return 1
+  mode=$(printf '%s' "$workload" | cut -f2)
+  marker=$(printf '%s' "$workload" | cut -f3)
+  [ "$mode" != cluster-admin ] && [ "$marker" = required ]
 }
 
 report_partial_apply() {
-  local phase=$1 file kind name scope
+  local phase=$1 file kind name scope recovery
   echo "incomplete: primary $phase failed; automatic cleanup withheld pending exact recovery" >&2
   while IFS= read -r file; do
     [ -n "$file" ] || continue
@@ -266,8 +372,16 @@ report_partial_apply() {
   done < <(find "$OUT" -type f -name '*.yaml' -print)
   report_partial_observation Pod agent-os-firstmate-0 namespaced
   report_partial_observation ClusterRoleBinding "agent-os-firstmate-$NAMESPACE" cluster
-  echo "safe recovery: $(lifecycle_command)" >&2
-  echo "privileged cleanup if the reported grant is stale: $(cleanup_command)" >&2
+  if recovery=$(partial_recovery_action); then
+    echo "safe recovery: $(lifecycle_command "$recovery")" >&2
+  else
+    echo "safe recovery unavailable: workload ownership changed; inspect retained resources" >&2
+  fi
+  if partial_cleanup_is_applicable; then
+    echo "privileged cleanup with proven predicates: $(cleanup_command)" >&2
+  else
+    echo "privileged cleanup unavailable: stale-grant predicates are not proven" >&2
+  fi
   return 3
 }
 
@@ -295,7 +409,8 @@ verify_desired_rbac() {
       .rules == [
         {"apiGroups":[""],"resources":["pods","persistentvolumeclaims"],"verbs":["get","list","watch","create","delete","patch"]},
         {"apiGroups":[""],"resources":["pods/log","pods/exec"],"verbs":["get","list","watch","create","delete"]},
-        {"apiGroups":["apps"],"resources":["statefulsets"],"verbs":["get","list","watch"]}
+        {"apiGroups":["apps"],"resources":["statefulsets"],"verbs":["get","list","watch"]},
+        {"apiGroups":["coordination.k8s.io"],"resources":["leases"],"verbs":["get","list","watch","create","delete"]}
       ]' >/dev/null ||
       ! printf '%s' "$binding_json" | jq -e --arg namespace "$NAMESPACE" '
         .roleRef == {"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"agent-os-firstmate-runtime"} and
@@ -323,7 +438,7 @@ uninstall_command() {
 }
 
 report_retained_observation() {
-  local kind=$1 name=$2 scope=$3 record managed installation uid operation ready finalizers identity expected
+  local kind=$1 name=$2 scope=$3 record managed installation uid operation ready finalizers identity expected details
   if ! record=$(resource_observation "$scope" "$kind" "$name"); then
     echo "retained-unverified: $kind/$name could not be inspected; no further deletion attempted" >&2
     return
@@ -334,13 +449,19 @@ report_retained_observation() {
   uid=$(printf '%s' "$record" | cut -f4)
   operation=$(printf '%s' "$record" | cut -f5)
   ready=$(printf '%s' "$record" | cut -f6)
-  finalizers=$(printf '%s' "$record" | cut -f7-)
+  finalizers=$(printf '%s' "$record" | cut -f7)
   identity="$managed"$'\t'"$installation"
   expected="agent-os"$'\t'"$INSTALLATION_ID"
   [ -n "$ready" ] || ready=unknown
   [ -n "$finalizers" ] || finalizers='[]'
+  details="ready=$ready"
+  if [ "$kind" = StatefulSet ]; then
+    details="desired=$(printf '%s' "$record" | cut -f8) current=$(printf '%s' "$record" | cut -f9) ready=$(printf '%s' "$record" | cut -f10) updated=$(printf '%s' "$record" | cut -f11) available=$(printf '%s' "$record" | cut -f12) current-revision=$(printf '%s' "$record" | cut -f13) update-revision=$(printf '%s' "$record" | cut -f14) generation=$(printf '%s' "$record" | cut -f15) observed-generation=$(printf '%s' "$record" | cut -f16)"
+  elif [ "$kind" = Pod ]; then
+    details="ready=$ready reasons=$(printf '%s' "$record" | cut -f8-)"
+  fi
   if [ "$identity" = "$expected" ]; then
-    echo "retained: $kind/$name uid=$uid operation=$operation ready=$ready ownership=$managed installation=$installation finalizers=$finalizers" >&2
+    echo "retained: $kind/$name uid=$uid operation=$operation $details ownership=$managed installation=$installation finalizers=$finalizers" >&2
   else
     echo "retained-unverified: $kind/$name uid=$uid operation=$operation ownership=$managed installation=$installation; no further deletion attempted" >&2
   fi
