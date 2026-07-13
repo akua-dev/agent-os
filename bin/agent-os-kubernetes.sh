@@ -14,14 +14,16 @@ NAMESPACE=${REQUESTED_NAMESPACE:-agent-os}
 AKUA=${AGENT_OS_AKUA:-akua}
 KUBECTL=${AGENT_OS_KUBECTL:-kubectl}
 OUT=$(mktemp -d)
+RENDER_INPUTS=$(mktemp)
 CONFIRMED=0
 DELETE_NAMESPACE=0
 MANAGES_NAMESPACE=0
 DESIRED_RBAC=none
 INSTALLATION_ID=
+OPERATION_ID=${AGENT_OS_OPERATION_ID:-"$(date -u '+%Y%m%d%H%M%S')-$$-$RANDOM"}
 
 cleanup() {
-  rm -rf "$OUT"
+  rm -rf "$OUT" "$RENDER_INPUTS"
 }
 trap cleanup EXIT
 
@@ -43,6 +45,10 @@ if [ -z "$CONTEXT" ]; then
   echo "error: set AGENT_OS_CONTEXT to the Kubernetes context to operate" >&2
   exit 2
 fi
+case "$OPERATION_ID" in
+  ''|*[!a-z0-9.-]*|[.-]*|*[-.]) echo "error: invalid operation id" >&2; exit 2 ;;
+esac
+[ "${#OPERATION_ID}" -le 63 ] || { echo "error: invalid operation id" >&2; exit 2; }
 
 render_has_kind() {
   grep -R -Eq "^kind:[[:space:]]*$1$" "$OUT"
@@ -58,7 +64,13 @@ render() {
     echo "error: Akua renderer '$AKUA' is required for Kubernetes package operations" >&2
     exit 2
   fi
-  "$AKUA" render --no-agent-mode --package "$PACKAGE" --inputs "$INPUTS" --out "$OUT"
+  if grep -Eq '^[[:space:]]*operationId:' "$INPUTS"; then
+    echo "error: operationId is reserved for the lifecycle helper" >&2
+    exit 2
+  fi
+  cp "$INPUTS" "$RENDER_INPUTS"
+  printf '\noperationId: %s\n' "$OPERATION_ID" >> "$RENDER_INPUTS"
+  "$AKUA" render --no-agent-mode --package "$PACKAGE" --inputs "$RENDER_INPUTS" --out "$OUT"
   statefulset=$(rendered_statefulset)
   statefulset_count=$(printf '%s\n' "$statefulset" | sed '/^$/d' | wc -l | tr -d ' ')
   if [ "$statefulset_count" -ne 1 ]; then
@@ -199,9 +211,74 @@ delete_namespace_rbac() {
   fi
 }
 
+resource_observation() {
+  local scope=$1 kind=$2 name=$3
+  if [ "$scope" = cluster ]; then
+    "$KUBECTL" --context "$CONTEXT" get "$kind" "$name" --ignore-not-found \
+      -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.uid}{"\t"}{.metadata.labels.agent-os\.dev/operation-id}{"\t"}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\t"}{.metadata.finalizers}'
+  else
+    "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get "$kind" "$name" --ignore-not-found \
+      -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.uid}{"\t"}{.metadata.labels.agent-os\.dev/operation-id}{"\t"}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\t"}{.metadata.finalizers}'
+  fi
+}
+
+lifecycle_command() {
+  printf 'AGENT_OS_CONTEXT=%q AGENT_OS_NAMESPACE=%q AGENT_OS_PACKAGE=%q AGENT_OS_INPUTS=%q AGENT_OS_AKUA=%q AGENT_OS_KUBECTL=%q %q %q' \
+    "$CONTEXT" "$NAMESPACE" "$PACKAGE" "$INPUTS" "$AKUA" "$KUBECTL" "$0" "$COMMAND"
+}
+
+report_partial_observation() {
+  local kind=$1 name=$2 scope=$3 record managed installation uid operation ready finalizers prefix
+  if ! record=$(resource_observation "$scope" "$kind" "$name"); then
+    echo "partial apply: $kind/$name observation=unavailable expected-operation=$OPERATION_ID" >&2
+    return
+  fi
+  if [ -z "$record" ]; then
+    echo "partial apply: $kind/$name observed=absent expected-operation=$OPERATION_ID" >&2
+    return
+  fi
+  managed=$(printf '%s' "$record" | cut -f2)
+  installation=$(printf '%s' "$record" | cut -f3)
+  uid=$(printf '%s' "$record" | cut -f4)
+  operation=$(printf '%s' "$record" | cut -f5)
+  ready=$(printf '%s' "$record" | cut -f6)
+  finalizers=$(printf '%s' "$record" | cut -f7-)
+  [ -n "$ready" ] || ready=unknown
+  [ -n "$finalizers" ] || finalizers='[]'
+  prefix='partial apply'
+  [ "$kind" != ClusterRoleBinding ] || prefix='residual-authority'
+  echo "$prefix: $kind/$name uid=$uid operation=$operation ready=$ready ownership=$managed installation=$installation finalizers=$finalizers" >&2
+}
+
+report_partial_apply() {
+  local phase=$1 file kind name scope
+  echo "incomplete: primary $phase failed; automatic cleanup withheld pending exact recovery" >&2
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    kind=$(rendered_resource_field "$file" kind)
+    name=$(rendered_resource_field "$file" name)
+    scope=namespaced
+    case "$kind" in
+      ClusterRoleBinding) continue ;;
+      Namespace) scope=cluster ;;
+    esac
+    report_partial_observation "$kind" "$name" "$scope"
+  done < <(find "$OUT" -type f -name '*.yaml' -print)
+  report_partial_observation Pod agent-os-firstmate-0 namespaced
+  report_partial_observation ClusterRoleBinding "agent-os-firstmate-$NAMESPACE" cluster
+  echo "safe recovery: $(lifecycle_command)" >&2
+  echo "privileged cleanup if the reported grant is stale: $(cleanup_command)" >&2
+  return 3
+}
+
 apply_rendered() {
-  "$KUBECTL" --context "$CONTEXT" apply -f "$OUT"
-  "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" rollout status statefulset/agent-os-firstmate --timeout=180s
+  if ! "$KUBECTL" --context "$CONTEXT" apply -f "$OUT"; then
+    report_partial_apply apply
+  fi
+  if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" rollout status \
+    statefulset/agent-os-firstmate --timeout=180s; then
+    report_partial_apply rollout
+  fi
 }
 
 verify_desired_rbac() {
@@ -245,8 +322,41 @@ uninstall_command() {
   [ "$DELETE_NAMESPACE" -eq 0 ] || printf ' --delete-namespace'
 }
 
+report_retained_observation() {
+  local kind=$1 name=$2 scope=$3 record managed installation uid operation ready finalizers identity expected
+  if ! record=$(resource_observation "$scope" "$kind" "$name"); then
+    echo "retained-unverified: $kind/$name could not be inspected; no further deletion attempted" >&2
+    return
+  fi
+  [ -n "$record" ] || return
+  managed=$(printf '%s' "$record" | cut -f2)
+  installation=$(printf '%s' "$record" | cut -f3)
+  uid=$(printf '%s' "$record" | cut -f4)
+  operation=$(printf '%s' "$record" | cut -f5)
+  ready=$(printf '%s' "$record" | cut -f6)
+  finalizers=$(printf '%s' "$record" | cut -f7-)
+  identity="$managed"$'\t'"$installation"
+  expected="agent-os"$'\t'"$INSTALLATION_ID"
+  [ -n "$ready" ] || ready=unknown
+  [ -n "$finalizers" ] || finalizers='[]'
+  if [ "$identity" = "$expected" ]; then
+    echo "retained: $kind/$name uid=$uid operation=$operation ready=$ready ownership=$managed installation=$installation finalizers=$finalizers" >&2
+  else
+    echo "retained-unverified: $kind/$name uid=$uid operation=$operation ownership=$managed installation=$installation; no further deletion attempted" >&2
+  fi
+}
+
 report_retained_resources() {
-  local file kind name record identity expected finalizers
+  local failed_target=$1 file kind name scope
+  echo "failed-target: $failed_target timeout=180s" >&2
+  kind=${failed_target%%/*}
+  name=${failed_target#*/}
+  scope=namespaced
+  [ "$kind" != Namespace ] || scope=cluster
+  report_retained_observation "$kind" "$name" "$scope"
+  report_retained_observation Pod agent-os-firstmate-0 namespaced
+  report_retained_observation Role agent-os-firstmate-runtime namespaced
+  report_retained_observation RoleBinding agent-os-firstmate-runtime namespaced
   while IFS= read -r file; do
     [ -n "$file" ] || continue
     kind=$(rendered_resource_field "$file" kind)
@@ -255,39 +365,21 @@ report_retained_resources() {
       ClusterRoleBinding) continue ;;
       Namespace)
         [ "$DELETE_NAMESPACE" -eq 1 ] || continue
-        if ! record=$("$KUBECTL" --context "$CONTEXT" get namespace "$name" --ignore-not-found \
-          -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.finalizers}'); then
-          echo "retained-unverified: Namespace/$name could not be inspected; no further deletion attempted" >&2
-          continue
-        fi
+        scope=cluster
         ;;
-      *)
-        if ! record=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get "$kind" "$name" --ignore-not-found \
-          -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.finalizers}'); then
-          echo "retained-unverified: $kind/$name could not be inspected; no further deletion attempted" >&2
-          continue
-        fi
-        ;;
+      *) scope=namespaced ;;
     esac
-    [ -n "$record" ] || continue
-    identity=$(printf '%s' "$record" | cut -f1-3)
-    expected="$name"$'\t'"agent-os"$'\t'"$INSTALLATION_ID"
-    if [ "$identity" = "$expected" ]; then
-      finalizers=$(printf '%s' "$record" | cut -f4-)
-      [ -n "$finalizers" ] || finalizers='[]'
-      echo "retained: $kind/$name finalizers=$finalizers" >&2
-    else
-      echo "retained-unverified: $kind/$name ownership changed; no further deletion attempted" >&2
-    fi
+    report_retained_observation "$kind" "$name" "$scope"
   done < <(find "$OUT" -type f -name '*.yaml' -print)
   echo "safe retry: $(uninstall_command)" >&2
+  echo "cluster cleanup if required: $(cleanup_command)" >&2
 }
 
 bounded_delete_failure() {
   local target=$1
   if [ "$COMMAND" = uninstall ]; then
     echo "incomplete: timed out deleting $target after 180s" >&2
-    report_retained_resources
+    report_retained_resources "$target"
     return 3
   fi
   echo "error: timed out deleting $target after 180s" >&2

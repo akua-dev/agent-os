@@ -14,6 +14,7 @@ AI_SECRET=${AGENT_OS_AI_SECRET:-}
 KUBECTL=${AGENT_OS_KUBECTL:-kubectl}
 TEMPLATE=${AGENT_OS_CREWMATE_TEMPLATE:-/opt/agent-os/tools/agent-os/packages/firstmate/crewmate.yaml}
 INSTALLATION_ID="agent-os-firstmate:$NAMESPACE"
+OPERATION_ID=${AGENT_OS_OPERATION_ID:-"$(date -u '+%Y%m%d%H%M%S')-$$-$RANDOM"}
 
 if [ ! -f "$TEMPLATE" ]; then
   TEMPLATE="$ROOT/tools/agent-os/packages/firstmate/crewmate.yaml"
@@ -22,6 +23,10 @@ fi
 case "$ID" in
   ''|*[!a-z0-9-]*|-*|*-) echo "error: invalid crewmate id '$ID'" >&2; exit 2 ;;
 esac
+case "$OPERATION_ID" in
+  ''|*[!a-z0-9.-]*|[.-]*|*[-.]) echo "error: invalid operation id" >&2; exit 2 ;;
+esac
+[ "${#OPERATION_ID}" -le 63 ] || { echo "error: invalid operation id" >&2; exit 2; }
 
 KUBECTL_ARGS=()
 if [ -n "${AGENT_OS_CONTEXT:-}" ]; then
@@ -48,12 +53,12 @@ resource_identity() {
 
 pod_record() {
   kube get pod "$POD" --ignore-not-found \
-    -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.uid}'
+    -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.labels.agent-os\.dev/operation-id}{"\t"}{.metadata.uid}'
 }
 
 pvc_record() {
   kube get pvc "$PVC" --ignore-not-found \
-    -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.annotations.agent-os\.dev/checkpoint-state}{"\t"}{.metadata.annotations.agent-os\.dev/checkpoint-at}'
+    -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.annotations.agent-os\.dev/checkpoint-state}{"\t"}{.metadata.annotations.agent-os\.dev/checkpoint-at}{"\t"}{.metadata.annotations.agent-os\.dev/quiesced-operation}{"\t"}{.metadata.annotations.agent-os\.dev/checkpoint-operation}'
 }
 
 require_owned_or_absent() {
@@ -101,20 +106,23 @@ render_resources() {
     -e "s|__AGENT_OS_IMAGE__|$IMAGE|g" \
     -e "s|__AGENT_OS_IMAGE_PULL_POLICY__|$IMAGE_PULL_POLICY|g" \
     -e "s|__AGENT_OS_AI_SECRET__|$AI_SECRET|g" \
+    -e "s|__AGENT_OS_OPERATION_ID__|$OPERATION_ID|g" \
     "$TEMPLATE"
 }
 
 cleanup_new_owned_pod() {
-  local before_uid=$1 after current identity after_uid
+  local before_uid=$1 after current identity after_operation after_uid
   after=$(pod_record)
   if [ -z "$after" ]; then
     echo "partial state: crewmate apply left no Pod; persistent home retained" >&2
     return
   fi
   identity=$(printf '%s' "$after" | cut -f1-4)
-  after_uid=$(printf '%s' "$after" | cut -f5)
-  if [ "$identity" != "$EXPECTED_POD" ] || [ -z "$after_uid" ] || [ -n "$before_uid" ]; then
-    echo "partial state: Pod was not proven newly created and owned; persistent home retained" >&2
+  after_operation=$(printf '%s' "$after" | cut -f5)
+  after_uid=$(printf '%s' "$after" | cut -f6)
+  if [ "$identity" != "$EXPECTED_POD" ] || [ "$after_operation" != "$OPERATION_ID" ] || \
+    [ -z "$after_uid" ] || [ -n "$before_uid" ]; then
+    echo "partial state: replacement or ownership mismatch retained; persistent home retained" >&2
     return
   fi
   current=$(pod_record)
@@ -123,14 +131,18 @@ cleanup_new_owned_pod() {
     return
   fi
   echo "partial state: removing newly created owned Pod '$POD' uid=$after_uid; persistent home retained" >&2
-  kube delete pod "$POD" --ignore-not-found --wait=false
+  if ! printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s"}}\n' "$after_uid" | \
+    kube delete --raw "/api/v1/namespaces/$NAMESPACE/pods/$POD" -f -; then
+    echo "partial state: UID-precondition rejected; replacement or ownership mismatch retained" >&2
+    return
+  fi
   kube wait --for=delete "pod/$POD" --timeout=180s
 }
 
 apply_and_wait() {
   local before before_uid
   before=$(pod_record)
-  before_uid=$(printf '%s' "$before" | cut -f5)
+  before_uid=$(printf '%s' "$before" | cut -f6)
   if ! render_resources | kube apply -f -; then
     cleanup_new_owned_pod "$before_uid"
     echo "error: crewmate resources were only partially applied" >&2
@@ -169,6 +181,14 @@ stop_owned_pod() {
   kube wait --for=delete "pod/$POD" --timeout=180s
 }
 
+invalidate_checkpoint_evidence() {
+  local pvc
+  pvc=$(require_owned_pvc_or_absent)
+  [ -n "$pvc" ] || return
+  kube annotate pvc "$PVC" agent-os.dev/checkpoint-state=pending agent-os.dev/checkpoint-at- \
+    agent-os.dev/quiesced-operation="$OPERATION_ID" agent-os.dev/checkpoint-operation- --overwrite
+}
+
 record_purge() {
   local phase=$1 checkpoint_at=$2 timestamp
   timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -196,12 +216,14 @@ case "$COMMAND" in
     [ -z "$CONFIRM" ] || { echo "usage: $0 stop <crewmate-id>" >&2; exit 2; }
     require_owned_pvc_or_absent >/dev/null
     stop_owned_pod
+    invalidate_checkpoint_evidence
     ;;
   restart)
     [ -z "$CONFIRM" ] || { echo "usage: $0 restart <crewmate-id>" >&2; exit 2; }
     validate_ai_grant
     preflight_existing_home >/dev/null
     stop_owned_pod
+    invalidate_checkpoint_evidence
     apply_and_wait
     ;;
   purge)
@@ -217,12 +239,18 @@ case "$COMMAND" in
     pvc=$(preflight_existing_home)
     checkpoint_state=$(printf '%s' "$pvc" | cut -f5)
     checkpoint_at=$(printf '%s' "$pvc" | cut -f6)
+    quiesced_operation=$(printf '%s' "$pvc" | cut -f7)
+    checkpoint_operation=$(printf '%s' "$pvc" | cut -f8)
     if [[ ! "$checkpoint_at" =~ ^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$ ]]; then
       echo "error: purge requires a valid non-secret checkpoint timestamp" >&2
       exit 2
     fi
     if [ "$checkpoint_state" != clean ]; then
       echo "error: purge requires agent-os.dev/checkpoint-state=clean on '$PVC'" >&2
+      exit 2
+    fi
+    if [ -z "$quiesced_operation" ] || [ "$checkpoint_operation" != "$quiesced_operation" ]; then
+      echo "error: purge requires checkpoint evidence created for the current quiesced PVC generation" >&2
       exit 2
     fi
     evidence_file=${AGENT_OS_PURGE_EVIDENCE_FILE:-}

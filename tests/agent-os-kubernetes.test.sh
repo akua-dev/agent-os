@@ -48,6 +48,10 @@ fi
 if [ "${AGENT_OS_TEST_FAIL_APPLY:-0}" = 1 ] && [[ " $* " = *" apply -f - "* ]]; then
   exit 1
 fi
+if [ "${AGENT_OS_TEST_FAIL_GENERIC_APPLY:-0}" = 1 ] && [[ " $* " = *" apply -f "* ]] && \
+  [[ " $* " != *" apply -f - "* ]]; then
+  exit 1
+fi
 if [ "${AGENT_OS_TEST_FAIL_WAIT:-0}" = 1 ] && [ "${1:-}" = -n ] && [ "${3:-}" = wait ]; then
   exit 1
 fi
@@ -69,11 +73,15 @@ case " $* " in
       absent) ;;
       owned)
         printf 'agent-os-crewmate-%s\tagent-os\t%s\tagent-os-firstmate:agent-os-demo' "$id" "$id"
-        [[ " $* " != *'.metadata.uid'* ]] || printf '\tuid-owned'
+        [[ " $* " != *'.metadata.uid'* ]] || printf '\toperation-test\tuid-owned'
+        ;;
+      replacement)
+        printf 'agent-os-crewmate-%s\tagent-os\t%s\tagent-os-firstmate:agent-os-demo' "$id" "$id"
+        [[ " $* " != *'.metadata.uid'* ]] || printf '\tother-operation\tuid-replacement'
         ;;
       foreign)
         printf 'agent-os-crewmate-%s\tother\tother\tother-installation' "$id"
-        [[ " $* " != *'.metadata.uid'* ]] || printf '\tuid-foreign'
+        [[ " $* " != *'.metadata.uid'* ]] || printf '\tother-operation\tuid-foreign'
         ;;
     esac
     ;;
@@ -81,10 +89,11 @@ case " $* " in
     id=${AGENT_OS_TEST_CREWMATE_ID:-scout-1}
     case "${AGENT_OS_TEST_PVC_STATE:-absent}" in
       absent) ;;
-      owned) printf 'agent-os-crewmate-%s-home\tagent-os\t%s\tagent-os-firstmate:agent-os-demo\tpending\t' "$id" "$id" ;;
-      clean) printf 'agent-os-crewmate-%s-home\tagent-os\t%s\tagent-os-firstmate:agent-os-demo\tclean\t2026-07-13T12:00:00Z' "$id" "$id" ;;
-      invalid-checkpoint) printf 'agent-os-crewmate-%s-home\tagent-os\t%s\tagent-os-firstmate:agent-os-demo\tclean\t2026' "$id" "$id" ;;
-      foreign) printf 'agent-os-crewmate-%s-home\tother\tother\tother-installation\tclean\t2026-07-13T12:00:00Z' "$id" ;;
+      owned) printf 'agent-os-crewmate-%s-home\tagent-os\t%s\tagent-os-firstmate:agent-os-demo\tpending\t\toperation-test\t' "$id" "$id" ;;
+      clean) printf 'agent-os-crewmate-%s-home\tagent-os\t%s\tagent-os-firstmate:agent-os-demo\tclean\t2026-07-13T12:00:00Z\toperation-test\toperation-test' "$id" "$id" ;;
+      stale-clean) printf 'agent-os-crewmate-%s-home\tagent-os\t%s\tagent-os-firstmate:agent-os-demo\tclean\t2026-07-13T12:00:00Z\toperation-test\told-operation' "$id" "$id" ;;
+      invalid-checkpoint) printf 'agent-os-crewmate-%s-home\tagent-os\t%s\tagent-os-firstmate:agent-os-demo\tclean\t2026\toperation-test\toperation-test' "$id" "$id" ;;
+      foreign) printf 'agent-os-crewmate-%s-home\tother\tother\tother-installation\tclean\t2026-07-13T12:00:00Z\toperation-test\toperation-test' "$id" ;;
     esac
     ;;
   *" get namespace "*" --ignore-not-found -o name "*)
@@ -93,9 +102,16 @@ case " $* " in
       *) printf 'namespace/%s\n' "${AGENT_OS_TEST_NAMESPACE:-portable-agent-os}" ;;
     esac
     ;;
-  *" get namespace "*" -o jsonpath="*)
+  *" get namespace "*" -o jsonpath="*|*" get Namespace "*" -o jsonpath="*)
     case "${AGENT_OS_TEST_NAMESPACE_STATE:-absent}" in
-      owned) printf 'agent-os\tagent-os-firstmate:%s' "${AGENT_OS_TEST_NAMESPACE:-portable-agent-os}" ;;
+      owned)
+        if [[ " $* " = *'.metadata.uid'* ]]; then
+          printf '%s\tagent-os\tagent-os-firstmate:%s\tuid-namespace\toperation-test\tTrue\t[]' \
+            "${AGENT_OS_TEST_NAMESPACE:-portable-agent-os}" "${AGENT_OS_TEST_NAMESPACE:-portable-agent-os}"
+        else
+          printf 'agent-os\tagent-os-firstmate:%s' "${AGENT_OS_TEST_NAMESPACE:-portable-agent-os}"
+        fi
+        ;;
       foreign) printf 'other\tother-installation' ;;
       *) printf '\t' ;;
     esac
@@ -117,20 +133,26 @@ case " $* " in
   *" get Service agent-os-firstmate --ignore-not-found -o jsonpath="*|\
   *" get Role agent-os-firstmate-runtime --ignore-not-found -o jsonpath="*|\
   *" get RoleBinding agent-os-firstmate-runtime --ignore-not-found -o jsonpath="*)
+    kind=''
     name=''
     case " $* " in
-      *" StatefulSet "*) name=agent-os-firstmate ;;
-      *" ServiceAccount "*) name=agent-os-firstmate ;;
-      *" PersistentVolumeClaim "*) name=agent-os-firstmate-home ;;
-      *" Service "*) name=agent-os-firstmate ;;
-      *" RoleBinding "*) name=agent-os-firstmate-runtime ;;
-      *" Role "*) name=agent-os-firstmate-runtime ;;
+      *" StatefulSet "*) kind=StatefulSet; name=agent-os-firstmate ;;
+      *" ServiceAccount "*) kind=ServiceAccount; name=agent-os-firstmate ;;
+      *" PersistentVolumeClaim "*) kind=PersistentVolumeClaim; name=agent-os-firstmate-home ;;
+      *" Service "*) kind=Service; name=agent-os-firstmate ;;
+      *" RoleBinding "*) kind=RoleBinding; name=agent-os-firstmate-runtime ;;
+      *" Role "*) kind=Role; name=agent-os-firstmate-runtime ;;
     esac
-    case "${AGENT_OS_TEST_RESOURCE_STATE:-absent}" in
+    resource_state=${AGENT_OS_TEST_RESOURCE_STATE:-absent}
+    if grep -F ' apply -f ' "$AGENT_OS_TEST_LOG" >/dev/null; then
+      resource_state=${AGENT_OS_TEST_RESOURCE_AFTER_APPLY:-$resource_state}
+    fi
+    case "$resource_state" in
       absent) ;;
       owned)
         printf '%s\tagent-os\tagent-os-firstmate:portable-agent-os' "$name"
-        [[ " $* " != *'.metadata.finalizers'* ]] || printf '\t[kubernetes.io/pvc-protection]'
+        [[ " $* " != *'.metadata.uid'* ]] || \
+          printf '\tuid-%s\toperation-test\tTrue\t[kubernetes.io/pvc-protection]' "$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')"
         ;;
       foreign) printf '%s\tother\tother-installation' "$name" ;;
     esac
@@ -156,14 +178,29 @@ case " $* " in
     printf 'Role\tagent-os-firstmate-runtime\tServiceAccount\tagent-os-firstmate\t%s' \
       "${AGENT_OS_TEST_NAMESPACE:-portable-agent-os}"
     ;;
-  *" get clusterrolebinding agent-os-firstmate-"*" --ignore-not-found -o jsonpath="*)
-    case "${AGENT_OS_TEST_CLUSTER_RBAC_STATE:-absent}" in
+  *" get clusterrolebinding agent-os-firstmate-"*" --ignore-not-found -o jsonpath="*|\
+  *" get ClusterRoleBinding agent-os-firstmate-"*" --ignore-not-found -o jsonpath="*)
+    cluster_state=${AGENT_OS_TEST_CLUSTER_RBAC_STATE:-absent}
+    if grep -F ' apply -f ' "$AGENT_OS_TEST_LOG" >/dev/null; then
+      cluster_state=${AGENT_OS_TEST_CLUSTER_RBAC_AFTER_APPLY:-$cluster_state}
+    fi
+    case "$cluster_state" in
       absent) ;;
       owned)
         printf 'agent-os-firstmate-%s\tagent-os\tagent-os-firstmate:%s' \
           "${AGENT_OS_TEST_NAMESPACE:-portable-agent-os}" "${AGENT_OS_TEST_NAMESPACE:-portable-agent-os}"
+        [[ " $* " != *'.metadata.uid'* ]] || printf '\tuid-clusterrolebinding\toperation-test\tTrue\t[]'
         ;;
       foreign) printf 'agent-os-firstmate-portable-agent-os\tother\tother-installation' ;;
+    esac
+    ;;
+  *" get Pod agent-os-firstmate-0 --ignore-not-found -o jsonpath="*)
+    case "${AGENT_OS_TEST_PRIMARY_POD_STATE:-absent}" in
+      absent) ;;
+      owned)
+        printf 'agent-os-firstmate-0\tagent-os\tagent-os-firstmate:portable-agent-os\tuid-pod\toperation-test\tFalse\t[kubernetes.io/pvc-protection]'
+        ;;
+      foreign) printf 'agent-os-firstmate-0\tother\tother-installation\tuid-foreign\tother-operation\tFalse\t[]' ;;
     esac
     ;;
   *" api-resources --verbs=list --namespaced -o name "*)
@@ -185,7 +222,8 @@ run_launcher() {
   PATH="$FAKEBIN:$PATH" AGENT_OS_TEST_LOG="$CALLS" AGENT_OS_STDIN_LOG="$STDIN_LOG" \
     AGENT_OS_IN_CLUSTER=1 AGENT_OS_NAMESPACE=agent-os-demo AGENT_OS_IMAGE=agent-os:local-test \
     AGENT_OS_IMAGE_PULL_POLICY=Never AGENT_OS_AI_SECRET=scout-1-ai-auth \
-    AGENT_OS_PURGE_EVIDENCE_FILE="$PURGE_EVIDENCE" "$LAUNCHER" "$@"
+    AGENT_OS_OPERATION_ID=operation-test AGENT_OS_PURGE_EVIDENCE_FILE="$PURGE_EVIDENCE" \
+    "$LAUNCHER" "$@"
 }
 
 : > "$CALLS"
@@ -198,6 +236,8 @@ assert_grep 'app.kubernetes.io/managed-by: agent-os' "$STDIN_LOG" \
   "child resources need the exact Agent OS ownership label"
 assert_grep 'agent-os.dev/installation-id: agent-os-firstmate:agent-os-demo' "$STDIN_LOG" \
   "child resources need the exact installation identity"
+assert_grep 'agent-os.dev/operation-id: operation-test' "$STDIN_LOG" \
+  "each crewmate apply must carry its unique operation identity"
 assert_grep 'automountServiceAccountToken: false' "$STDIN_LOG" "children must not receive Kubernetes credentials"
 assert_grep 'claimName: agent-os-crewmate-scout-1-home' "$STDIN_LOG" "child work must use its own PVC"
 assert_no_grep 'hostUsers: false' "$STDIN_LOG" "OrbStack children must not request unsupported Pod user namespaces"
@@ -250,8 +290,10 @@ pass "crewmate create requires an explicit AI Secret grant"
 if AGENT_OS_TEST_FAIL_WAIT=1 AGENT_OS_TEST_POD_AFTER_APPLY=owned run_launcher create scout-1 >/dev/null 2>&1; then
   fail "crewmate create must fail when its authorized Secret cannot produce a ready Pod"
 fi
-grep -Fqx 'kubectl -n agent-os-demo delete pod agent-os-crewmate-scout-1 --ignore-not-found --wait=false' "$CALLS" || \
-  fail "failed create must remove the non-running Pod"
+grep -Fqx 'kubectl -n agent-os-demo delete --raw /api/v1/namespaces/agent-os-demo/pods/agent-os-crewmate-scout-1 -f -' "$CALLS" || \
+  fail "failed create must use an atomic UID-preconditioned delete"
+assert_grep '"uid":"uid-owned"' "$STDIN_LOG" \
+  "failed create must precondition deletion on the observed Pod UID"
 if grep -F 'delete pvc agent-os-crewmate-scout-1-home' "$CALLS" >/dev/null; then
   fail "failed create must retain the crewmate PVC for an authorized retry"
 fi
@@ -267,11 +309,24 @@ assert_contains "$partial_out" 'uid-owned' \
   "partial apply cleanup must report the exact newly created Pod UID"
 assert_grep 'metadata.uid' "$CALLS" \
   "partial apply cleanup must collect exact Pod UID evidence"
-grep -Fqx 'kubectl -n agent-os-demo delete pod agent-os-crewmate-scout-1 --ignore-not-found --wait=false' "$CALLS" || \
-  fail "partial apply cleanup must remove only the newly created owned Pod"
+grep -Fqx 'kubectl -n agent-os-demo delete --raw /api/v1/namespaces/agent-os-demo/pods/agent-os-crewmate-scout-1 -f -' "$CALLS" || \
+  fail "partial apply cleanup must use an atomic UID-preconditioned delete"
+assert_grep '"uid":"uid-owned"' "$STDIN_LOG" \
+  "partial apply cleanup must bind deletion to the observed Pod UID"
 assert_no_grep 'delete pvc agent-os-crewmate-scout-1-home' "$CALLS" \
   "partial apply cleanup must retain the persistent home"
 pass "crewmate partial apply cleans only a newly created owned Pod"
+
+: > "$CALLS"
+replacement_out=''
+replacement_rc=0
+replacement_out=$(AGENT_OS_TEST_FAIL_APPLY=1 AGENT_OS_TEST_POD_AFTER_APPLY=replacement \
+  run_launcher create scout-1 2>&1) || replacement_rc=$?
+[ "$replacement_rc" -eq 1 ] || fail "replacement partial apply must remain failed: $replacement_out"
+assert_contains "$replacement_out" 'replacement or ownership mismatch retained' \
+  "partial apply must report a replacement instead of deleting it"
+assert_no_grep 'delete --raw' "$CALLS" \
+  "partial apply must retain a same-name Pod from another operation"
 
 : > "$CALLS"
 AGENT_OS_TEST_POD_STATE=owned AGENT_OS_TEST_PVC_STATE=owned run_launcher stop scout-1
@@ -279,6 +334,10 @@ grep -Fqx 'kubectl -n agent-os-demo delete pod agent-os-crewmate-scout-1 --ignor
   fail "stop must target the exactly owned crewmate Pod"
 grep -Fqx 'kubectl -n agent-os-demo wait --for=delete pod/agent-os-crewmate-scout-1 --timeout=180s' "$CALLS" || \
   fail "stop must prove Pod absence before checkpointing can begin"
+wait_line=$(grep -Fn 'wait --for=delete pod/agent-os-crewmate-scout-1' "$CALLS" | head -n 1 | cut -d: -f1)
+invalidate_line=$(grep -Fn 'annotate pvc agent-os-crewmate-scout-1-home agent-os.dev/checkpoint-state=pending agent-os.dev/checkpoint-at- agent-os.dev/quiesced-operation=operation-test agent-os.dev/checkpoint-operation- --overwrite' "$CALLS" | head -n 1 | cut -d: -f1)
+[ -n "$wait_line" ] && [ -n "$invalidate_line" ] && [ "$wait_line" -lt "$invalidate_line" ] || \
+  fail "stop must invalidate every pre-stop checkpoint only after Pod absence"
 if grep -F 'delete pvc agent-os-crewmate-scout-1-home' "$CALLS" >/dev/null; then
   fail "stop must preserve the crewmate persistent home"
 fi
@@ -333,6 +392,13 @@ if AGENT_OS_TEST_POD_STATE=owned AGENT_OS_TEST_PVC_STATE=invalid-checkpoint run_
 fi
 assert_no_grep 'delete pvc agent-os-crewmate-scout-1-home' "$CALLS" \
   "purge must not delete a home with malformed checkpoint evidence"
+
+: > "$CALLS"
+if AGENT_OS_TEST_POD_STATE=absent AGENT_OS_TEST_PVC_STATE=stale-clean run_launcher purge scout-1 --yes >/dev/null 2>&1; then
+  fail "purge must reject checkpoint evidence from before the latest stop"
+fi
+assert_no_grep 'delete pvc agent-os-crewmate-scout-1-home' "$CALLS" \
+  "purge must not delete a home using stale clean checkpoint evidence"
 
 : > "$CALLS"
 : > "$PURGE_EVIDENCE"
@@ -392,6 +458,8 @@ done
 mkdir -p "$out"
 rbac=$(awk '/^rbac:/{print $2}' "$inputs")
 namespace=$(awk '/^namespace:/{print $2}' "$inputs")
+operation=$(awk '/^operationId:/{print $2}' "$inputs")
+printf 'akua-input-operation %s\n' "$operation" >> "$AGENT_OS_TEST_LOG"
 create_namespace=$(awk '/^createNamespace:/{print $2}' "$inputs")
 [ -n "$create_namespace" ] || create_namespace=true
 cat > "$out/00-pvc.yaml" <<YAML
@@ -402,6 +470,7 @@ metadata:
   namespace: $namespace
   labels:
     app.kubernetes.io/managed-by: agent-os
+    agent-os.dev/operation-id: $operation
   annotations:
     agent-os.dev/installation-id: agent-os-firstmate:$namespace
 YAML
@@ -413,6 +482,7 @@ metadata:
   namespace: $namespace
   labels:
     app.kubernetes.io/managed-by: agent-os
+    agent-os.dev/operation-id: $operation
   annotations:
     agent-os.dev/installation-id: agent-os-firstmate:$namespace
     agent-os.dev/rbac-mode: $rbac
@@ -427,6 +497,7 @@ metadata:
   namespace: $namespace
   labels:
     app.kubernetes.io/managed-by: agent-os
+    agent-os.dev/operation-id: $operation
   annotations:
     agent-os.dev/installation-id: agent-os-firstmate:$namespace
 YAML
@@ -439,6 +510,7 @@ metadata:
   name: $namespace
   labels:
     app.kubernetes.io/managed-by: agent-os
+    agent-os.dev/operation-id: $operation
   annotations:
     agent-os.dev/installation-id: agent-os-firstmate:$namespace
 YAML
@@ -455,6 +527,7 @@ metadata:
   namespace: $namespace
   labels:
     app.kubernetes.io/managed-by: agent-os
+    agent-os.dev/operation-id: $operation
   annotations:
     agent-os.dev/installation-id: agent-os-firstmate:$namespace
 YAML
@@ -468,6 +541,7 @@ metadata:
   name: agent-os-firstmate-$namespace
   labels:
     app.kubernetes.io/managed-by: agent-os
+    agent-os.dev/operation-id: $operation
   annotations:
     agent-os.dev/installation-id: agent-os-firstmate:$namespace
 YAML
@@ -482,21 +556,66 @@ run_generic() {
     AGENT_OS_TEST_NAMESPACE_STATE="${AGENT_OS_TEST_NAMESPACE_STATE:-absent}" \
     AGENT_OS_TEST_WORKLOAD_STATE="${AGENT_OS_TEST_WORKLOAD_STATE:-absent}" \
     AGENT_OS_TEST_CLUSTER_RBAC_STATE="${AGENT_OS_TEST_CLUSTER_RBAC_STATE:-absent}" \
+    AGENT_OS_OPERATION_ID=operation-test \
     AGENT_OS_CONTEXT=kind-agent-os AGENT_OS_NAMESPACE=portable-agent-os "$GENERIC" "$@"
 }
 
 : > "$CALLS"
 run_generic install
-grep -Fq -- "akua render --no-agent-mode --package $ROOT/tools/agent-os/packages/firstmate/package.k --inputs $GENERIC_INPUTS --out " "$CALLS" || \
+grep -Fq -- "akua render --no-agent-mode --package $ROOT/tools/agent-os/packages/firstmate/package.k --inputs " "$CALLS" || \
   fail "generic install must render the canonical package before applying it"
 grep -Fq 'kubectl --context kind-agent-os apply -f ' "$CALLS" || \
   fail "generic install must apply only its freshly rendered package output"
+grep -Fqx 'akua-input-operation operation-test' "$CALLS" || \
+  fail "generic install must label every resource with its unique operation identity"
 grep -Fqx 'kubectl --context kind-agent-os -n portable-agent-os rollout status statefulset/agent-os-firstmate --timeout=180s' "$CALLS" || \
   fail "generic install must wait for the rendered Firstmate StatefulSet"
 if grep -F 'delete clusterrolebinding' "$CALLS" >/dev/null; then
   fail "fresh namespace-scoped install must not require cluster RBAC deletion authority"
 fi
 pass "generic install renders and applies the canonical package on an explicit context"
+
+PARTIAL_CLUSTER_INPUTS="$TMP/partial-cluster-inputs.yaml"
+sed 's/rbac: namespace/rbac: cluster-admin/' "$GENERIC_INPUTS" > "$PARTIAL_CLUSTER_INPUTS"
+: > "$CALLS"
+partial_primary_out=''
+partial_primary_rc=0
+partial_primary_out=$(PATH="$FAKEBIN:$PATH" AGENT_OS_TEST_LOG="$CALLS" \
+  AGENT_OS_INPUTS="$PARTIAL_CLUSTER_INPUTS" AGENT_OS_TEST_NAMESPACE=portable-agent-os \
+  AGENT_OS_TEST_NAMESPACE_STATE=absent AGENT_OS_TEST_WORKLOAD_STATE=absent \
+  AGENT_OS_TEST_RESOURCE_AFTER_APPLY=owned AGENT_OS_TEST_CLUSTER_RBAC_AFTER_APPLY=owned \
+  AGENT_OS_TEST_FAIL_GENERIC_APPLY=1 AGENT_OS_OPERATION_ID=operation-test \
+  AGENT_OS_CONTEXT=kind-agent-os AGENT_OS_NAMESPACE=portable-agent-os \
+  "$GENERIC" install 2>&1) || partial_primary_rc=$?
+[ "$partial_primary_rc" -eq 3 ] || \
+  fail "partial primary apply must exit incomplete with 3: $partial_primary_out"
+assert_contains "$partial_primary_out" 'partial apply: StatefulSet/agent-os-firstmate' \
+  "failed primary apply must inventory expected namespaced resources"
+assert_contains "$partial_primary_out" 'uid=uid-statefulset operation=operation-test ready=True' \
+  "failed primary apply must report UID, operation identity, and readiness"
+assert_contains "$partial_primary_out" 'residual-authority: ClusterRoleBinding/agent-os-firstmate-portable-agent-os' \
+  "failed cluster-admin apply must report the exact residual grant"
+assert_contains "$partial_primary_out" 'cleanup-cluster-rbac --yes' \
+  "failed cluster-admin apply must print the privileged cleanup command"
+assert_contains "$partial_primary_out" 'safe recovery:' \
+  "failed primary apply must print a bounded exact recovery command"
+pass "primary partial apply reports residual resources and authority"
+
+: > "$CALLS"
+namespace_partial_out=''
+namespace_partial_rc=0
+namespace_partial_out=$(AGENT_OS_TEST_WORKLOAD_STATE=namespace AGENT_OS_TEST_NAMESPACE_STATE=owned \
+  AGENT_OS_TEST_RESOURCE_AFTER_APPLY=owned \
+  AGENT_OS_TEST_CLUSTER_RBAC_AFTER_APPLY=owned AGENT_OS_TEST_FAIL_GENERIC_APPLY=1 \
+  run_generic upgrade 2>&1) || namespace_partial_rc=$?
+[ "$namespace_partial_rc" -eq 3 ] || \
+  fail "namespace partial upgrade must exit incomplete with 3: $namespace_partial_out"
+assert_contains "$namespace_partial_out" \
+  'residual-authority: ClusterRoleBinding/agent-os-firstmate-portable-agent-os' \
+  "every failed primary mutation must inspect the deterministic cluster grant"
+assert_contains "$namespace_partial_out" 'cleanup-cluster-rbac --yes' \
+  "a failed namespaced mutation with residual authority must print exact cleanup"
+pass "namespace partial apply reports stale cluster authority"
 
 : > "$CALLS"
 owned_namespace_out=''
@@ -730,18 +849,33 @@ pvc_delete_line=$(grep -Fn '/00-pvc.yaml' "$CALLS" | grep ' delete ' | head -n 1
 pass "routine uninstall removes namespaced resources without cluster-wide authority"
 
 : > "$CALLS"
+NONE_INPUTS="$TMP/none-rbac-inputs.yaml"
+sed 's/rbac: namespace/rbac: none/' "$GENERIC_INPUTS" > "$NONE_INPUTS"
 bounded_out=''
 bounded_rc=0
-bounded_out=$(AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_WORKLOAD_STATE=namespace \
-  AGENT_OS_TEST_RESOURCE_STATE=owned AGENT_OS_TEST_FAIL_DELETE_FILE=00-pvc.yaml \
-  run_generic uninstall --yes 2>&1) || bounded_rc=$?
+bounded_out=$(PATH="$FAKEBIN:$PATH" AGENT_OS_TEST_LOG="$CALLS" AGENT_OS_INPUTS="$NONE_INPUTS" \
+  AGENT_OS_TEST_NAMESPACE=portable-agent-os AGENT_OS_TEST_NAMESPACE_STATE=owned \
+  AGENT_OS_TEST_WORKLOAD_STATE=none AGENT_OS_TEST_RESOURCE_STATE=owned \
+  AGENT_OS_TEST_PRIMARY_POD_STATE=owned AGENT_OS_TEST_FAIL_DELETE_FILE=00-pvc.yaml \
+  AGENT_OS_OPERATION_ID=operation-test AGENT_OS_CONTEXT=kind-agent-os \
+  AGENT_OS_NAMESPACE=portable-agent-os "$GENERIC" uninstall --yes 2>&1) || bounded_rc=$?
 [ "$bounded_rc" -eq 3 ] || fail "timed-out uninstall must exit incomplete: $bounded_out"
-assert_contains "$bounded_out" 'retained: PersistentVolumeClaim/agent-os-firstmate-home' \
+assert_contains "$bounded_out" 'failed-target: PersistentVolumeClaim/agent-os-firstmate-home' \
+  "timed-out uninstall must report the actual failed target"
+assert_contains "$bounded_out" 'retained: PersistentVolumeClaim/agent-os-firstmate-home uid=uid-persistentvolumeclaim' \
   "timed-out uninstall must report the retained owned resource"
 assert_contains "$bounded_out" 'finalizers=[kubernetes.io/pvc-protection]' \
   "timed-out uninstall must report retained finalizers"
+assert_contains "$bounded_out" 'retained: Pod/agent-os-firstmate-0 uid=uid-pod' \
+  "timed-out uninstall must report the StatefulSet Pod outside the fresh render"
+assert_contains "$bounded_out" 'retained: Role/agent-os-firstmate-runtime uid=uid-role' \
+  "timed-out rbac:none uninstall must report stale deterministic Role residue"
+assert_contains "$bounded_out" 'retained: RoleBinding/agent-os-firstmate-runtime uid=uid-rolebinding' \
+  "timed-out rbac:none uninstall must report stale deterministic RoleBinding residue"
 assert_contains "$bounded_out" 'safe retry:' \
   "timed-out uninstall must print exact safe retry evidence"
+assert_contains "$bounded_out" 'cluster cleanup if required:' \
+  "timed-out uninstall must print exact privileged cleanup evidence"
 grep -F '/00-pvc.yaml' "$CALLS" | grep -F -- '--wait=true --timeout=180s' >/dev/null || \
   fail "uninstall deletion must have an explicit timeout"
 pass "uninstall timeouts report retained owned resources and safe retry evidence"

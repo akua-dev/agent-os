@@ -4,6 +4,8 @@
 
 The Agent OS image uses the official multi-architecture `node:24-trixie-slim` base image pinned to index digest `sha256:366fdef91728b1b7fa18c84fba63b6e79ed77b7e10cc206878e9705da4d7b169`.
 The reviewed Docker Node source revision is <https://github.com/nodejs/docker-node/tree/303e6c3be0be8010403376712d3018fb99809f86>.
+System packages resolve only from the Debian and Debian security snapshots dated `20260624T235959Z` in `image/debian.sources`.
+Runtime npm packages resolve from the committed `image/npm/package-lock.json`, including registry integrity checks for every artifact.
 
 ## Herdr
 

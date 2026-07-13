@@ -10,6 +10,10 @@ ARG BUN_VERSION=1.3.14
 ARG AKUA_VERSION=0.8.25
 ARG K9S_VERSION=0.51.0
 
+COPY image/debian.sources /etc/apt/sources.list.d/debian.sources
+
+RUN echo "9767ac71230276e282fdb39a087c889a277835b47751a0c0e5a9da0e8352e289  /etc/apt/sources.list.d/debian.sources" | sha256sum -c -
+
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     bash \
@@ -136,13 +140,17 @@ RUN set -eu; \
   mkdir -p /usr/share/licenses/k9s; \
   curl -fsSL "https://raw.githubusercontent.com/derailed/k9s/v${K9S_VERSION}/LICENSE" -o /usr/share/licenses/k9s/LICENSE
 
-RUN npm install --global \
-  @earendil-works/pi-coding-agent@0.80.6 \
-  gh-axi@0.1.27 \
-  chrome-devtools-axi@0.1.26 \
-  lavish-axi@0.1.40 \
-  tasks-axi@0.2.2 \
-  quota-axi@0.1.5
+COPY image/npm/package.json image/npm/package-lock.json /opt/agent-os-npm/
+
+RUN echo "3646e31389155fbce155c828d8db46bc60ff2976c2d8d29e6633f260f56fd06d  /opt/agent-os-npm/package.json" | sha256sum -c - \
+  && echo "d815b10a3ea0bf79d55a9e2245b422cbb401bc9b38f27a4575a639ce2caabe1f  /opt/agent-os-npm/package-lock.json" | sha256sum -c - \
+  && npm ci --omit=dev --ignore-scripts --no-audit --no-fund --prefix /opt/agent-os-npm \
+  && mkdir -p /usr/local/lib/node_modules \
+  && cp -a /opt/agent-os-npm/node_modules/. /usr/local/lib/node_modules/ \
+  && for command in pi gh-axi chrome-devtools-axi lavish-axi tasks-axi quota-axi; do \
+    ln -s "/usr/local/lib/node_modules/.bin/$command" "/usr/local/bin/$command"; \
+  done \
+  && rm -rf /opt/agent-os-npm
 
 ENV FM_HOME=/home/agent \
     HOME=/home/agent \

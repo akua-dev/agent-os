@@ -8,6 +8,7 @@ metadata:
     app.kubernetes.io/component: crewmate
     app.kubernetes.io/managed-by: agent-os
     agent-os.dev/crewmate: __AGENT_OS_CREWMATE_ID__
+    agent-os.dev/operation-id: __AGENT_OS_OPERATION_ID__
   annotations:
     agent-os.dev/installation-id: agent-os-firstmate:__AGENT_OS_NAMESPACE__
     agent-os.dev/checkpoint-state: pending
@@ -28,6 +29,7 @@ metadata:
     app.kubernetes.io/component: crewmate
     app.kubernetes.io/managed-by: agent-os
     agent-os.dev/crewmate: __AGENT_OS_CREWMATE_ID__
+    agent-os.dev/operation-id: __AGENT_OS_OPERATION_ID__
   annotations:
     agent-os.dev/installation-id: agent-os-firstmate:__AGENT_OS_NAMESPACE__
 spec:

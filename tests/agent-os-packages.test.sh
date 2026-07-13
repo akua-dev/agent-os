@@ -148,6 +148,8 @@ for invalid_image in \
   'ghcr.io/akua-dev/agent-os@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaextra' \
   'invalid@@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
   'registry.example/org:123/image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  '[2001:db8::1]:5000/org:123/image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  '[2001:db8::g]:5000/org/image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
   'prefix@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:suffix'; do
   invalid_inputs="$TMP/invalid-$(printf '%s' "$invalid_image" | tr '/:@' '---').yaml"
   sed "s|^image: .*|image: $invalid_image|" "$INPUTS" > "$invalid_inputs"
@@ -165,6 +167,14 @@ akua render --no-agent-mode --package "$FIRSTMATE/package.k" --inputs "$PORT_INP
   --out "$TMP/registry-port-rendered" >/dev/null || \
   fail "the portable package must allow a registry authority port"
 pass "OCI reference ports are confined to registry authority"
+
+IPV6_INPUTS="$TMP/registry-ipv6.yaml"
+sed 's|^image: .*|image: "[2001:db8::1]:5000/org/agent-os@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"|' \
+  "$INPUTS" > "$IPV6_INPUTS"
+akua render --no-agent-mode --package "$FIRSTMATE/package.k" --inputs "$IPV6_INPUTS" \
+  --out "$TMP/registry-ipv6-rendered" >/dev/null || \
+  fail "the portable package must allow a bracketed IPv6 registry authority"
+pass "OCI references accept bracketed IPv6 registry authorities"
 
 assert_grep 'bin/agent-os-kubernetes.sh install' "$ROOT/docs/kubernetes.md" \
   "Kubernetes docs must make the generic installer the default quickstart"

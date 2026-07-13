@@ -32,7 +32,8 @@ Load this skill only when the current firstmate is running in Kubernetes or is e
 - Use `status` to inspect it, `stop` to remove only the Pod, and `restart` to replace only the Pod on its retained PVC.
 - The ambiguous `delete` command is rejected.
 - `purge <id> --yes` is the only operation that destroys a persistent home.
-- Before purge, stop the owned Pod and wait for its absence, independently checkpoint or deliver unique work from the stopped home, then annotate the owned PVC with `agent-os.dev/checkpoint-state=clean` and a non-secret RFC3339 `agent-os.dev/checkpoint-at` value.
+- Stopping the owned Pod invalidates earlier checkpoint evidence and records a non-secret `agent-os.dev/quiesced-operation` generation only after proving Pod absence.
+- Before purge, independently checkpoint or deliver unique work from the stopped home, then annotate the owned PVC with `agent-os.dev/checkpoint-state=clean`, a non-secret RFC3339 `agent-os.dev/checkpoint-at` value, and `agent-os.dev/checkpoint-operation` equal to the current `agent-os.dev/quiesced-operation` value.
 - Purge verifies exact installation and crewmate ownership, displays the target, requires its own confirmation, and records requested and completed phases in `AGENT_OS_PURGE_EVIDENCE_FILE` or `$FM_HOME/data/crewmate-purge-evidence.log`.
 - Purge evidence contains only time, namespace, crewmate ID, resource names, phase, and checkpoint time.
 - Never mount the primary home into a child Pod.

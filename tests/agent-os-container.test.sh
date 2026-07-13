@@ -5,6 +5,8 @@ set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+IMAGE_WORKFLOW="$ROOT/.github/workflows/agent-os-image.yml"
+
 assert_grep 'FROM node:24-trixie-slim@sha256:366fdef91728b1b7fa18c84fba63b6e79ed77b7e10cc206878e9705da4d7b169' \
   "$ROOT/Dockerfile" "image must pin the multi-architecture Node 24 Trixie base"
 assert_grep 'sha256:366fdef91728b1b7fa18c84fba63b6e79ed77b7e10cc206878e9705da4d7b169' \
@@ -17,13 +19,30 @@ assert_grep 'ARG NO_MISTAKES_VERSION=1.34.0' "$ROOT/Dockerfile" "image must pin 
 assert_grep 'ARG BUN_VERSION=1.3.14' "$ROOT/Dockerfile" "image must pin stable Bun 1.3.14"
 assert_grep 'ARG AKUA_VERSION=0.8.25' "$ROOT/Dockerfile" "image must pin Akua 0.8.25"
 assert_grep 'ARG K9S_VERSION=0.51.0' "$ROOT/Dockerfile" "image must pin K9s 0.51.0"
+assert_present "$ROOT/image/debian.sources" "image must commit immutable Debian snapshot inputs"
+assert_grep 'snapshot.debian.org/archive/debian/20260624T235959Z' "$ROOT/image/debian.sources" \
+  "image must use the reviewed immutable Debian snapshot"
+assert_grep 'snapshot.debian.org/archive/debian-security/20260624T235959Z' "$ROOT/image/debian.sources" \
+  "image must pin the matching Debian security snapshot"
+assert_grep 'debian.sources' "$ROOT/Dockerfile" \
+  "image build must install and checksum the committed Debian source input"
+assert_present "$ROOT/image/npm/package.json" "image runtime npm dependencies must have a committed manifest"
+assert_present "$ROOT/image/npm/package-lock.json" "image runtime npm dependencies must have a committed lockfile"
+assert_grep '"lockfileVersion": 3' "$ROOT/image/npm/package-lock.json" \
+  "image runtime npm lock must use the reproducible current lock format"
+assert_grep '"integrity": "sha512-' "$ROOT/image/npm/package-lock.json" \
+  "image runtime npm lock must checksum resolved artifacts"
+assert_grep 'npm ci --omit=dev --ignore-scripts' "$ROOT/Dockerfile" \
+  "image runtime npm installation must consume only the committed lock"
+assert_no_grep 'npm install --global' "$ROOT/Dockerfile" \
+  "image build must not resolve mutable global npm dependency graphs"
 assert_grep 'sha256sum -c -' "$ROOT/Dockerfile" "downloaded runtime binaries must be checksum verified"
-assert_grep '@earendil-works/pi-coding-agent@0.80.6' "$ROOT/Dockerfile" "image must pin Pi 0.80.6"
-assert_grep 'gh-axi@0.1.27' "$ROOT/Dockerfile" "image must pin gh-axi 0.1.27"
-assert_grep 'chrome-devtools-axi@0.1.26' "$ROOT/Dockerfile" "image must pin chrome-devtools-axi 0.1.26"
-assert_grep 'lavish-axi@0.1.40' "$ROOT/Dockerfile" "image must pin lavish-axi 0.1.40"
-assert_grep 'tasks-axi@0.2.2' "$ROOT/Dockerfile" "image must pin tasks-axi 0.2.2"
-assert_grep 'quota-axi@0.1.5' "$ROOT/Dockerfile" "image must pin quota-axi 0.1.5"
+assert_grep '"@earendil-works/pi-coding-agent": "0.80.6"' "$ROOT/image/npm/package.json" "image must pin Pi 0.80.6"
+assert_grep '"gh-axi": "0.1.27"' "$ROOT/image/npm/package.json" "image must pin gh-axi 0.1.27"
+assert_grep '"chrome-devtools-axi": "0.1.26"' "$ROOT/image/npm/package.json" "image must pin chrome-devtools-axi 0.1.26"
+assert_grep '"lavish-axi": "0.1.40"' "$ROOT/image/npm/package.json" "image must pin lavish-axi 0.1.40"
+assert_grep '"tasks-axi": "0.2.2"' "$ROOT/image/npm/package.json" "image must pin tasks-axi 0.2.2"
+assert_grep '"quota-axi": "0.1.5"' "$ROOT/image/npm/package.json" "image must pin quota-axi 0.1.5"
 assert_grep 'ripgrep' "$ROOT/Dockerfile" "image must install ripgrep"
 assert_grep 'fd-find' "$ROOT/Dockerfile" "image must install fd"
 assert_grep 'FM_HOME=/home/agent' "$ROOT/Dockerfile" "image must declare the persistent firstmate home"
@@ -101,6 +120,17 @@ assert_grep '/usr/share/doc/agent-os/THIRD_PARTY_SOURCES.md' "$ROOT/THIRD_PARTY_
   "the Herdr notice must direct image recipients to the bundled source offer"
 assert_no_grep 'publication is gated on a compliant license path' "$ROOT/THIRD_PARTY_NOTICES.md" \
   "the Herdr notice must state the selected compliance path"
+if grep -Eq '^  packages: write$' "$IMAGE_WORKFLOW"; then
+  fail "workflow defaults must keep pull-request validation read-only"
+fi
+[ "$(grep -c '^      packages: write$' "$IMAGE_WORKFLOW")" -eq 1 ] || \
+  fail "only the protected publication job may receive packages write"
+assert_grep '  validate:' "$IMAGE_WORKFLOW" \
+  "pull requests must use a distinct read-only validation job"
+assert_grep '  publish:' "$IMAGE_WORKFLOW" \
+  "push and tag publication must use a distinct privileged job"
+assert_grep "if: github.event_name == 'push'" "$IMAGE_WORKFLOW" \
+  "the packages-write job must be restricted to protected push and tag events"
 assert_grep 'Section 13' "$ROOT/docs/herdr-compliance.md" \
   "the Herdr audit must account for the network-interaction clause"
 assert_grep 'https://github.com/akua-dev/akua/tree/v0.8.25' "$ROOT/THIRD_PARTY_NOTICES.md" \
@@ -152,8 +182,10 @@ assert_grep 'ghcr.io/akua-dev/agent-os' "$ROOT/.github/workflows/agent-os-image.
   "release workflow must publish the image expected by the portable package"
 assert_grep 'linux/amd64,linux/arm64' "$ROOT/.github/workflows/agent-os-image.yml" \
   "release workflow must build the two supported container architectures"
-assert_grep "push: \${{ github.event_name != 'pull_request' }}" "$ROOT/.github/workflows/agent-os-image.yml" \
-  "pull requests must build but never publish images"
+[ "$(grep -c '^          push: false$' "$IMAGE_WORKFLOW")" -eq 1 ] || \
+  fail "the read-only pull-request job must build without publishing"
+[ "$(grep -c '^          push: true$' "$IMAGE_WORKFLOW")" -eq 1 ] || \
+  fail "only the protected publication job may push images"
 assert_grep 'id: build' "$ROOT/.github/workflows/agent-os-image.yml" \
   "release workflow must expose its build result"
 assert_grep 'steps.build.outputs.digest' "$ROOT/.github/workflows/agent-os-image.yml" \

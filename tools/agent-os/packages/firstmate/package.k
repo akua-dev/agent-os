@@ -15,17 +15,20 @@ schema Input:
     memoryRequest: str = "1Gi"
     cpuLimit: str = "4"
     memoryLimit: str = "8Gi"
+    operationId: str = ""
 
     check:
-        allowMutableImage or regex.match(image, r"^([a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]+)?/)?[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*(\/[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$"), "image must use one complete OCI reference with an immutable @sha256 digest unless the local profile explicitly allows a mutable image"
+        allowMutableImage or regex.match(image, r"^((([a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*|(\[[0-9A-Fa-f:]+\]))(:[0-9]+)?)/)?[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*(\/[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$"), "image must use one complete OCI reference with an immutable @sha256 digest unless the local profile explicitly allows a mutable image"
+        operationId == "" or regex.match(operationId, r"^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$"), "operationId must be empty or a valid Kubernetes label value"
 
 input: Input = ctx.input()
 
-labels = {
+selectorLabels = {
     "app.kubernetes.io/name" = "agent-os"
     "app.kubernetes.io/component" = "firstmate"
     "app.kubernetes.io/managed-by" = "agent-os"
 }
+labels = selectorLabels | ({ "agent-os.dev/operation-id" = input.operationId } if input.operationId != "" else {})
 
 installationId = "agent-os-firstmate:${input.namespace}"
 ownershipAnnotations = { "agent-os.dev/installation-id" = installationId }
@@ -147,7 +150,7 @@ resources = namespaceResources + [
         }
         spec = {
             clusterIP = "None"
-            selector = labels
+            selector = selectorLabels
         }
     },
 ] + namespaceRbacResources + clusterAdminResources + [
@@ -165,7 +168,7 @@ resources = namespaceResources + [
         spec = {
             serviceName = "agent-os-firstmate"
             replicas = 1
-            selector = { matchLabels = labels }
+            selector = { matchLabels = selectorLabels }
             template = {
                 metadata = {
                     labels = labels
