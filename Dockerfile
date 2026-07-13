@@ -145,6 +145,9 @@ RUN mkdir -p /home/agent /opt/agent-os /opt/image-usr-local
 
 COPY . /opt/agent-os
 
+RUN install -D -m 0644 /opt/agent-os/THIRD_PARTY_NOTICES.md /usr/share/doc/agent-os/THIRD_PARTY_NOTICES.md \
+  && install -D -m 0644 /opt/agent-os/THIRD_PARTY_SOURCES.md /usr/share/doc/agent-os/THIRD_PARTY_SOURCES.md
+
 RUN cd /opt/agent-os/tools/agent-os \
   && bun install --frozen-lockfile --production --ignore-scripts \
   && ln -s /opt/agent-os/tools/agent-os/src/cli.ts /usr/local/bin/agent-os \
