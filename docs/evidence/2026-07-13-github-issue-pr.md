@@ -95,13 +95,18 @@ integration.
   `docs/kubernetes.md`, and `tests/agent-os-local.test.sh`.
 
 Pi displayed approximate subscription cost estimates of `$0.966` for the child
-and `$0.815` for the primary by the end of their panes. These are UI estimates,
+and `$0.917` for the primary after final reconciliation. These are UI estimates,
 not provider invoices.
 
-Three evaluator interventions occurred: move the primary into a dedicated
-workspace, run the host-only verification, and merge the verified stacked PR
-into the final review branch. No evaluator intervention changed the child's
-implementation.
+Four evaluator interventions occurred: move the primary into a dedicated
+workspace, run the host-only verification, merge the verified stacked PR into
+the final review branch, and ask Firstmate to reconcile and tear down the
+completed child after that external merge. No evaluator intervention changed
+the child's implementation or communicated with it directly.
+
+Firstmate then ran its ordinary teardown path, marked the task done in the
+backlog, removed the child pane and task metadata, and left the retained
+separate-Pod recovery fixture, primary workspace, and committed evidence intact.
 
 ## Scope
 
