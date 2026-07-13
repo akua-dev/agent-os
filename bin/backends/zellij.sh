@@ -48,8 +48,9 @@
 #   2. Key names: Enter -> "Enter", Escape -> "Esc" (NOT "Escape"), Ctrl-C ->
 #      "Ctrl c" as ONE shell argument with an embedded space (NOT two argv
 #      words, NOT "C-c" or "Ctrl+c" - all verified to fail).
-#   3. `new-tab --cwd --name` DOES return the created tab's bare integer id on
-#      stdout, exactly as documented.
+#   3. `new-tab --cwd --name` normally returns the created tab's bare integer
+#      id on stdout, but can create the tab and return empty stdout after the
+#      prior task tab closes. Empty stdout therefore needs structural recovery.
 #   4. `list-panes --json`'s `pane_cwd` reflects a `cd` run DIRECTLY in the
 #      pane's own top-level shell within one poll (<0.3s) - but does NOT
 #      reflect a `cd` performed by a NESTED SUBSHELL the pane's shell
@@ -324,9 +325,36 @@ fm_backend_zellij_tab_matches_label() {  # <session> <tab_id> <label>
 # no-op when no client is attached (the common case: an unattended firstmate
 # spawn). Best-effort: a failure to restore never fails the spawn.
 #
+# fm_backend_zellij_recover_created_task: after a successful-looking new-tab
+# call emits empty stdout, recover only an EXACT, unique <title> tab with one
+# terminal pane. Zellij has no trustworthy completion signal, so make the
+# immediate structural check plus two short follow-up polls before refusing.
+fm_backend_zellij_recover_created_task() {  # <session> <scoped-title>
+  local session=$1 title=$2 attempt tabs tab_id panes pane_id
+  for attempt in 1 2 3; do
+    tabs=$(fm_backend_zellij_cli "$session" action list-tabs --json 2>/dev/null)
+    tab_id=$(printf '%s' "$tabs" | jq -r --arg want "$title" \
+      '[.[]? | select(.name == $want)] | if length == 1 then .[0].tab_id else empty end' 2>/dev/null)
+    case "$tab_id" in
+      ''|*[!0-9]*) ;;
+      *)
+        panes=$(fm_backend_zellij_cli "$session" action list-panes --json 2>/dev/null)
+        pane_id=$(printf '%s' "$panes" | jq -r --argjson t "$tab_id" \
+          '[.[]? | select(.tab_id == $t and .is_plugin == false)] | if length == 1 then .[0].id else empty end' 2>/dev/null)
+        case "$pane_id" in
+          ''|*[!0-9]*) ;;
+          *) printf '%s %s' "$tab_id" "$pane_id"; return 0 ;;
+        esac
+        ;;
+    esac
+    [ "$attempt" -eq 3 ] || sleep 0.1
+  done
+  return 1
+}
+
 # Echoes "<tab_id> <pane_id>" on success.
 fm_backend_zellij_create_task() {  # <session> <label> <cwd>
-  local session=$1 label=$2 cwd=$3 title tabs dup prev_active tab_id pane_id
+  local session=$1 label=$2 cwd=$3 title tabs dup prev_active tab_id pane_id recovered
   fm_backend_zellij_session_exists "$session" || { echo "error: zellij session '$session' does not exist; run container_ensure first" >&2; return 1; }
   title=$(fm_backend_zellij_scoped_title "$label")
   tabs=$(fm_backend_zellij_cli "$session" action list-tabs --json 2>/dev/null)
@@ -338,12 +366,24 @@ fm_backend_zellij_create_task() {  # <session> <label> <cwd>
   prev_active=$(printf '%s' "$tabs" | jq -r '.[]? | select(.active == true) | .tab_id' 2>/dev/null | head -1)
   tab_id=$(fm_backend_zellij_cli "$session" action new-tab --cwd "$cwd" --name "$title" 2>/dev/null | tr -d '[:space:]')
   case "$tab_id" in
-    ''|*[!0-9]*)
+    '')
+      recovered=$(fm_backend_zellij_recover_created_task "$session" "$title")
+      if [ -z "$recovered" ]; then
+        echo "error: could not recover zellij tab '$title' with exactly one terminal pane after new-tab returned empty stdout" >&2
+        return 1
+      fi
+      read -r tab_id pane_id <<EOF
+$recovered
+EOF
+      ;;
+    *[!0-9]*)
       echo "error: zellij new-tab did not return a numeric tab id for '$title' (got '$tab_id'; session '$session' may not exist)" >&2
       return 1
       ;;
+    *)
+      pane_id=$(fm_backend_zellij_pane_for_tab "$session" "$tab_id")
+      ;;
   esac
-  pane_id=$(fm_backend_zellij_pane_for_tab "$session" "$tab_id")
   if [ -z "$pane_id" ]; then
     echo "error: could not find a terminal pane for zellij tab $tab_id (session '$session')" >&2
     return 1
