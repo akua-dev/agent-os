@@ -10,16 +10,16 @@ Update it from real runs; planned behavior and model narration never count as pr
 | Direct Akua-managed KaaS and Hetzner bootstrap | Public endpoint study and `akua-intelligence-bootstrap` skill | Not yet run |
 | Distinct clustered token and bootstrap-token revocation | Explicit Secret mount in the Firstmate package and handoff procedure | Not yet run |
 | Firstmate-native Akua worker lifecycle | Native endpoint routing in the bootstrap skill | Not yet run |
-| Replaceable usable model supply | Pi auth is explicit, but the live demo has one Codex provider and current quota exhaustion | Blocked until an approved route has capacity |
-| Same-Pod general-purpose crewmate | Existing Firstmate Herdr backend | Not yet captured as acceptance evidence |
-| Separate persistent crewmate Pod with explicit authority | Mate package, no ServiceAccount token by default, explicit Pi Secret grant | Package proven; full task run incomplete |
-| Parent-only supervision and human attach | Firstmate contract, Herdr CLI, live workspaces | Mechanism proven; distributed task trace incomplete |
+| Replaceable usable model supply | `openai-codex/gpt-5.4-mini` completed the same-Pod task; Terra-low completed the separate-Pod and recovery tasks; the current local overlay converges direct Pi, crewmate, and Secondmate defaults to `openai-codex/gpt-5.6-terra` with low thinking | One provider with multiple models proven locally; replacement provider still unproven |
+| Same-Pod general-purpose crewmate | Firstmate-supervised Pi scout, real Kubernetes test, in-cluster context check, and report in `docs/evidence/2026-07-13-same-pod-firstmate.md` | Proven locally |
+| Separate persistent crewmate Pod with explicit authority | Terra-low task, explicit resources, read-only Pi Secret, no ServiceAccount token, and retained PVC in `docs/evidence/2026-07-13-separate-pod-recovery.md` | Proven locally |
+| Parent-only supervision and human attach | Same-Pod and separate-Pod tasks accepted only Firstmate briefs and steers; a connected Herdr client observed the live workspaces | Proven locally |
 | Real issue to tested review-ready PR | Existing Firstmate delivery machinery | Not yet proven through the Kubernetes fleet |
-| Parent and child restart without unique-work loss | Parent PVC restart proven | Child unique-work recovery not yet proven |
+| Parent and child restart without unique-work loss | Primary session recovery plus separate-Pod replacement with unique artifact, report, tools, and exact Pi session resumed | Proven locally |
 | Separate production read-only and scoped write identity | Cortex contract only | Not yet implemented or Red-approved |
 | Optional GitHub Issue/Project client | Cortex contract only | Deferred until terminal-native path passes |
-| Repeatable end-to-end eval and recordable demo | Deterministic unit checks and local smoke evidence | Full critical-path run not yet captured |
-| Public installable image and release | Multi-architecture GHCR workflow added; local image only | Publication not yet proven |
+| Repeatable end-to-end eval and recordable demo | Same-Pod and separate-Pod run records now capture model, time, cost estimate, interventions, resource IDs, and failures | Local agent lifecycle captured; Akua/GitHub/product path incomplete |
+| Public installable image and release | Multi-architecture workflow run `29188585384` succeeded; local image only because pull-request builds do not publish | Publication not yet proven |
 
 ## Definition of done
 

@@ -57,6 +57,10 @@ spec:
               value: /home/agent
             - name: HOME
               value: /home/agent
+            - name: AGENT_OS_TEST_PI_MODEL
+              value: openai-codex/gpt-5.6-terra
+            - name: AGENT_OS_TEST_PI_EFFORT
+              value: low
           readinessProbe:
             exec:
               command:

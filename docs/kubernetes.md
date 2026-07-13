@@ -50,11 +50,20 @@ Start Pi from the tracked distro and attach to Herdr from another terminal:
 ```sh
 # inside the primary shell
 cd /opt/agent-os
-pi
+pi --model openai-codex/gpt-5.6-terra --thinking low
 
 # on the host
 bin/agent-os-local.sh attach
 ```
+
+During the current local evaluation, the OrbStack manifest also converges
+`config/crew-dispatch.json` and `config/secondmate-harness` on every primary Pod
+start. Crewmates and Secondmates therefore launch through Pi with
+`openai-codex/gpt-5.6-terra` and low thinking. The reusable image and Akua
+packages remain model-agnostic when those local test environment variables are
+absent. The same opt-in policy updates Pi's own `defaultProvider`,
+`defaultModel`, and `defaultThinkingLevel`, so a plain `pi` primary session uses
+Terra-low too.
 
 The primary can create and manage isolated crewmates directly:
 

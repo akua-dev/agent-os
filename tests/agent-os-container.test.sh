@@ -24,6 +24,10 @@ assert_grep 'quota-axi@0.1.5' "$ROOT/Dockerfile" "image must pin quota-axi 0.1.5
 assert_grep 'ripgrep' "$ROOT/Dockerfile" "image must install ripgrep"
 assert_grep 'fd-find' "$ROOT/Dockerfile" "image must install fd"
 assert_grep 'FM_HOME=/home/agent' "$ROOT/Dockerfile" "image must declare the persistent firstmate home"
+assert_grep 'never create or read operational state through repo-relative' "$ROOT/AGENTS.md" \
+  "Firstmate must anchor operational state to FM_HOME"
+assert_grep 'pass a provider-qualified model id' "$ROOT/.agents/skills/harness-adapters/SKILL.md" \
+  "Pi dispatch must preserve the selected provider route"
 assert_grep 'XDG_CONFIG_HOME=/home/agent/.config' "$ROOT/Dockerfile" "image must persist XDG configuration"
 assert_grep 'NPM_CONFIG_PREFIX=/usr/local' "$ROOT/Dockerfile" "global npm installs must use persistent /usr/local"
 assert_grep 'PATH=/home/agent/.local/bin:/home/agent/.bun/bin:/home/agent/.cargo/bin:/usr/local/bin' "$ROOT/Dockerfile" \
@@ -41,6 +45,14 @@ assert_no_grep 'USER node' "$ROOT/Dockerfile" "Agent OS containers must start as
 assert_grep 'exec herdr server' "$ROOT/bin/agent-os-container-entrypoint.sh" "entrypoint must keep Herdr as PID 1"
 assert_grep 'setup hooks' "$ROOT/bin/agent-os-container-entrypoint.sh" "entrypoint must install persistent AXI hooks"
 assert_grep 'agent-os-kubeconfig.sh' "$ROOT/bin/agent-os-container-entrypoint.sh" "entrypoint must prepare in-cluster kubectl access"
+assert_grep 'AGENT_OS_TEST_PI_MODEL' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "test-mode Pods must converge the Pi model policy"
+assert_grep 'defaultThinkingLevel' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "test-mode Pods must also pin direct Pi sessions"
+assert_grep 'openai-codex/gpt-5.6-terra' "$ROOT/deploy/orbstack/primary.yaml" \
+  "the local test fleet must pin Terra"
+assert_grep 'AGENT_OS_TEST_PI_EFFORT' "$ROOT/deploy/orbstack/primary.yaml" \
+  "the local test fleet must pin Pi reasoning effort"
 assert_grep 'tokenFile:' "$ROOT/bin/agent-os-kubeconfig.sh" "kubeconfig must follow the projected token file"
 assert_no_grep 'set-credentials.*--token' "$ROOT/bin/agent-os-kubeconfig.sh" "kubeconfig must not copy a bearer token"
 assert_grep 'automountServiceAccountToken = False' "$ROOT/tools/agent-os/packages/mate/package.k" \
