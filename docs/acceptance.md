@@ -5,6 +5,7 @@ Update it from real runs; planned behavior and model narration never count as pr
 
 | Requirement | Current evidence | State |
 | --- | --- | --- |
+| Portable Kubernetes core without Akua | `docs/kubernetes.md` and `bin/agent-os-local.sh` provide the OrbStack build, deploy, status, shell, and attach path without an Akua account, credential, managed control plane, or hosted worker | Documented locally; clean published-source run remains required |
 | Persistent Firstmate and Herdr in Kubernetes | OrbStack demo plus generic package render and disposable-cluster run in `docs/evidence/2026-07-12-firstmate-package.md` | Proven locally |
 | Firstmate cluster-admin limited to the intelligence cluster | Dedicated local namespace and explicit demo ClusterRoleBinding | Proven locally only |
 | Direct Akua-managed KaaS and Hetzner bootstrap | Public endpoint study and `akua-intelligence-bootstrap` skill | Not yet run |
@@ -24,4 +25,5 @@ Update it from real runs; planned behavior and model narration never count as pr
 ## Definition of done
 
 Agent OS is finished only when every row is backed by current external evidence and no row remains partial or unproven.
+The portable Kubernetes gate and Akua integration gate are separate: the core must pass from published sources on local OrbStack without Akua, while the enhanced path separately proves Akua-managed bootstrap and guarded delivery.
 The complete run must record time-to-cluster, time-to-Firstmate, time-to-crewmate, time-to-PR, recovery time, model and infrastructure cost, human interventions, immutable image digest, resource and operation IDs, and sanitized failure evidence.

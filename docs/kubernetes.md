@@ -3,6 +3,10 @@
 This demo runs Firstmate as the persistent controller of an isolated agent cluster.
 Kubernetes distributes and isolates the crew; it does not replace Firstmate's supervision model or Herdr's terminal/session interface.
 
+This is the provider-independent Agent OS acceptance environment.
+Running it requires no Akua account, API key, managed control plane, or Akua-hosted worker.
+The same core is intended to run on any conformant Kubernetes cluster; Akua is an optional enhanced integration for faster bootstrap, managed capacity, identity, secrets, and guarded product delivery.
+
 The local topology is deliberately small:
 
 - `agent-os-firstmate-0` is a StatefulSet with a 20 Gi persistent home.
@@ -34,6 +38,10 @@ bin/agent-os-local.sh deploy
 bin/agent-os-local.sh status
 bin/agent-os-local.sh shell
 ```
+
+Those four commands are the clean local smoke path.
+They build the image into OrbStack, start the local Kubernetes node, deploy the isolated persistent fleet, show its status, and open the Firstmate shell.
+No Akua authentication step is part of this path.
 
 With the default local image, each `build` also creates a content-addressed local tag. The following `deploy` updates both StatefulSet containers to that tag, so a rebuilt `agent-os:dev` cannot reuse a stale OrbStack runtime digest. Set `AGENT_OS_IMAGE` to build and deploy an explicit image name without replacing or retagging that override.
 
