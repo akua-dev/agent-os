@@ -72,6 +72,28 @@ assert_grep 'node_modules' "$ROOT/.dockerignore" "host dependencies must stay ou
 assert_grep '.repos' "$ROOT/.dockerignore" "development source checkouts must stay out of the build context"
 assert_grep 'https://github.com/ogulcancelik/herdr/tree/v0.7.3' "$ROOT/THIRD_PARTY_NOTICES.md" \
   "Herdr's exact corresponding source must be named"
+assert_present "$ROOT/THIRD_PARTY_SOURCES.md" \
+  "the image must ship an operator-visible Herdr source offer"
+assert_present "$ROOT/docs/herdr-compliance.md" \
+  "the repository must record the Herdr distribution boundary"
+assert_grep '299dd4163a96381ec2d8e5bde13d7ba6d6432373' "$ROOT/THIRD_PARTY_SOURCES.md" \
+  "the Herdr source offer must pin the v0.7.3 commit"
+assert_grep '4e4a536fff8cd74019a1f8b4f1eef7fce556042f2b3e389eb6f9a155c1a7c6d5' "$ROOT/THIRD_PARTY_SOURCES.md" \
+  "the Herdr source offer must checksum the source archive"
+assert_grep 'cargo build --release' "$ROOT/THIRD_PARTY_SOURCES.md" \
+  "the Herdr source offer must name its build command"
+assert_grep 'unmodified executable' "$ROOT/THIRD_PARTY_SOURCES.md" \
+  "the Herdr source offer must state the modification boundary"
+assert_grep 'install -D -m 0644 /opt/agent-os/THIRD_PARTY_NOTICES.md /usr/share/doc/agent-os/THIRD_PARTY_NOTICES.md' "$ROOT/Dockerfile" \
+  "the image must expose third-party notices to operators"
+assert_grep 'install -D -m 0644 /opt/agent-os/THIRD_PARTY_SOURCES.md /usr/share/doc/agent-os/THIRD_PARTY_SOURCES.md' "$ROOT/Dockerfile" \
+  "the image must expose Herdr's source offer to operators"
+assert_grep '/usr/share/doc/agent-os/THIRD_PARTY_SOURCES.md' "$ROOT/THIRD_PARTY_NOTICES.md" \
+  "the Herdr notice must direct image recipients to the bundled source offer"
+assert_no_grep 'publication is gated on a compliant license path' "$ROOT/THIRD_PARTY_NOTICES.md" \
+  "the Herdr notice must state the selected compliance path"
+assert_grep 'Section 13' "$ROOT/docs/herdr-compliance.md" \
+  "the Herdr audit must account for the network-interaction clause"
 assert_grep 'https://github.com/akua-dev/akua/tree/v0.8.25' "$ROOT/THIRD_PARTY_NOTICES.md" \
   "Akua's exact source must be named"
 assert_grep 'https://github.com/derailed/k9s/tree/v0.51.0' "$ROOT/THIRD_PARTY_NOTICES.md" \
@@ -86,9 +108,6 @@ assert_grep 'id: build' "$ROOT/.github/workflows/agent-os-image.yml" \
   "release workflow must expose its build result"
 assert_grep 'steps.build.outputs.digest' "$ROOT/.github/workflows/agent-os-image.yml" \
   "release workflow must record the immutable published digest"
-assert_grep 'publication is gated on a compliant license path' "$ROOT/THIRD_PARTY_NOTICES.md" \
-  "Herdr notice must not claim publication approval before the license decision"
-
 bash -n "$ROOT/bin/agent-os-container-entrypoint.sh"
 bash -n "$ROOT/bin/agent-os-kubeconfig.sh"
 pass "container files pin dependencies and exclude host credentials"

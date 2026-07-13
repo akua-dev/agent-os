@@ -21,6 +21,7 @@ Update it from real runs; planned behavior and model narration never count as pr
 | Optional GitHub Issue/Project client | Firstmate read a private Cortex GitHub issue through `gh-axi` and delivered public PR #3 with no custom intake service; public Agent OS Issues are disabled because work tracking is private | Issue client proven locally; Project client remains optional and unproven |
 | Repeatable end-to-end eval and recordable demo | Same-Pod and separate-Pod run records now capture model, time, cost estimate, interventions, resource IDs, and failures | Local agent lifecycle captured; Akua/GitHub/product path incomplete |
 | Public installable image and release | Multi-architecture release workflow builds `linux/amd64` and `linux/arm64`, publishes only outside pull requests, and records the resulting digest in its job summary | Publication not yet proven |
+| Herdr 0.7.3 source and notice bundle | `THIRD_PARTY_NOTICES.md`, `THIRD_PARTY_SOURCES.md`, the image documentation paths, and `tests/agent-os-container.test.sh` prove the unmodified-binary source offer and notice contract | Source and render contract proven; publication availability remains required |
 
 ## Definition of done
 

@@ -2,11 +2,10 @@
 
 ## Herdr
 
-The Agent OS demo image includes an unmodified Herdr 0.7.3 executable as a separate program.
-Herdr is available under AGPL-3.0-or-later or a commercial license.
-Public image publication is gated on a compliant license path being selected for this distribution.
+The Agent OS image includes an unmodified Herdr 0.7.3 executable as a separate program under AGPL-3.0-or-later.
 The image includes Herdr's license at `/usr/share/licenses/herdr/LICENSE`.
-The exact corresponding source is available at <https://github.com/ogulcancelik/herdr/tree/v0.7.3>.
+The source offer is available in the image at `/usr/share/doc/agent-os/THIRD_PARTY_SOURCES.md` and in this repository at [THIRD_PARTY_SOURCES.md](THIRD_PARTY_SOURCES.md).
+The exact upstream source is available at <https://github.com/ogulcancelik/herdr/tree/v0.7.3>.
 Agent OS invokes Herdr through its documented CLI and socket interfaces.
 
 ## Akua
