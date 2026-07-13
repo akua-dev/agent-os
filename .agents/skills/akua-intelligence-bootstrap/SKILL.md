@@ -43,6 +43,20 @@ Use the Platform MCP `search` tool again before a mutation so current schemas ou
 | Inventory tokens | `GET /api_tokens` |
 | Revoke the local bootstrap token | `DELETE /api_tokens/{id}` |
 
+## Authorization overlay contract
+
+The public Firstmate package never accepts an Akua credential input or renders an Akua Secret reference.
+Akua authorization belongs to the separate namespace-local integration overlay under `deploy/akua/`.
+The grant patch mounts only the selected Secret at `/var/run/secrets/agent-os/akua` and sets `AKUA_AUTH_HEADER_FILE=/var/run/secrets/agent-os/akua/authorization`.
+The Secret must contain one `authorization` key with the complete header and must live in the same namespace as the Firstmate StatefulSet.
+Render `__AKUA_AUTH_SECRET__` into a mode-`0600` temporary copy of `firstmate-auth-grant.yaml`, apply it with `kubectl patch statefulset agent-os-firstmate --type=strategic --patch-file`, wait for rollout, and destroy the temporary copy.
+Reject a Secret name that is not a Kubernetes DNS subdomain before substituting it.
+Never put the Secret value into the overlay, package inputs, or command arguments.
+
+Revocation is owned by the same integration boundary.
+Revoke the Akua API token and prove it fails first, apply `firstmate-auth-revoke.yaml`, wait for rollout, then delete only the named namespace-local Secret after explicit cleanup approval.
+The revoke patch removes the environment entry, volume mount, and volume without changing the public package or any other Firstmate setting.
+
 ## Bootstrap procedure
 
 1. Record the approved workspace ID, intended region, machine constraints, expiration or cleanup condition, and evidence directory without recording secrets.
@@ -54,9 +68,8 @@ Use the Platform MCP `search` tool again before a mutation so current schemas ou
 7. Create the worker, then verify both Akua machine state and Kubernetes Node readiness.
 8. Retrieve kubeconfig only into a protected temporary file and verify the cluster identity before applying anything.
 9. Build or select a published Agent OS image by immutable digest.
-10. Create a distinct clustered-Firstmate API token and immediately convert it into a Kubernetes Secret named by `akuaAuthSecret`.
-    The Secret's `authorization` key contains the complete header consumed through `AKUA_AUTH_HEADER_FILE`.
-11. Render `tools/agent-os/packages/firstmate/package.k` with `akua render`, inspect the ordinary YAML, and apply it with `kubectl`.
+10. Render `tools/agent-os/packages/firstmate/package.k` with `akua render`, inspect the ordinary credential-free YAML, and apply it with `kubectl`.
+11. Create a distinct clustered-Firstmate API token, create the namespace-local authorization Secret from a protected header file, and apply the grant overlay exactly as defined above.
 12. Verify the StatefulSet is ready, Herdr responds, the persistent home is writable, the `in-cluster` context is cluster-admin only in this intelligence cluster, and the Pod can list its Akua workspace through `curl -H @"$AKUA_AUTH_HEADER_FILE"`.
 13. Probe the approved primary model route with a bounded request and record only provider, model, result, timing, and cost.
     If there is no independently approved fallback provider, record the single-provider availability risk instead of presenting the fleet as quota-resilient.
@@ -66,10 +79,10 @@ Use the Platform MCP `search` tool again before a mutation so current schemas ou
 
 ## Recovery and cleanup
 
-- A Pod restart reuses the Firstmate PVC and mounted Kubernetes Secret.
+- A Pod restart reuses the Firstmate PVC and the authorization mount declared by the separate overlay.
 - A worker replacement must preserve or reattach every PVC holding unique work before deleting the old worker.
 - Do not claim cluster-loss recovery until an external encrypted backup has been restored in a clean cluster.
-- Machine, cluster, Secret, token, and workspace deletion are separate destructive actions.
+- Machine, cluster, authorization overlay, Secret, token, and workspace deletion are separate destructive actions.
 - Execute only the approved cleanup scope and verify retained resources afterward.
 
 ## Completion evidence

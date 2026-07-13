@@ -60,7 +60,15 @@ spec:
         - name: home
           mountPath: /usr/local
           subPath: usr-local
+        - name: ai-auth
+          mountPath: /home/agent/.pi/agent/auth.json
+          subPath: auth.json
+          readOnly: true
   volumes:
     - name: home
       persistentVolumeClaim:
         claimName: agent-os-crewmate-__AGENT_OS_CREWMATE_ID__-home
+    - name: ai-auth
+      secret:
+        secretName: __AGENT_OS_AI_SECRET__
+        defaultMode: 256

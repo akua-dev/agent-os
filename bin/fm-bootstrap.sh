@@ -43,11 +43,10 @@
 #          "treehouse get --lease" support.
 #          no-mistakes is also MISSING when its installed version is older than
 #          1.31.2.
-#          Akua, tasks-axi, and quota-axi are required bootstrap tools.
-#          Akua renders the optional Agent OS mate package into ordinary YAML;
-#          firstmate may also author and apply Kubernetes YAML directly.
-#          tasks-axi and quota-axi are in the same class as
-#          lavish-axi). tasks-axi is also version and feature gated (0.1.1+
+#          Akua is optional and required only when an Agent OS Kubernetes or
+#          Akua integration path invokes it.
+#          tasks-axi and quota-axi are required bootstrap tools in the same class as
+#          lavish-axi. tasks-axi is also version and feature gated (0.1.1+
 #          with update --archive-body and mv [<id>...]); an installed but incompatible build
 #          reports MISSING like no-mistakes. When
 #          config/backlog-backend is not manual and tasks-axi is compatible,
@@ -326,8 +325,8 @@ install_cmd() {
 
 BACKEND=$(fm_backend_name)
 case "$BACKEND" in
-  orca) TOOLS="orca node git gh akua no-mistakes gh-axi chrome-devtools-axi lavish-axi tasks-axi quota-axi" ;;
-  *) TOOLS="tmux node git gh akua treehouse no-mistakes gh-axi chrome-devtools-axi lavish-axi tasks-axi quota-axi" ;;
+  orca) TOOLS="orca node git gh no-mistakes gh-axi chrome-devtools-axi lavish-axi tasks-axi quota-axi" ;;
+  *) TOOLS="tmux node git gh treehouse no-mistakes gh-axi chrome-devtools-axi lavish-axi tasks-axi quota-axi" ;;
 esac
 NO_MISTAKES_MIN_MAJOR=1
 NO_MISTAKES_MIN_MINOR=31

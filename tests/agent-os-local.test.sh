@@ -118,6 +118,20 @@ test_explicit_image_override_is_used_without_retagging() {
   pass "explicit image override remains intact"
 }
 
+test_empty_image_override_uses_content_addressed_default() {
+  : > "$LOG"
+  AGENT_OS_IMAGE='' AGENT_OS_TEST_IMAGE_ID=sha256:empty-default run_cli build
+  AGENT_OS_IMAGE='' AGENT_OS_TEST_IMAGE_ID=sha256:empty-default run_cli deploy
+
+  assert_call 'docker build -t agent-os:dev .' \
+    "an empty image override must use the local demo default"
+  assert_call 'docker tag agent-os:dev agent-os:local-empty-default' \
+    "an empty image override must still receive a content-addressed tag"
+  assert_call 'akua-input-image agent-os:local-empty-default' \
+    "an empty image override must deploy the content-addressed local image"
+  pass "empty image override uses the content-addressed local default"
+}
+
 test_destroy_requires_exact_confirmation() {
   local out rc=0
   : > "$LOG"
@@ -149,5 +163,6 @@ test_status_pins_context_and_namespace
 test_deploy_starts_local_kubernetes_and_renders_the_orbstack_profile
 test_rebuild_deploy_uses_a_new_immutable_local_tag
 test_explicit_image_override_is_used_without_retagging
+test_empty_image_override_uses_content_addressed_default
 test_destroy_requires_exact_confirmation
 test_non_orbstack_context_is_fail_closed

@@ -25,14 +25,45 @@ if [ -z "$CONTEXT" ]; then
 fi
 
 render() {
+  if ! command -v "$AKUA" >/dev/null 2>&1; then
+    echo "error: Akua renderer '$AKUA' is required for Kubernetes package operations" >&2
+    exit 2
+  fi
   "$AKUA" render --no-agent-mode --package "$PACKAGE" --inputs "$INPUTS" --out "$OUT"
 }
 
+render_has_kind() {
+  grep -R -Eq "^kind:[[:space:]]*$1$" "$OUT"
+}
+
+delete_namespace_rbac() {
+  "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" delete rolebinding agent-os-firstmate-runtime --ignore-not-found
+  "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" delete role agent-os-firstmate-runtime --ignore-not-found
+}
+
+delete_cluster_admin_rbac() {
+  "$KUBECTL" --context "$CONTEXT" delete clusterrolebinding "agent-os-firstmate-$NAMESPACE" --ignore-not-found
+}
+
+reconcile_rbac() {
+  render_has_kind Role || delete_namespace_rbac
+  render_has_kind ClusterRoleBinding || delete_cluster_admin_rbac
+}
+
+apply_rendered() {
+  "$KUBECTL" --context "$CONTEXT" apply -f "$OUT"
+  "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" rollout status statefulset/agent-os-firstmate --timeout=180s
+}
+
 case "$COMMAND" in
-  install|upgrade)
+  install)
     render
-    "$KUBECTL" --context "$CONTEXT" apply -f "$OUT"
-    "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" rollout status statefulset/agent-os-firstmate --timeout=180s
+    apply_rendered
+    ;;
+  upgrade)
+    render
+    reconcile_rbac
+    apply_rendered
     ;;
   rollback)
     "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" rollout undo statefulset/agent-os-firstmate
@@ -47,6 +78,8 @@ case "$COMMAND" in
       exit 2
     fi
     render
+    delete_cluster_admin_rbac
+    delete_namespace_rbac
     "$KUBECTL" --context "$CONTEXT" delete --ignore-not-found -f "$OUT"
     ;;
   *)

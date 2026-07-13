@@ -17,9 +17,9 @@ Inspect the YAML before applying it with `kubectl`.
 The example digest is deliberately non-installable until the first public Agent OS image release exists.
 Replace it only with that release's published digest.
 
-The default `rbac: namespace` grants the Firstmate ServiceAccount only the namespace-scoped Pod, Pod exec/log, PVC, and StatefulSet reads needed for runtime mate management.
+The default `rbac: namespace` grants the Firstmate ServiceAccount only the namespace-scoped Pod, Pod exec/log, PVC, and StatefulSet operations needed for runtime mate management, including patch for idempotent apply.
 Set `rbac: none` when a separate authority mechanism manages mates.
 Set `rbac: cluster-admin` only for an isolated intelligence cluster after a reviewed grant.
 
 The package carries no credential value or Secret reference.
-Any runtime credential is a separately created Kubernetes Secret, mounted only after its owner has approved that authority.
+Any runtime credential is a separately created namespace-local Kubernetes Secret, referenced by the runtime helper only after its owner has approved that authority.

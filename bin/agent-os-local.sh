@@ -7,7 +7,8 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CONTEXT=${AGENT_OS_CONTEXT:-orbstack}
 NAMESPACE=${AGENT_OS_NAMESPACE:-agent-os-demo}
 IMAGE=${AGENT_OS_IMAGE:-agent-os:dev}
-IMAGE_IS_OVERRIDE=${AGENT_OS_IMAGE+x}
+IMAGE_IS_OVERRIDE=
+[ -z "${AGENT_OS_IMAGE:-}" ] || IMAGE_IS_OVERRIDE=1
 COMMAND=${1:-}
 PROFILE="$ROOT/deploy/orbstack/inputs.yaml"
 

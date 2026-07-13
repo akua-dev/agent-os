@@ -9,7 +9,7 @@ Update it from real runs; planned behavior and model narration never count as pr
 | Persistent Firstmate and Herdr in Kubernetes | Canonical package render plus local lifecycle records in `docs/evidence/2026-07-12-firstmate-package.md` | Package render and local evidence proven; published-image run remains required |
 | Firstmate cluster-admin limited to the intelligence cluster | Dedicated local namespace and explicit demo ClusterRoleBinding | Proven locally only |
 | Direct Akua-managed KaaS and Hetzner bootstrap | Public endpoint study and `akua-intelligence-bootstrap` skill | Not yet run |
-| Distinct clustered token and bootstrap-token revocation | Explicit Secret mount in the Firstmate package and handoff procedure | Not yet run |
+| Distinct clustered token and bootstrap-token revocation | Separate namespace-local Akua grant/revoke overlay and handoff procedure; the public package remains credential-free | Overlay contract implemented; live handoff and revocation not yet run |
 | Firstmate-native Akua worker lifecycle | Native endpoint routing in the bootstrap skill | Not yet run |
 | Replaceable usable model supply | `openai-codex/gpt-5.4-mini` completed the same-Pod task; Terra-low completed the separate-Pod and recovery tasks; the current local overlay converges direct Pi, crewmate, and Secondmate defaults to `openai-codex/gpt-5.6-terra` with low thinking | One provider with multiple models proven locally; replacement provider still unproven |
 | Same-Pod general-purpose crewmate | Firstmate-supervised Pi scout, real Kubernetes test, in-cluster context check, and report in `docs/evidence/2026-07-13-same-pod-firstmate.md` | Proven locally |

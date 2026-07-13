@@ -38,10 +38,28 @@ assert_grep 'kind = "Role"' "$FIRSTMATE/package.k" \
   "the portable package must render the namespace runtime Role"
 assert_grep 'kind = "RoleBinding"' "$FIRSTMATE/package.k" \
   "the portable package must bind its explicit ServiceAccount to that Role"
+assert_grep 'resources = ["pods", "persistentvolumeclaims"]' "$FIRSTMATE/package.k" \
+  "runtime apply authority must exclude Pod subresources from patch access"
+assert_grep 'verbs = ["get", "list", "watch", "create", "delete", "patch"]' "$FIRSTMATE/package.k" \
+  "runtime RBAC must allow kubectl apply to patch retained crewmate PVCs"
 assert_no_grep 'akuaAuthSecret' "$FIRSTMATE/package.k" \
   "the portable package must not require Akua authorization"
 assert_no_grep 'agent-os.akua.dev' "$FIRSTMATE/package.k" \
   "the portable package must not depend on Akua-owned resource annotations"
+[ -f "$ROOT/deploy/akua/firstmate-auth-grant.yaml" ] || \
+  fail "Akua authorization must use a separate integration grant overlay"
+[ -f "$ROOT/deploy/akua/firstmate-auth-revoke.yaml" ] || \
+  fail "Akua authorization overlay must own explicit mount cleanup"
+assert_grep 'name: AKUA_AUTH_HEADER_FILE' "$ROOT/deploy/akua/firstmate-auth-grant.yaml" \
+  "Akua overlay must set the authorization header file path"
+assert_grep 'mountPath: /var/run/secrets/agent-os/akua' "$ROOT/deploy/akua/firstmate-auth-grant.yaml" \
+  "Akua overlay must mount only the Akua authorization path"
+assert_grep 'secretName: __AKUA_AUTH_SECRET__' "$ROOT/deploy/akua/firstmate-auth-grant.yaml" \
+  "Akua overlay must reference a namespace-local Secret by name"
+assert_grep "\$patch: delete" "$ROOT/deploy/akua/firstmate-auth-revoke.yaml" \
+  "Akua overlay must define explicit authorization mount cleanup"
+assert_grep 'mountPath: /var/run/secrets/agent-os/akua' "$ROOT/deploy/akua/firstmate-auth-revoke.yaml" \
+  "Akua overlay cleanup must use the strategic merge key for volume mounts"
 assert_grep '@sha256:' "$FIRSTMATE/inputs.example.yaml" \
   "the example must use an immutable image digest"
 [ ! -f "$MATE/package.k" ] || fail "mate creation must not remain a separately installable package"

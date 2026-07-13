@@ -56,6 +56,9 @@ To upgrade, use a new released digest in the same input file and apply it throug
 bin/agent-os-kubernetes.sh upgrade
 ```
 
+Upgrade reconciles the mutually exclusive namespace and cluster-admin RBAC resources before applying the new render.
+Downgrading from `cluster-admin` therefore requires permission to delete the prior ClusterRoleBinding and fails instead of silently retaining authority.
+
 To roll back only the Firstmate workload revision, use Kubernetes StatefulSet history.
 This does not roll back package inputs, RBAC, or persistent data.
 
@@ -69,9 +72,10 @@ To inspect the workload, use the same explicit context and namespace.
 bin/agent-os-kubernetes.sh status
 ```
 
-Uninstall is deliberately confirmed and bounded to a fresh render of the selected package inputs.
+Uninstall is deliberately confirmed and bounded to a fresh render plus the package's deterministic RBAC resource names.
+It attempts all package-owned RBAC modes so a binding omitted by newer inputs cannot survive.
 When those inputs create the namespace, deleting that rendered Namespace also removes everything in that namespace.
-When `createNamespace: false`, the command deletes only the rendered Agent OS resources in the existing namespace.
+When `createNamespace: false`, the command leaves unrelated resources in the existing namespace untouched.
 
 ```sh
 bin/agent-os-kubernetes.sh uninstall --yes
@@ -82,6 +86,14 @@ bin/agent-os-kubernetes.sh uninstall --yes
 Firstmate creates a separate-Pod crewmate at runtime with the internal `crewmate.yaml` template in the canonical package.
 It is not a second public package and is not a Marketplace product.
 Each runtime mate has its own PVC and no ambient Kubernetes ServiceAccount token.
+Creating one requires an explicitly authorized, pre-created Secret in the same namespace with an `auth.json` key.
+Pass only that Secret's name through `AGENT_OS_AI_SECRET`; the helper never discovers or copies the primary credential.
+The authorization file is mounted read-only at `/home/agent/.pi/agent/auth.json`.
+A missing Secret or key keeps the Pod unready, so creation fails closed and removes the non-running Pod while retaining its PVC for an authorized retry.
+
+```sh
+AGENT_OS_AI_SECRET=scout-1-ai-auth bin/agent-os-crewmate.sh create scout-1
+```
 
 The existing [same-Pod](evidence/2026-07-13-same-pod-firstmate.md) and [separate-Pod recovery](evidence/2026-07-13-separate-pod-recovery.md) records remain local lifecycle evidence.
 They do not substitute for a clean published-image installation.

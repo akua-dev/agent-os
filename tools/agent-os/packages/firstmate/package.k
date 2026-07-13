@@ -46,7 +46,12 @@ namespaceRbacResources = [
         rules = [
             {
                 apiGroups = [""]
-                resources = ["pods", "pods/log", "pods/exec", "persistentvolumeclaims"]
+                resources = ["pods", "persistentvolumeclaims"]
+                verbs = ["get", "list", "watch", "create", "delete", "patch"]
+            },
+            {
+                apiGroups = [""]
+                resources = ["pods/log", "pods/exec"]
                 verbs = ["get", "list", "watch", "create", "delete"]
             },
             {
