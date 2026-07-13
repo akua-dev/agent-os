@@ -34,6 +34,25 @@ SH
 chmod +x "$FAKEBIN/docker"
 make_fake kubectl
 make_fake orbctl
+cat > "$FAKEBIN/akua" <<'SH'
+#!/usr/bin/env bash
+printf '%s' "$(basename "$0")" >> "$AGENT_OS_TEST_LOG"
+printf ' %s' "$@" >> "$AGENT_OS_TEST_LOG"
+printf '\n' >> "$AGENT_OS_TEST_LOG"
+inputs=''
+out=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --inputs) inputs=$2; shift 2 ;;
+    --out) out=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf 'akua-input-image %s\n' "$(awk '/^image:/{print $2}' "$inputs")" >> "$AGENT_OS_TEST_LOG"
+mkdir -p "$out"
+printf 'apiVersion: v1\nkind: ConfigMap\n' > "$out/rendered.yaml"
+SH
+chmod +x "$FAKEBIN/akua"
 
 run_cli() {
   PATH="$FAKEBIN:$PATH" AGENT_OS_TEST_LOG="$LOG" \
@@ -52,15 +71,22 @@ test_status_pins_context_and_namespace() {
   pass "status pins the OrbStack context and Agent OS namespace"
 }
 
-test_deploy_starts_local_kubernetes_and_applies_kustomize() {
+test_deploy_starts_local_kubernetes_and_renders_the_orbstack_profile() {
   : > "$LOG"
   run_cli deploy
   assert_call 'orbctl start k8s' "deploy must start OrbStack Kubernetes"
   assert_call 'kubectl --context orbstack wait --for=condition=Ready node/orbstack --timeout=120s' \
     "deploy must wait for the explicit OrbStack node"
-  assert_call 'kubectl --context orbstack apply -k deploy/orbstack' \
-    "deploy must apply only the checked-in OrbStack kustomization"
-  pass "deploy starts and targets only OrbStack"
+  grep -Fq -- "akua render --no-agent-mode --package $ROOT/tools/agent-os/packages/firstmate/package.k --inputs " "$LOG" || \
+    fail "deploy must render the canonical portable package"
+  assert_call 'akua-input-image agent-os:local-default' \
+    "OrbStack must derive its manifest from the rebuilt local image"
+  grep -Fq 'kubectl --context orbstack apply -f ' "$LOG" || \
+    fail "deploy must apply only the freshly rendered OrbStack profile"
+  if grep -F 'kubectl --context orbstack apply -k' "$LOG" >/dev/null; then
+    fail "OrbStack must not maintain a second static installer"
+  fi
+  pass "deploy starts OrbStack and applies the canonical package profile"
 }
 
 test_rebuild_deploy_uses_a_new_immutable_local_tag() {
@@ -72,9 +98,9 @@ test_rebuild_deploy_uses_a_new_immutable_local_tag() {
   assert_call 'docker build -t agent-os:dev .' "build must retain the local demo image tag"
   assert_call 'docker tag agent-os:dev agent-os:local-rebuilt' \
     "build must assign the rebuilt image a unique local tag"
-  assert_call 'kubectl --context orbstack -n agent-os-demo set image statefulset/agent-os-firstmate agent-os-init=agent-os:local-rebuilt firstmate=agent-os:local-rebuilt' \
-    "deploy must replace the stale mutable tag with the rebuilt local tag"
-  pass "rebuild deploy selects the rebuilt local image instead of a stale mutable tag"
+  assert_call 'akua-input-image agent-os:local-rebuilt' \
+    "the rendered OrbStack profile must select the rebuilt local image"
+  pass "rebuild deploy renders the rebuilt local image instead of a stale mutable tag"
 }
 
 test_explicit_image_override_is_used_without_retagging() {
@@ -84,8 +110,8 @@ test_explicit_image_override_is_used_without_retagging() {
 
   assert_call 'docker build -t example.test/agent-os:custom .' \
     "build must preserve an explicit image override"
-  assert_call 'kubectl --context orbstack -n agent-os-demo set image statefulset/agent-os-firstmate agent-os-init=example.test/agent-os:custom firstmate=example.test/agent-os:custom' \
-    "deploy must preserve an explicit image override"
+  assert_call 'akua-input-image example.test/agent-os:custom' \
+    "the rendered OrbStack profile must preserve an explicit image override"
   if grep -F 'docker tag example.test/agent-os:custom' "$LOG" >/dev/null; then
     fail "explicit image overrides must not be retagged"
   fi
@@ -100,9 +126,9 @@ test_destroy_requires_exact_confirmation() {
   [ ! -s "$LOG" ] || fail "destroy without --yes invoked an external command"
 
   run_cli destroy --yes
-  assert_call 'kubectl --context orbstack delete namespace agent-os-demo' \
-    "confirmed destroy must delete only agent-os-demo"
-  pass "destroy requires confirmation and remains namespace-scoped"
+  grep -Fq 'kubectl --context orbstack delete --ignore-not-found -f ' "$LOG" || \
+    fail "confirmed destroy must delete only resources from the rendered OrbStack profile"
+  pass "destroy requires confirmation and remains package-scoped"
 }
 
 test_non_orbstack_context_is_fail_closed() {
@@ -120,7 +146,7 @@ test_non_orbstack_context_is_fail_closed() {
 }
 
 test_status_pins_context_and_namespace
-test_deploy_starts_local_kubernetes_and_applies_kustomize
+test_deploy_starts_local_kubernetes_and_renders_the_orbstack_profile
 test_rebuild_deploy_uses_a_new_immutable_local_tag
 test_explicit_image_override_is_used_without_retagging
 test_destroy_requires_exact_confirmation

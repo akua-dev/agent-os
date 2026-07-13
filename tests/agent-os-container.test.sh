@@ -49,20 +49,22 @@ assert_grep 'AGENT_OS_TEST_PI_MODEL' "$ROOT/bin/agent-os-container-entrypoint.sh
   "test-mode Pods must converge the Pi model policy"
 assert_grep 'defaultThinkingLevel' "$ROOT/bin/agent-os-container-entrypoint.sh" \
   "test-mode Pods must also pin direct Pi sessions"
-assert_grep 'openai-codex/gpt-5.6-terra' "$ROOT/deploy/orbstack/primary.yaml" \
-  "the local test fleet must pin Terra"
-assert_grep 'AGENT_OS_TEST_PI_EFFORT' "$ROOT/deploy/orbstack/primary.yaml" \
-  "the local test fleet must pin Pi reasoning effort"
+assert_grep 'image: agent-os:dev' "$ROOT/deploy/orbstack/inputs.yaml" \
+  "the OrbStack profile must define its local image source"
+assert_grep 'imagePullPolicy: Never' "$ROOT/deploy/orbstack/inputs.yaml" \
+  "the OrbStack profile must use its local image store"
+assert_grep 'rbac: cluster-admin' "$ROOT/deploy/orbstack/inputs.yaml" \
+  "the OrbStack profile must make its local-demo grant explicit"
 assert_grep 'tokenFile:' "$ROOT/bin/agent-os-kubeconfig.sh" "kubeconfig must follow the projected token file"
 assert_no_grep 'set-credentials.*--token' "$ROOT/bin/agent-os-kubeconfig.sh" "kubeconfig must not copy a bearer token"
-assert_grep 'automountServiceAccountToken = False' "$ROOT/tools/agent-os/packages/mate/package.k" \
-  "mate package must deny ambient Kubernetes credentials"
-assert_grep 'piAuthSecret: str = ""' "$ROOT/tools/agent-os/packages/mate/package.k" \
-  "mate package must default to no AI credential grant"
-assert_grep 'readOnly = True' "$ROOT/tools/agent-os/packages/mate/package.k" \
-  "granted AI credentials must be mounted read-only"
-assert_grep 'secretName = input.piAuthSecret' "$ROOT/tools/agent-os/packages/mate/package.k" \
-  "mate package must use only the explicitly selected Secret"
+assert_grep 'automountServiceAccountToken: false' "$ROOT/tools/agent-os/packages/firstmate/crewmate.yaml" \
+  "runtime mate template must deny ambient Kubernetes credentials"
+assert_grep 'agent-os.dev/crewmate' "$ROOT/tools/agent-os/packages/firstmate/crewmate.yaml" \
+  "runtime mate template must use the portable Agent OS label"
+assert_grep 'AGENT_OS_CREWMATE_TEMPLATE' "$ROOT/bin/agent-os-crewmate.sh" \
+  "mate runtime must render the canonical package template"
+assert_absent "$ROOT/tools/agent-os/packages/mate/package.k" \
+  "mate creation must not remain a separately installable package"
 assert_grep '.git' "$ROOT/.dockerignore" "git metadata must stay out of the build context"
 assert_grep '.pi' "$ROOT/.dockerignore" "Pi credentials must stay out of the build context"
 assert_grep '.codex' "$ROOT/.dockerignore" "Codex credentials must stay out of the build context"
@@ -75,11 +77,17 @@ assert_grep 'https://github.com/akua-dev/akua/tree/v0.8.25' "$ROOT/THIRD_PARTY_N
 assert_grep 'https://github.com/derailed/k9s/tree/v0.51.0' "$ROOT/THIRD_PARTY_NOTICES.md" \
   "K9s's exact source must be named"
 assert_grep 'ghcr.io/akua-dev/agent-os' "$ROOT/.github/workflows/agent-os-image.yml" \
-  "release workflow must publish the image expected by the Akua packages"
+  "release workflow must publish the image expected by the portable package"
 assert_grep 'linux/amd64,linux/arm64' "$ROOT/.github/workflows/agent-os-image.yml" \
   "release workflow must build the two supported container architectures"
 assert_grep "push: \${{ github.event_name != 'pull_request' }}" "$ROOT/.github/workflows/agent-os-image.yml" \
   "pull requests must build but never publish images"
+assert_grep 'id: build' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "release workflow must expose its build result"
+assert_grep 'steps.build.outputs.digest' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "release workflow must record the immutable published digest"
+assert_grep 'publication is gated on a compliant license path' "$ROOT/THIRD_PARTY_NOTICES.md" \
+  "Herdr notice must not claim publication approval before the license decision"
 
 bash -n "$ROOT/bin/agent-os-container-entrypoint.sh"
 bash -n "$ROOT/bin/agent-os-kubeconfig.sh"

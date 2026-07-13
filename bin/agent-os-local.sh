@@ -9,6 +9,7 @@ NAMESPACE=${AGENT_OS_NAMESPACE:-agent-os-demo}
 IMAGE=${AGENT_OS_IMAGE:-agent-os:dev}
 IMAGE_IS_OVERRIDE=${AGENT_OS_IMAGE+x}
 COMMAND=${1:-}
+PROFILE="$ROOT/deploy/orbstack/inputs.yaml"
 
 if [ "$CONTEXT" != orbstack ] && [ "${AGENT_OS_ALLOW_NON_ORBSTACK:-0}" != 1 ]; then
   echo "error: refusing Kubernetes context '$CONTEXT'; set AGENT_OS_ALLOW_NON_ORBSTACK=1 to opt in" >&2
@@ -19,6 +20,15 @@ local_image_tag() {
   local image_id
   image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE")
   printf 'agent-os:local-%s\n' "${image_id#sha256:}"
+}
+
+render_profile() {
+  local image=$1 inputs
+  inputs=$(mktemp)
+  trap 'rm -f "$inputs"' RETURN
+  sed "s|^image: .*|image: $image|" "$PROFILE" > "$inputs"
+  AGENT_OS_CONTEXT="$CONTEXT" AGENT_OS_NAMESPACE="$NAMESPACE" AGENT_OS_INPUTS="$inputs" \
+    "$ROOT/bin/agent-os-kubernetes.sh" install
 }
 
 cd "$ROOT"
@@ -35,12 +45,10 @@ case "$COMMAND" in
       orbctl start k8s
       kubectl --context "$CONTEXT" wait --for=condition=Ready node/orbstack --timeout=120s
     fi
-    kubectl --context "$CONTEXT" apply -k deploy/orbstack
     if [ -z "$IMAGE_IS_OVERRIDE" ]; then
       IMAGE=$(local_image_tag)
     fi
-    kubectl --context "$CONTEXT" -n "$NAMESPACE" set image statefulset/agent-os-firstmate \
-      "agent-os-init=$IMAGE" "firstmate=$IMAGE"
+    render_profile "$IMAGE"
     ;;
   status)
     kubectl --context "$CONTEXT" -n "$NAMESPACE" get statefulset agent-os-firstmate
@@ -56,7 +64,8 @@ case "$COMMAND" in
       echo "error: destroy requires --yes and deletes only namespace '$NAMESPACE'" >&2
       exit 2
     fi
-    kubectl --context "$CONTEXT" delete namespace "$NAMESPACE"
+    AGENT_OS_CONTEXT="$CONTEXT" AGENT_OS_NAMESPACE="$NAMESPACE" AGENT_OS_INPUTS="$PROFILE" \
+      "$ROOT/bin/agent-os-kubernetes.sh" uninstall --yes
     ;;
   *)
     echo "usage: $0 build|deploy|status|shell|attach|destroy [--yes]" >&2

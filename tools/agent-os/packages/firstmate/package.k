@@ -1,19 +1,22 @@
 import akua.ctx
 
 schema Input:
-    """Inputs for one persistent Firstmate in a dedicated intelligence cluster."""
+    """Inputs for one persistent Firstmate on a conformant Kubernetes cluster."""
 
     namespace: str = "agent-os"
     createNamespace: bool = True
-    image: str = "ghcr.io/akua-dev/agent-os:latest"
+    image: str
     imagePullPolicy: "Always" | "IfNotPresent" | "Never" = "IfNotPresent"
-    clusterAdmin: bool = True
-    akuaAuthSecret: str = ""
+    allowMutableImage: bool = False
+    rbac: "namespace" | "cluster-admin" | "none" = "namespace"
     storage: str = "20Gi"
     cpuRequest: str = "500m"
     memoryRequest: str = "1Gi"
     cpuLimit: str = "4"
     memoryLimit: str = "8Gi"
+
+    check:
+        allowMutableImage or "@sha256:" in image, "image must use an immutable @sha256 digest unless the local profile explicitly allows a mutable image"
 
 input: Input = ctx.input()
 
@@ -21,25 +24,6 @@ labels = {
     "app.kubernetes.io/name" = "agent-os"
     "app.kubernetes.io/component" = "firstmate"
 }
-
-akuaAuthMounts = [{
-    name = "akua-auth"
-    mountPath = "/var/run/secrets/agent-os/akua"
-    readOnly = True
-}] if input.akuaAuthSecret else []
-
-akuaAuthVolumes = [{
-    name = "akua-auth"
-    secret = {
-        secretName = input.akuaAuthSecret
-        defaultMode = 256
-    }
-}] if input.akuaAuthSecret else []
-
-akuaAuthEnv = [{
-    name = "AKUA_AUTH_HEADER_FILE"
-    value = "/var/run/secrets/agent-os/akua/authorization"
-}] if input.akuaAuthSecret else []
 
 namespaceResources = [{
     apiVersion = "v1"
@@ -50,7 +34,50 @@ namespaceResources = [{
     }
 }] if input.createNamespace else []
 
-adminResources = [{
+namespaceRbacResources = [
+    {
+        apiVersion = "rbac.authorization.k8s.io/v1"
+        kind = "Role"
+        metadata = {
+            name = "agent-os-firstmate-runtime"
+            namespace = input.namespace
+            labels = labels
+        }
+        rules = [
+            {
+                apiGroups = [""]
+                resources = ["pods", "pods/log", "pods/exec", "persistentvolumeclaims"]
+                verbs = ["get", "list", "watch", "create", "delete"]
+            },
+            {
+                apiGroups = ["apps"]
+                resources = ["statefulsets"]
+                verbs = ["get", "list", "watch"]
+            },
+        ]
+    },
+    {
+        apiVersion = "rbac.authorization.k8s.io/v1"
+        kind = "RoleBinding"
+        metadata = {
+            name = "agent-os-firstmate-runtime"
+            namespace = input.namespace
+            labels = labels
+        }
+        roleRef = {
+            apiGroup = "rbac.authorization.k8s.io"
+            kind = "Role"
+            name = "agent-os-firstmate-runtime"
+        }
+        subjects = [{
+            kind = "ServiceAccount"
+            name = "agent-os-firstmate"
+            namespace = input.namespace
+        }]
+    },
+] if input.rbac == "namespace" else []
+
+clusterAdminResources = [{
     apiVersion = "rbac.authorization.k8s.io/v1"
     kind = "ClusterRoleBinding"
     metadata = {
@@ -67,7 +94,7 @@ adminResources = [{
         name = "agent-os-firstmate"
         namespace = input.namespace
     }]
-}] if input.clusterAdmin else []
+}] if input.rbac == "cluster-admin" else []
 
 resources = namespaceResources + [
     {
@@ -78,6 +105,7 @@ resources = namespaceResources + [
             namespace = input.namespace
             labels = labels
         }
+        automountServiceAccountToken = True
     },
     {
         apiVersion = "v1"
@@ -105,7 +133,7 @@ resources = namespaceResources + [
             selector = labels
         }
     },
-] + adminResources + [
+] + namespaceRbacResources + clusterAdminResources + [
     {
         apiVersion = "apps/v1"
         kind = "StatefulSet"
@@ -122,7 +150,7 @@ resources = namespaceResources + [
                 metadata = {
                     labels = labels
                     annotations = {
-                        "agent-os.akua.dev/address" = "/k8s/in-cluster/namespace/${input.namespace}/mate/firstmate/herdr"
+                        "agent-os.dev/address" = "/k8s/in-cluster/namespace/${input.namespace}/mate/firstmate/herdr"
                     }
                 }
                 spec = {
@@ -149,8 +177,10 @@ resources = namespaceResources + [
                         env = [
                             { name = "FM_HOME", value = "/home/agent" },
                             { name = "HOME", value = "/home/agent" },
-                            { name = "AKUA_API_URL", value = "https://api.akua.dev/v1" },
-                        ] + akuaAuthEnv
+                            { name = "AGENT_OS_NAMESPACE", value = input.namespace },
+                            { name = "AGENT_OS_IMAGE", value = input.image },
+                            { name = "AGENT_OS_IMAGE_PULL_POLICY", value = input.imagePullPolicy },
+                        ]
                         readinessProbe = {
                             exec = { command = ["herdr", "status", "--json"] }
                             initialDelaySeconds = 2
@@ -169,12 +199,12 @@ resources = namespaceResources + [
                         volumeMounts = [
                             { name = "home", mountPath = "/home/agent" },
                             { name = "home", mountPath = "/usr/local", subPath = "usr-local" },
-                        ] + akuaAuthMounts
+                        ]
                     }]
                     volumes = [{
                         name = "home"
                         persistentVolumeClaim = { claimName = "agent-os-firstmate-home" }
-                    }] + akuaAuthVolumes
+                    }]
                 }
             }
         }

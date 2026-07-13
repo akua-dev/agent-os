@@ -48,6 +48,7 @@ jobs:
             type=ref,event=tag
 
       - name: Build and optionally publish
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -59,3 +60,12 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: mode=max
           sbom: true
+
+      - name: Record published image digest
+        if: github.event_name != 'pull_request'
+        run: |
+          {
+            echo '### Agent OS image'
+            echo
+            echo "Digest: \`${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

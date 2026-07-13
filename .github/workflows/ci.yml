@@ -52,6 +52,13 @@ jobs:
           set -eu
           npm install -g tasks-axi
           tasks-axi --version
+      - name: Install Akua renderer
+        run: |
+          set -eu
+          export AKUA_INSTALL="$RUNNER_TEMP/akua"
+          curl -fsSL https://cli.akua.dev/install | sh -s -- 0.8.25
+          echo "$AKUA_INSTALL/bin" >> "$GITHUB_PATH"
+          "$AKUA_INSTALL/bin/akua" --version
       - run: |
           set -eu
           for test_script in tests/*.test.sh; do

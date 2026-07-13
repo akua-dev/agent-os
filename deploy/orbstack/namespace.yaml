@@ -1,8 +1,0 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: agent-os-demo
-  labels:
-    app.kubernetes.io/name: agent-os
-    app.kubernetes.io/part-of: agent-os-demo
-
