@@ -65,6 +65,7 @@ Never add an agent name as co-author.
 `FM_HOME` selects the operational home for a firstmate instance.
 When it is unset, most scripts use this repo root as the home, which is today's behavior.
 When it is set, scripts still use their own `bin/` from the repo they live in, but operational dirs come from `$FM_HOME`: `state/`, `data/`, `config/`, and `projects/`.
+When `FM_HOME` is set, never create or read operational state through repo-relative `state/`, `data/`, `config/`, or `projects/` paths; use `$FM_HOME/...` or firstmate scripts that resolve it.
 Existing overrides remain compatible: `FM_STATE_OVERRIDE` can still point at a custom state dir, and `FM_ROOT_OVERRIDE` still behaves like the old whole-root override when `FM_HOME` is unset.
 `bin/fm-send.sh` is the fail-closed exception: it requires `FM_HOME` to be set so target resolution is always scoped to an explicit firstmate home.
 Each secondmate gets its own persistent `FM_HOME`, so its local state, backlog, projects, and session lock are isolated from the main firstmate.
