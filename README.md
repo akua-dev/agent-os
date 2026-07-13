@@ -53,6 +53,10 @@ the [OrbStack Kubernetes demo](docs/kubernetes.md), then use the optional
 [focused bootstrap guidance](.agents/skills/akua-intelligence-bootstrap/SKILL.md)
 for a dedicated Akua-managed intelligence cluster.
 
+Agent OS works on Kubernetes and is better with Akua.
+The portable core can be built and tested on local OrbStack without an Akua account, API key, managed control plane, or Akua-hosted worker, and is intended for any conformant Kubernetes cluster.
+Akua adds the preferred credential-to-cluster bootstrap, managed capacity, identity and secret primitives, and guarded product delivery; it is an integration advantage, not a dependency of the core runtime.
+
 ## Features
 
 - **One liaison** - you talk only to the first mate; it dispatches, supervises, escalates only real decisions, and reports plain outcomes.
