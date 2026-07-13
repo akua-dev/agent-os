@@ -14,10 +14,10 @@ Update it from real runs; planned behavior and model narration never count as pr
 | Same-Pod general-purpose crewmate | Firstmate-supervised Pi scout, real Kubernetes test, in-cluster context check, and report in `docs/evidence/2026-07-13-same-pod-firstmate.md` | Proven locally |
 | Separate persistent crewmate Pod with explicit authority | Terra-low task, explicit resources, read-only Pi Secret, no ServiceAccount token, and retained PVC in `docs/evidence/2026-07-13-separate-pod-recovery.md` | Proven locally |
 | Parent-only supervision and human attach | Same-Pod and separate-Pod tasks accepted only Firstmate briefs and steers; a connected Herdr client observed the live workspaces | Proven locally |
-| Real issue to tested review-ready PR | Existing Firstmate delivery machinery | Not yet proven through the Kubernetes fleet |
+| Real issue to tested review-ready PR | Issue [#2](https://github.com/akua-dev/agent-os/issues/2) became Terra-low task `fix-local-rebuild-image-r2`, tested commit `761223c`, and PR [#3](https://github.com/akua-dev/agent-os/pull/3), then merged into review branch PR #1; see `docs/evidence/2026-07-13-github-issue-pr.md` | Proven locally |
 | Parent and child restart without unique-work loss | Primary session recovery plus separate-Pod replacement with unique artifact, report, tools, and exact Pi session resumed | Proven locally |
 | Separate production read-only and scoped write identity | Cortex contract only | Not yet implemented or Red-approved |
-| Optional GitHub Issue/Project client | Cortex contract only | Deferred until terminal-native path passes |
+| Optional GitHub Issue/Project client | Repository Issues enabled only when the native intake proof needed it; Firstmate read Issue #2 through `gh-axi` and delivered PR #3 with no custom intake service | Issue client proven locally; Project client remains optional and unproven |
 | Repeatable end-to-end eval and recordable demo | Same-Pod and separate-Pod run records now capture model, time, cost estimate, interventions, resource IDs, and failures | Local agent lifecycle captured; Akua/GitHub/product path incomplete |
 | Public installable image and release | Multi-architecture workflow run `29188585384` succeeded; local image only because pull-request builds do not publish | Publication not yet proven |
 
