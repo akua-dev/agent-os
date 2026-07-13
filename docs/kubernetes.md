@@ -103,7 +103,8 @@ Use ordinary Herdr and Kubernetes commands to launch, inspect, steer, and retrie
 
 ```sh
 kubectl -n agent-os-demo exec agent-os-mate-scout-1 -- \
-  herdr agent start scout-1-research --cwd /home/agent --no-focus -- pi "$(cat /tmp/scout-1.prompt)"
+  herdr agent start scout-1-research --cwd /home/agent --no-focus -- \
+  pi --model openai-codex/gpt-5.6-terra --thinking low "$(cat /tmp/scout-1.prompt)"
 kubectl -n agent-os-demo exec agent-os-mate-scout-1 -- \
   test -s /home/agent/data/scout-1.md
 ```
