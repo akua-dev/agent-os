@@ -17,6 +17,15 @@ mkdir -p \
   "$HOME/.bun" \
   "$HOME/.cargo"
 
+if [ -n "${AGENT_OS_PI_AUTH_FILE:-}" ]; then
+  if [ ! -f "$AGENT_OS_PI_AUTH_FILE" ]; then
+    echo "error: projected Pi authorization is unavailable" >&2
+    exit 2
+  fi
+  mkdir -p "$HOME/.pi/agent"
+  ln -sfn -- "$AGENT_OS_PI_AUTH_FILE" "$HOME/.pi/agent/auth.json"
+fi
+
 "$(dirname "$0")/agent-os-kubeconfig.sh"
 if [ ! -e "$FM_HOME/config/backend" ]; then
   printf 'herdr\n' > "$FM_HOME/config/backend"

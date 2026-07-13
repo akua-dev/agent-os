@@ -189,8 +189,14 @@ preflight_rendered_resources() {
 delete_namespace_rbac() {
   require_namespaced_resource_owned_or_absent RoleBinding agent-os-firstmate-runtime
   require_namespaced_resource_owned_or_absent Role agent-os-firstmate-runtime
-  "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" delete rolebinding agent-os-firstmate-runtime --ignore-not-found
-  "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" delete role agent-os-firstmate-runtime --ignore-not-found
+  if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" delete rolebinding \
+    agent-os-firstmate-runtime --ignore-not-found --wait=true --timeout=180s; then
+    bounded_delete_failure "RoleBinding/agent-os-firstmate-runtime"
+  fi
+  if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" delete role \
+    agent-os-firstmate-runtime --ignore-not-found --wait=true --timeout=180s; then
+    bounded_delete_failure "Role/agent-os-firstmate-runtime"
+  fi
 }
 
 apply_rendered() {
@@ -233,13 +239,72 @@ report_cluster_cleanup() {
   echo "required evidence: clusterrolebinding/agent-os-firstmate-$NAMESPACE absent" >&2
 }
 
+uninstall_command() {
+  printf 'AGENT_OS_CONTEXT=%q AGENT_OS_NAMESPACE=%q AGENT_OS_PACKAGE=%q AGENT_OS_INPUTS=%q AGENT_OS_AKUA=%q AGENT_OS_KUBECTL=%q %q uninstall --yes' \
+    "$CONTEXT" "$NAMESPACE" "$PACKAGE" "$INPUTS" "$AKUA" "$KUBECTL" "$0"
+  [ "$DELETE_NAMESPACE" -eq 0 ] || printf ' --delete-namespace'
+}
+
+report_retained_resources() {
+  local file kind name record identity expected finalizers
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    kind=$(rendered_resource_field "$file" kind)
+    name=$(rendered_resource_field "$file" name)
+    case "$kind" in
+      ClusterRoleBinding) continue ;;
+      Namespace)
+        [ "$DELETE_NAMESPACE" -eq 1 ] || continue
+        if ! record=$("$KUBECTL" --context "$CONTEXT" get namespace "$name" --ignore-not-found \
+          -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.finalizers}'); then
+          echo "retained-unverified: Namespace/$name could not be inspected; no further deletion attempted" >&2
+          continue
+        fi
+        ;;
+      *)
+        if ! record=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get "$kind" "$name" --ignore-not-found \
+          -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.finalizers}'); then
+          echo "retained-unverified: $kind/$name could not be inspected; no further deletion attempted" >&2
+          continue
+        fi
+        ;;
+    esac
+    [ -n "$record" ] || continue
+    identity=$(printf '%s' "$record" | cut -f1-3)
+    expected="$name"$'\t'"agent-os"$'\t'"$INSTALLATION_ID"
+    if [ "$identity" = "$expected" ]; then
+      finalizers=$(printf '%s' "$record" | cut -f4-)
+      [ -n "$finalizers" ] || finalizers='[]'
+      echo "retained: $kind/$name finalizers=$finalizers" >&2
+    else
+      echo "retained-unverified: $kind/$name ownership changed; no further deletion attempted" >&2
+    fi
+  done < <(find "$OUT" -type f -name '*.yaml' -print)
+  echo "safe retry: $(uninstall_command)" >&2
+}
+
+bounded_delete_failure() {
+  local target=$1
+  if [ "$COMMAND" = uninstall ]; then
+    echo "incomplete: timed out deleting $target after 180s" >&2
+    report_retained_resources
+    return 3
+  fi
+  echo "error: timed out deleting $target after 180s" >&2
+  return 1
+}
+
 delete_rendered_kind() {
-  local desired_kind=$1 file kind
+  local desired_kind=$1 file kind name
   while IFS= read -r file; do
     [ -n "$file" ] || continue
     kind=$(rendered_resource_field "$file" kind)
     if [ "$kind" = "$desired_kind" ]; then
-      "$KUBECTL" --context "$CONTEXT" delete --ignore-not-found --wait=true -f "$file"
+      name=$(rendered_resource_field "$file" name)
+      if ! "$KUBECTL" --context "$CONTEXT" delete --ignore-not-found \
+        --wait=true --timeout=180s -f "$file"; then
+        bounded_delete_failure "$kind/$name"
+      fi
     fi
   done < <(find "$OUT" -type f -name '*.yaml' -print)
 }
@@ -247,7 +312,10 @@ delete_rendered_kind() {
 delete_rendered_namespaced_resources() {
   local kind
   delete_rendered_kind StatefulSet
-  "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" wait --for=delete pod/agent-os-firstmate-0 --timeout=180s
+  if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" wait \
+    --for=delete pod/agent-os-firstmate-0 --timeout=180s; then
+    bounded_delete_failure Pod/agent-os-firstmate-0
+  fi
   for kind in Service RoleBinding Role ServiceAccount; do
     delete_rendered_kind "$kind"
   done
@@ -301,7 +369,10 @@ delete_owned_empty_namespace() {
     echo "error: namespace '$NAMESPACE' ownership changed during deletion checks" >&2
     exit 2
   fi
-  "$KUBECTL" --context "$CONTEXT" delete namespace "$NAMESPACE"
+  if ! "$KUBECTL" --context "$CONTEXT" delete namespace "$NAMESPACE" \
+    --wait=true --timeout=180s; then
+    bounded_delete_failure "Namespace/$NAMESPACE"
+  fi
 }
 
 cleanup_cluster_rbac() {
@@ -327,7 +398,7 @@ cleanup_cluster_rbac() {
         exit 2
       fi
     fi
-    "$KUBECTL" --context "$CONTEXT" delete clusterrolebinding "$binding"
+    "$KUBECTL" --context "$CONTEXT" delete clusterrolebinding "$binding" --wait=false
     "$KUBECTL" --context "$CONTEXT" wait --for=delete "clusterrolebinding/$binding" --timeout=60s
   fi
   if [ -n "$(namespace_name)" ]; then

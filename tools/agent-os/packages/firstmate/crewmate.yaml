@@ -54,6 +54,8 @@ spec:
           value: /home/agent
         - name: HOME
           value: /home/agent
+        - name: AGENT_OS_PI_AUTH_FILE
+          value: /var/run/secrets/agent-os/pi/auth.json
       readinessProbe:
         exec:
           command:
@@ -76,7 +78,7 @@ spec:
           mountPath: /usr/local
           subPath: usr-local
         - name: ai-auth
-          mountPath: /home/agent/.pi/agent
+          mountPath: /var/run/secrets/agent-os/pi
           readOnly: true
   volumes:
     - name: home

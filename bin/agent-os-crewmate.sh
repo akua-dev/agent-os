@@ -46,6 +46,11 @@ resource_identity() {
     -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}'
 }
 
+pod_record() {
+  kube get pod "$POD" --ignore-not-found \
+    -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.uid}'
+}
+
 pvc_record() {
   kube get pvc "$PVC" --ignore-not-found \
     -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.annotations.agent-os\.dev/checkpoint-state}{"\t"}{.metadata.annotations.agent-os\.dev/checkpoint-at}'
@@ -99,10 +104,40 @@ render_resources() {
     "$TEMPLATE"
 }
 
+cleanup_new_owned_pod() {
+  local before_uid=$1 after current identity after_uid
+  after=$(pod_record)
+  if [ -z "$after" ]; then
+    echo "partial state: crewmate apply left no Pod; persistent home retained" >&2
+    return
+  fi
+  identity=$(printf '%s' "$after" | cut -f1-4)
+  after_uid=$(printf '%s' "$after" | cut -f5)
+  if [ "$identity" != "$EXPECTED_POD" ] || [ -z "$after_uid" ] || [ -n "$before_uid" ]; then
+    echo "partial state: Pod was not proven newly created and owned; persistent home retained" >&2
+    return
+  fi
+  current=$(pod_record)
+  if [ "$current" != "$after" ]; then
+    echo "partial state: Pod identity changed during cleanup; no Pod deleted and persistent home retained" >&2
+    return
+  fi
+  echo "partial state: removing newly created owned Pod '$POD' uid=$after_uid; persistent home retained" >&2
+  kube delete pod "$POD" --ignore-not-found --wait=false
+  kube wait --for=delete "pod/$POD" --timeout=180s
+}
+
 apply_and_wait() {
-  render_resources | kube apply -f -
+  local before before_uid
+  before=$(pod_record)
+  before_uid=$(printf '%s' "$before" | cut -f5)
+  if ! render_resources | kube apply -f -; then
+    cleanup_new_owned_pod "$before_uid"
+    echo "error: crewmate resources were only partially applied" >&2
+    exit 1
+  fi
   if ! kube wait --for=condition=Ready "pod/$POD" --timeout=180s; then
-    kube delete pod "$POD" --ignore-not-found
+    cleanup_new_owned_pod "$before_uid"
     echo "error: crewmate Pod did not become ready with the authorized AI Secret" >&2
     exit 1
   fi
@@ -122,6 +157,16 @@ preflight_existing_home() {
     exit 2
   fi
   printf '%s' "$pvc"
+}
+
+stop_owned_pod() {
+  local pod
+  pod=$(require_owned_or_absent pod "$POD" "$EXPECTED_POD")
+  if [ -z "$pod" ]; then
+    return
+  fi
+  kube delete pod "$POD" --ignore-not-found --wait=false
+  kube wait --for=delete "pod/$POD" --timeout=180s
 }
 
 record_purge() {
@@ -149,21 +194,24 @@ case "$COMMAND" in
     ;;
   stop)
     [ -z "$CONFIRM" ] || { echo "usage: $0 stop <crewmate-id>" >&2; exit 2; }
-    require_owned_or_absent pod "$POD" "$EXPECTED_POD" >/dev/null
     require_owned_pvc_or_absent >/dev/null
-    kube delete pod "$POD" --ignore-not-found
+    stop_owned_pod
     ;;
   restart)
     [ -z "$CONFIRM" ] || { echo "usage: $0 restart <crewmate-id>" >&2; exit 2; }
     validate_ai_grant
     preflight_existing_home >/dev/null
-    kube delete pod "$POD" --ignore-not-found
+    stop_owned_pod
     apply_and_wait
     ;;
   purge)
     echo "purge target: namespace/$NAMESPACE pod/$POD pvc/$PVC" >&2
     if [ "$CONFIRM" != --yes ]; then
       echo "error: purge requires the purge-specific --yes confirmation" >&2
+      exit 2
+    fi
+    if [ -n "$(require_owned_or_absent pod "$POD" "$EXPECTED_POD")" ]; then
+      echo "error: stop the owned crewmate Pod and prove its absence before checkpointing for purge" >&2
       exit 2
     fi
     pvc=$(preflight_existing_home)
@@ -188,8 +236,7 @@ case "$COMMAND" in
     mkdir -p "$(dirname "$evidence_file")"
     exec 3>>"$evidence_file"
     record_purge purge-requested "$checkpoint_at"
-    kube delete pod "$POD" --ignore-not-found
-    kube delete pvc "$PVC" --ignore-not-found
+    kube delete pvc "$PVC" --ignore-not-found --wait=true --timeout=180s
     record_purge purge-complete "$checkpoint_at"
     ;;
   delete)

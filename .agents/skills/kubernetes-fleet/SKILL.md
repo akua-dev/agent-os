@@ -23,7 +23,8 @@ Load this skill only when the current firstmate is running in Kubernetes or is e
 - The Secret must contain the selected provider's `auth.json` key and must be provisioned independently instead of cloning or sharing the primary credential.
 - Pass only its name through `AGENT_OS_AI_SECRET` when invoking `bin/agent-os-crewmate.sh create <id>`.
 - The helper never reads or discovers the Secret value, and the default Role intentionally has no Secret-read permission.
-- Kubernetes projects only the selected `auth.json` key into a read-only authorization directory; a missing Secret or key keeps the Pod unready, makes create fail, removes the non-running Pod, and retains the PVC for an authorized retry.
+- Kubernetes projects only the selected `auth.json` key into a dedicated read-only runtime directory, and the entrypoint links that file into the writable PVC-backed Pi state without copying credential bytes.
+- A missing Secret or key keeps the Pod unready, makes create fail, removes the non-running Pod, and retains the PVC for an authorized retry.
 - Probe the selected model route before launching work; when quota is unavailable, use another explicitly granted provider or report the capacity blocker instead of repeatedly spawning agents.
 - Give every launched Herdr agent a task-unique name, close only a confirmed dead restored pane before reuse, and never replace a live agent.
 - Grade completion by the promised artifact or delivered Git state; Herdr `idle` alone is not a completion signal.
@@ -31,7 +32,7 @@ Load this skill only when the current firstmate is running in Kubernetes or is e
 - Use `status` to inspect it, `stop` to remove only the Pod, and `restart` to replace only the Pod on its retained PVC.
 - The ambiguous `delete` command is rejected.
 - `purge <id> --yes` is the only operation that destroys a persistent home.
-- Before purge, independently checkpoint or deliver unique work, then annotate the owned PVC with `agent-os.dev/checkpoint-state=clean` and a non-secret RFC3339 `agent-os.dev/checkpoint-at` value.
+- Before purge, stop the owned Pod and wait for its absence, independently checkpoint or deliver unique work from the stopped home, then annotate the owned PVC with `agent-os.dev/checkpoint-state=clean` and a non-secret RFC3339 `agent-os.dev/checkpoint-at` value.
 - Purge verifies exact installation and crewmate ownership, displays the target, requires its own confirmation, and records requested and completed phases in `AGENT_OS_PURGE_EVIDENCE_FILE` or `$FM_HOME/data/crewmate-purge-evidence.log`.
 - Purge evidence contains only time, namespace, crewmate ID, resource names, phase, and checkpoint time.
 - Never mount the primary home into a child Pod.

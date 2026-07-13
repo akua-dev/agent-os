@@ -1,5 +1,10 @@
 # Third-party notices
 
+## Node.js base image
+
+The Agent OS image uses the official multi-architecture `node:24-trixie-slim` base image pinned to index digest `sha256:366fdef91728b1b7fa18c84fba63b6e79ed77b7e10cc206878e9705da4d7b169`.
+The reviewed Docker Node source revision is <https://github.com/nodejs/docker-node/tree/303e6c3be0be8010403376712d3018fb99809f86>.
+
 ## Herdr
 
 The Agent OS image includes an unmodified Herdr 0.7.3 executable as a separate program under AGPL-3.0-or-later.

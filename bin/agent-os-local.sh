@@ -30,15 +30,20 @@ local_image_tag() {
   printf 'agent-os:local-%s\n' "${image_id#sha256:}"
 }
 
-render_profile() {
-  local image=$1 inputs lifecycle
-  inputs=$(mktemp)
-  trap 'rm -f "$inputs"' RETURN
+render_profile_inputs() {
+  local image=$1 inputs=$2
   awk -v image="$image" -v namespace="$NAMESPACE" '
     $1 == "image:" { print "image: " image; next }
     $1 == "namespace:" { print "namespace: " namespace; next }
     { print }
   ' "$PROFILE" > "$inputs"
+}
+
+render_profile() {
+  local image=$1 inputs lifecycle
+  inputs=$(mktemp)
+  trap 'rm -f "$inputs"' RETURN
+  render_profile_inputs "$image" "$inputs"
   lifecycle=install
   if [ -n "$(kubectl --context "$CONTEXT" -n "$NAMESPACE" get statefulset agent-os-firstmate --ignore-not-found -o name)" ]; then
     lifecycle=upgrade
@@ -80,7 +85,10 @@ case "$COMMAND" in
       echo "error: destroy requires --yes and removes only namespaced Agent OS resources from '$NAMESPACE'" >&2
       exit 2
     fi
-    AGENT_OS_CONTEXT="$CONTEXT" AGENT_OS_NAMESPACE="$NAMESPACE" AGENT_OS_INPUTS="$PROFILE" \
+    inputs=$(mktemp)
+    trap 'rm -f "$inputs"' EXIT
+    render_profile_inputs "$IMAGE" "$inputs"
+    AGENT_OS_CONTEXT="$CONTEXT" AGENT_OS_NAMESPACE="$NAMESPACE" AGENT_OS_INPUTS="$inputs" \
       "$ROOT/bin/agent-os-kubernetes.sh" uninstall --yes
     ;;
   *)

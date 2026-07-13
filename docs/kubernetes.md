@@ -102,7 +102,7 @@ It is not a second public package and is not a Marketplace product.
 Each runtime mate has its own PVC and no ambient Kubernetes ServiceAccount token.
 Creating one requires an explicitly authorized, pre-created Secret in the same namespace with an `auth.json` key.
 Pass only that Secret's name through `AGENT_OS_AI_SECRET`; the helper never discovers or copies the primary credential.
-The Secret projects only `auth.json` into the read-only `/home/agent/.pi/agent` directory without a `subPath` mount.
+The Secret projects only `auth.json` into a dedicated read-only runtime directory, and the entrypoint links that file into the writable PVC-backed Pi state without copying credential bytes.
 A missing Secret or key keeps the Pod unready, so creation fails closed and removes the non-running Pod while retaining its PVC for an authorized retry.
 
 ```sh
@@ -111,7 +111,7 @@ AGENT_OS_AI_SECRET=scout-1-ai-auth bin/agent-os-crewmate.sh create scout-1
 
 Use `stop` for a Pod-only shutdown and `restart` for a Pod-only replacement after an approved Secret rotation.
 The ambiguous `delete` operation is rejected.
-Only `purge <id> --yes` removes the PVC, and it requires exact ownership, a clean checkpoint annotation, and a non-secret evidence file.
+Only `purge <id> --yes` removes the PVC, and it requires the owned Pod to be absent, exact ownership, a fresh clean checkpoint annotation from the stopped home, and a non-secret evidence file.
 The full rotation, urgent-revocation, checkpoint, and purge procedure is owned by the `kubernetes-fleet` operating skill.
 
 The existing [same-Pod](evidence/2026-07-13-same-pod-firstmate.md) and [separate-Pod recovery](evidence/2026-07-13-separate-pod-recovery.md) records remain local lifecycle evidence.

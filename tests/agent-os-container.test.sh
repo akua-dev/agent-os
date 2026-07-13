@@ -5,7 +5,10 @@ set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-assert_grep 'FROM node:24-trixie-slim' "$ROOT/Dockerfile" "image must pin Node 24 Trixie"
+assert_grep 'FROM node:24-trixie-slim@sha256:366fdef91728b1b7fa18c84fba63b6e79ed77b7e10cc206878e9705da4d7b169' \
+  "$ROOT/Dockerfile" "image must pin the multi-architecture Node 24 Trixie base"
+assert_grep 'sha256:366fdef91728b1b7fa18c84fba63b6e79ed77b7e10cc206878e9705da4d7b169' \
+  "$ROOT/THIRD_PARTY_NOTICES.md" "base image provenance must record the reviewed index digest"
 assert_grep 'ARG HERDR_VERSION=0.7.3' "$ROOT/Dockerfile" "image must pin Herdr 0.7.3"
 assert_grep 'ARG KUBECTL_VERSION=1.34.8' "$ROOT/Dockerfile" "image must pin kubectl 1.34.8"
 assert_grep 'ARG GH_VERSION=2.96.0' "$ROOT/Dockerfile" "image must pin GitHub CLI 2.96.0"
@@ -49,6 +52,12 @@ assert_grep 'AGENT_OS_TEST_PI_MODEL' "$ROOT/bin/agent-os-container-entrypoint.sh
   "test-mode Pods must converge the Pi model policy"
 assert_grep 'defaultThinkingLevel' "$ROOT/bin/agent-os-container-entrypoint.sh" \
   "test-mode Pods must also pin direct Pi sessions"
+# shellcheck disable=SC2016 # Match literal entrypoint variables.
+assert_grep 'ln -sfn -- "$AGENT_OS_PI_AUTH_FILE" "$HOME/.pi/agent/auth.json"' \
+  "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "entrypoint must link projected authorization without copying Secret bytes"
+assert_no_grep 'cp .*AGENT_OS_PI_AUTH_FILE' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "entrypoint must never persist projected Secret bytes"
 assert_grep 'image: agent-os:dev' "$ROOT/deploy/orbstack/inputs.yaml" \
   "the OrbStack profile must define its local image source"
 assert_grep 'imagePullPolicy: Never' "$ROOT/deploy/orbstack/inputs.yaml" \

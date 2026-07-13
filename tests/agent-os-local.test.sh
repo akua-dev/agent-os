@@ -221,7 +221,7 @@ test_destroy_requires_exact_confirmation() {
   cleanup_out=$(run_cli destroy --yes 2>&1) || cleanup_rc=$?
   [ "$cleanup_rc" -eq 3 ] || \
     fail "cluster-admin demo destroy must stop for separate privileged cleanup, got $cleanup_rc: $cleanup_out"
-  grep -Fq 'kubectl --context orbstack delete --ignore-not-found --wait=true -f ' "$LOG" || \
+  grep -Fq 'kubectl --context orbstack delete --ignore-not-found --wait=true --timeout=180s -f ' "$LOG" || \
     fail "confirmed destroy must delete only resources from the rendered OrbStack profile"
   if grep -E 'kubectl .* (get|delete) clusterrolebinding' "$LOG" >/dev/null; then
     fail "routine demo destroy must not inspect or delete cluster-scoped RBAC"
@@ -229,6 +229,19 @@ test_destroy_requires_exact_confirmation() {
   assert_contains "$cleanup_out" 'cleanup-cluster-rbac --yes' \
     "demo destroy must print the separately confirmed privileged cleanup command"
   pass "destroy requires confirmation and reports privileged RBAC cleanup"
+}
+
+test_destroy_uses_the_namespace_adjusted_profile() {
+  local out rc=0
+  : > "$LOG"
+  out=$(AGENT_OS_NAMESPACE=agent-os-custom AGENT_OS_TEST_LOCAL_WORKLOAD=present \
+    run_cli destroy --yes 2>&1) || rc=$?
+  [ "$rc" -eq 3 ] || fail "custom namespace destroy must reach privileged cleanup, got $rc: $out"
+  assert_call 'akua-input-namespace agent-os-custom' \
+    "destroy must render the same namespace-adjusted profile as deploy"
+  grep -Fq 'kubectl --context orbstack -n agent-os-custom' "$LOG" || \
+    fail "destroy must target the custom rendered namespace"
+  pass "destroy stays consistent with namespace-adjusted rendering"
 }
 
 test_non_orbstack_context_is_fail_closed() {
@@ -253,4 +266,5 @@ test_namespace_override_updates_the_rendered_profile
 test_explicit_image_override_is_used_without_retagging
 test_empty_image_override_uses_content_addressed_default
 test_destroy_requires_exact_confirmation
+test_destroy_uses_the_namespace_adjusted_profile
 test_non_orbstack_context_is_fail_closed

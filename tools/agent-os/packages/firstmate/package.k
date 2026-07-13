@@ -17,7 +17,7 @@ schema Input:
     memoryLimit: str = "8Gi"
 
     check:
-        allowMutableImage or regex.match(image, r"^([a-z0-9]+(([._]|__|-+)[a-z0-9]+)*(:[0-9]+)?/)*[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$"), "image must use one complete OCI reference with an immutable @sha256 digest unless the local profile explicitly allows a mutable image"
+        allowMutableImage or regex.match(image, r"^([a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]+)?/)?[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*(\/[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$"), "image must use one complete OCI reference with an immutable @sha256 digest unless the local profile explicitly allows a mutable image"
 
 input: Input = ctx.input()
 
