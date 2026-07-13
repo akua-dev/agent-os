@@ -7,6 +7,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CONTEXT=${AGENT_OS_CONTEXT:-orbstack}
 NAMESPACE=${AGENT_OS_NAMESPACE:-agent-os-demo}
 IMAGE=${AGENT_OS_IMAGE:-agent-os:dev}
+IMAGE_IS_OVERRIDE=${AGENT_OS_IMAGE+x}
 COMMAND=${1:-}
 
 if [ "$CONTEXT" != orbstack ] && [ "${AGENT_OS_ALLOW_NON_ORBSTACK:-0}" != 1 ]; then
@@ -14,11 +15,20 @@ if [ "$CONTEXT" != orbstack ] && [ "${AGENT_OS_ALLOW_NON_ORBSTACK:-0}" != 1 ]; t
   exit 2
 fi
 
+local_image_tag() {
+  local image_id
+  image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE")
+  printf 'agent-os:local-%s\n' "${image_id#sha256:}"
+}
+
 cd "$ROOT"
 
 case "$COMMAND" in
   build)
     docker build -t "$IMAGE" .
+    if [ -z "$IMAGE_IS_OVERRIDE" ]; then
+      docker tag "$IMAGE" "$(local_image_tag)"
+    fi
     ;;
   deploy)
     if [ "$CONTEXT" = orbstack ]; then
@@ -26,6 +36,11 @@ case "$COMMAND" in
       kubectl --context "$CONTEXT" wait --for=condition=Ready node/orbstack --timeout=120s
     fi
     kubectl --context "$CONTEXT" apply -k deploy/orbstack
+    if [ -z "$IMAGE_IS_OVERRIDE" ]; then
+      IMAGE=$(local_image_tag)
+    fi
+    kubectl --context "$CONTEXT" -n "$NAMESPACE" set image statefulset/agent-os-firstmate \
+      "agent-os-init=$IMAGE" "firstmate=$IMAGE"
     ;;
   status)
     kubectl --context "$CONTEXT" -n "$NAMESPACE" get statefulset agent-os-firstmate
