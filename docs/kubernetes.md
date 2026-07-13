@@ -35,6 +35,8 @@ bin/agent-os-local.sh status
 bin/agent-os-local.sh shell
 ```
 
+With the default local image, each `build` also creates a content-addressed local tag. The following `deploy` updates both StatefulSet containers to that tag, so a rebuilt `agent-os:dev` cannot reuse a stale OrbStack runtime digest. Set `AGENT_OS_IMAGE` to build and deploy an explicit image name without replacing or retagging that override.
+
 The image includes Firstmate's complete required toolchain, including `gh`, `rg`, `fd`, Akua, `kubectl`, K9s, treehouse, no-mistakes, and every required AXI CLI.
 Authenticate GitHub inside the primary with `gh auth login`.
 Authenticate Pi using `/login` and the provider flow you choose.
