@@ -41,11 +41,11 @@ Set environment and working directory per command instead of mutating the global
 Use `Bun.spawn()` for interactive agents, servers, watches, live logs, cancellation, and other long-running processes.
 Existing Bash scripts may be invoked explicitly during migration, but do not move adaptable orchestration into TypeScript merely because it is currently written in Bash or instructions.
 
-## Akua packages
+## Kubernetes package
 
-The prepared mate package lives at `packages/mate/` and renders ordinary Kubernetes YAML.
-Treat it as an editable convenience, not a required abstraction or controller.
-Firstmate may invoke `akua render`, edit the result, change the package, or author equivalent YAML directly.
+The canonical portable Firstmate package lives at `packages/firstmate/` and renders ordinary Kubernetes YAML.
+Mate creation uses that package's internal `crewmate.yaml` template at runtime instead of a separately installable package.
+Keep the portable package free of Akua accounts, credentials, services, and marketplace-specific behavior.
 
 ## Scope Discipline
 

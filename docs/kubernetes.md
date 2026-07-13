@@ -1,36 +1,96 @@
-# Kubernetes Agent OS demo
+# Kubernetes Agent OS
 
-This demo runs Firstmate as the persistent controller of an isolated agent cluster.
+Agent OS installs one persistent Firstmate from the public, versioned package at `tools/agent-os/packages/firstmate/`.
+The package renders ordinary Kubernetes resources.
+It is free to render and apply on any conformant Kubernetes cluster without an Akua account, API key, managed control plane, or Akua-hosted worker.
 Kubernetes distributes and isolates the crew; it does not replace Firstmate's supervision model or Herdr's terminal/session interface.
-
-This is the provider-independent Agent OS acceptance environment.
-Running it requires no Akua account, API key, managed control plane, or Akua-hosted worker.
-The same core is intended to run on any conformant Kubernetes cluster; Akua is an optional enhanced integration for faster bootstrap, managed capacity, identity, secrets, and guarded product delivery.
-
-The local topology is deliberately small:
-
-- `agent-os-firstmate-0` is a StatefulSet with a 20 Gi persistent home.
-- Herdr 0.7.3 is PID 1 and remains the visible session backend.
-- the primary's local-demo ServiceAccount has `cluster-admin`, so it can shape its own crew and workspace;
-- every crewmate is an adaptable Agent OS container with its own 10 Gi PVC;
-- crewmates do not receive Kubernetes service-account credentials by default.
-
-The primary and crewmates run as UID 0 inside their containers.
-OrbStack's built-in Kubernetes does not support Pod user namespaces, so container root is also root on the dedicated OrbStack VM node.
-The Pods do not use privileged mode, host namespaces, host mounts, or raw block devices.
-This root policy and the broad primary grant are only for the isolated local agent cluster.
-They are not a production-cluster access pattern.
 
 ## Requirements
 
-- OrbStack with Kubernetes enabled
-- Docker
-- `kubectl`
+- A Kubernetes context that you are authorized to use explicitly.
+- `kubectl` and the public `akua` renderer CLI on your PATH.
+- Permission to create the selected namespace when `createNamespace: true`, plus the rendered ServiceAccount, Role, RoleBinding, Service, PVC, and StatefulSet.
+- A default or selected StorageClass that satisfies the `ReadWriteOnce` PVC request.
+- An immutable image digest published by an Agent OS release.
 
-The helper refuses ambient Kubernetes contexts.
-It uses `orbstack` unless a different context is deliberately enabled with `AGENT_OS_ALLOW_NON_ORBSTACK=1`.
+No Kubernetes Secret is required for the portable install.
+The package has no credential field or Secret reference.
+Runtime AI, GitHub, or other authority is created separately by its owner after installation and is never supplied through package inputs, command arguments, or rendered YAML.
 
-## Run the demo
+The package requires an image digest because a mutable tag cannot identify an upgrade or recovery input.
+The source tree contains an intentionally non-installable placeholder until the first public image release is published.
+Replace it only with the digest recorded by that release workflow.
+
+## Generic quickstart
+
+Start from a tagged Agent OS source checkout that matches the image release.
+Copy the stable input schema and replace its image value with that release's immutable digest.
+
+```sh
+cp tools/agent-os/packages/firstmate/inputs.example.yaml /tmp/agent-os-inputs.yaml
+$EDITOR /tmp/agent-os-inputs.yaml
+
+export AGENT_OS_CONTEXT=your-kubernetes-context
+export AGENT_OS_NAMESPACE=agent-os
+export AGENT_OS_INPUTS=/tmp/agent-os-inputs.yaml
+
+bin/agent-os-kubernetes.sh install
+```
+
+The installer renders only `tools/agent-os/packages/firstmate/package.k`, applies that fresh output to the named context, and waits for `agent-os-firstmate` to roll out.
+It never reads an ambient Kubernetes context.
+
+The default `rbac: namespace` creates a ServiceAccount plus a Role and RoleBinding scoped to the selected namespace.
+That Role allows Firstmate to manage runtime crewmate Pods and PVCs and inspect its StatefulSet.
+Set `rbac: none` only when another reviewed authority handles those runtime operations.
+Set `rbac: cluster-admin` only for an isolated intelligence cluster after reviewing the broader ClusterRoleBinding.
+
+The persistent home PVC defaults to `20Gi` and is mounted at `/home/agent`.
+`/usr/local` is a subpath of that same PVC so user-installed global tools survive Pod replacement.
+
+## Operations
+
+To upgrade, use a new released digest in the same input file and apply it through the same package.
+
+```sh
+bin/agent-os-kubernetes.sh upgrade
+```
+
+To roll back only the Firstmate workload revision, use Kubernetes StatefulSet history.
+This does not roll back package inputs, RBAC, or persistent data.
+
+```sh
+bin/agent-os-kubernetes.sh rollback
+```
+
+To inspect the workload, use the same explicit context and namespace.
+
+```sh
+bin/agent-os-kubernetes.sh status
+```
+
+Uninstall is deliberately confirmed and bounded to a fresh render of the selected package inputs.
+When those inputs create the namespace, deleting that rendered Namespace also removes everything in that namespace.
+When `createNamespace: false`, the command deletes only the rendered Agent OS resources in the existing namespace.
+
+```sh
+bin/agent-os-kubernetes.sh uninstall --yes
+```
+
+## Runtime mates
+
+Firstmate creates a separate-Pod crewmate at runtime with the internal `crewmate.yaml` template in the canonical package.
+It is not a second public package and is not a Marketplace product.
+Each runtime mate has its own PVC and no ambient Kubernetes ServiceAccount token.
+
+The existing [same-Pod](evidence/2026-07-13-same-pod-firstmate.md) and [separate-Pod recovery](evidence/2026-07-13-separate-pod-recovery.md) records remain local lifecycle evidence.
+They do not substitute for a clean published-image installation.
+
+## OrbStack profile
+
+OrbStack is a test profile of the canonical package, not the default product contract.
+Its `deploy/orbstack/inputs.yaml` changes only the local environment inputs: the isolated `agent-os-demo` namespace, a local image source with `imagePullPolicy: Never` and `allowMutableImage: true`, and its explicit local-demo `cluster-admin` grant.
+The profile uses the same package, ServiceAccount, persistent home, runtime mate template, and lifecycle commands.
 
 ```sh
 bin/agent-os-local.sh build
@@ -39,112 +99,7 @@ bin/agent-os-local.sh status
 bin/agent-os-local.sh shell
 ```
 
-Those four commands are the clean local smoke path.
-They build the image into OrbStack, start the local Kubernetes node, deploy the isolated persistent fleet, show its status, and open the Firstmate shell.
-No Akua authentication step is part of this path.
-
-With the default local image, each `build` also creates a content-addressed local tag. The following `deploy` updates both StatefulSet containers to that tag, so a rebuilt `agent-os:dev` cannot reuse a stale OrbStack runtime digest. Set `AGENT_OS_IMAGE` to build and deploy an explicit image name without replacing or retagging that override.
-
-The image includes Firstmate's complete required toolchain, including `gh`, `rg`, `fd`, Akua, `kubectl`, K9s, treehouse, no-mistakes, and every required AXI CLI.
-Authenticate GitHub inside the primary with `gh auth login`.
-Authenticate Pi using `/login` and the provider flow you choose.
-Host credentials are intentionally excluded from the image and are never copied automatically.
-Authentication stored below `/home/agent` persists on the individual agent PVC.
-
-Tools installed below `/home/agent/.local`, `/home/agent/.bun`, `/home/agent/.cargo`, or `/usr/local` survive Pod replacement.
-Global npm installs use the persistent `/usr/local` prefix.
-`apt` is available because the container runs as root, but packages written elsewhere in the container filesystem are ephemeral.
-
-Start Pi from the tracked distro and attach to Herdr from another terminal:
-
-```sh
-# inside the primary shell
-cd /opt/agent-os
-pi --model openai-codex/gpt-5.6-terra --thinking low
-
-# on the host
-bin/agent-os-local.sh attach
-```
-
-During the current local evaluation, the OrbStack manifest also converges
-`config/crew-dispatch.json` and `config/secondmate-harness` on every primary Pod
-start. Crewmates and Secondmates therefore launch through Pi with
-`openai-codex/gpt-5.6-terra` and low thinking. The reusable image and Akua
-packages remain model-agnostic when those local test environment variables are
-absent. The same opt-in policy updates Pi's own `defaultProvider`,
-`defaultModel`, and `defaultThinkingLevel`, so a plain `pi` primary session uses
-Terra-low too.
-
-The primary can create and manage isolated crewmates directly:
-
-```sh
-bin/agent-os-crewmate.sh create scout-1
-bin/agent-os-crewmate.sh status scout-1
-bin/agent-os-crewmate.sh delete scout-1
-```
-
-The prepared package is an optional alternative when typed, editable manifests are useful:
-
-```sh
-akua render \
-  --package tools/agent-os/packages/mate/package.k \
-  --inputs tools/agent-os/packages/mate/inputs.example.yaml \
-  --out /tmp/scout-1
-kubectl apply -f /tmp/scout-1
-```
-
-Firstmate may inspect or edit the result, change the package, compose raw YAML, or use the compatibility helper.
-Agent OS does not wrap these capable tools into a second workflow CLI.
-
-AI credentials are an explicit per-mate grant.
-Create or select a Kubernetes Secret containing an `auth.json` key, then pass only its name as the package's `piAuthSecret` input.
-The package mounts that file read-only and never discovers credentials by itself.
-
-```sh
-kubectl -n agent-os-demo create secret generic agent-os-mate-scout-1-pi-auth \
-  --from-file=auth.json=/home/agent/.pi/agent/auth.json
-```
-
-Do this only when copying that selected credential set was authorized.
-Prefer an already curated Secret when one exists.
-
-Give each launched Herdr agent a task-unique name and an explicit completion artifact in its brief.
-Use ordinary Herdr and Kubernetes commands to launch, inspect, steer, and retrieve it.
-
-```sh
-kubectl -n agent-os-demo exec agent-os-mate-scout-1 -- \
-  herdr agent start scout-1-research --cwd /home/agent --no-focus -- \
-  pi --model openai-codex/gpt-5.6-terra --thinking low "$(cat /tmp/scout-1.prompt)"
-kubectl -n agent-os-demo exec agent-os-mate-scout-1 -- \
-  test -s /home/agent/data/scout-1.md
-```
-
-Do not treat Herdr `idle` alone as completion because a newly launched agent may briefly be idle before it starts work.
-Check the declared artifact or delivered Git state and read the pane when it is absent.
-Before reusing a name restored from a persistent Herdr session, verify that no agent process is live and close only the confirmed stale pane.
-
-When run on a host, the compatibility helper requires an explicit context:
-
-```sh
-AGENT_OS_CONTEXT=orbstack bin/agent-os-crewmate.sh status scout-1
-```
-
-Inside an authorized Firstmate Pod, Agent OS creates a rotation-safe kubeconfig that references the projected ServiceAccount token file.
-It never copies the token value into the kubeconfig.
-
-Destroying the demo requires confirmation and deletes only the demo namespace:
-
-```sh
-bin/agent-os-local.sh destroy --yes
-```
-
-## What the demo proves
-
-The primary and child homes survive Pod replacement.
-Tools installed into the persistent home prefixes and `/usr/local` also survive Pod replacement.
-A child cannot use the Kubernetes API through an automatically mounted token.
-The primary can create, inspect, and delete child Pods and PVCs using ordinary `kubectl`.
-No custom agent communication protocol or GitOps controller is required.
-
-This is the local substrate, not the final access model.
-Remote Agent OS clusters should keep the intelligence cluster isolated and grant product or production access deliberately per task, with Akua providing stable infrastructure primitives and guardrails.
+The local helper refuses a non-OrbStack context unless `AGENT_OS_ALLOW_NON_ORBSTACK=1` is set deliberately.
+It tags each rebuilt local image by content before rendering the profile so a deployment cannot reuse a stale mutable image.
+The local profile is an isolated test environment only.
+Its broad RoleBinding and container-root policy are not a production-cluster access pattern.

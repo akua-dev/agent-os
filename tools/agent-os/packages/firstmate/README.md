@@ -1,21 +1,25 @@
-# Firstmate package
+# Agent OS package
 
-This optional Akua package renders ordinary Kubernetes resources for one persistent Firstmate in a dedicated intelligence cluster.
-It creates a namespace, ServiceAccount, persistent home, headless Service, StatefulSet, and - when explicitly enabled - the intelligence-cluster `cluster-admin` binding.
+This is the one public, versioned Agent OS package.
+It renders ordinary Kubernetes resources for one persistent Firstmate: an optional namespace, ServiceAccount, persistent home, headless Service, StatefulSet, and explicit RBAC.
+It requires an immutable Agent OS image digest and no Akua account, API key, service, or credential.
 
-Render it directly with Akua:
+Render it directly:
 
 ```sh
 akua render \
   --package package.k \
   --inputs inputs.example.yaml \
-  --out /tmp/agent-os-firstmate
+  --out /tmp/agent-os
 ```
 
 Inspect the YAML before applying it with `kubectl`.
-The package is an editable convenience, not a controller or required workflow.
-Use an immutable image digest for a real intelligence cluster; the `latest` default is only a discoverable starting point.
+The example digest is deliberately non-installable until the first public Agent OS image release exists.
+Replace it only with that release's published digest.
 
-`akuaAuthSecret` names an existing Kubernetes Secret with an `authorization` key containing a complete HTTP authorization header for the dedicated Agent OS workspace token.
-The value is mounted read-only at runtime and never belongs in inputs, rendered YAML, Git, logs, or command arguments.
-Leave the input empty when Firstmate should not receive Akua workspace access.
+The default `rbac: namespace` grants the Firstmate ServiceAccount only the namespace-scoped Pod, Pod exec/log, PVC, and StatefulSet reads needed for runtime mate management.
+Set `rbac: none` when a separate authority mechanism manages mates.
+Set `rbac: cluster-admin` only for an isolated intelligence cluster after a reviewed grant.
+
+The package carries no credential value or Secret reference.
+Any runtime credential is a separately created Kubernetes Secret, mounted only after its owner has approved that authority.

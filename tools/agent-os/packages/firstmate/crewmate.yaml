@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent-os-crewmate-__AGENT_OS_CREWMATE_ID__-home
+  namespace: __AGENT_OS_NAMESPACE__
+  labels:
+    app.kubernetes.io/name: agent-os
+    app.kubernetes.io/component: crewmate
+    agent-os.dev/crewmate: __AGENT_OS_CREWMATE_ID__
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: agent-os-crewmate-__AGENT_OS_CREWMATE_ID__
+  namespace: __AGENT_OS_NAMESPACE__
+  labels:
+    app.kubernetes.io/name: agent-os
+    app.kubernetes.io/component: crewmate
+    agent-os.dev/crewmate: __AGENT_OS_CREWMATE_ID__
+spec:
+  automountServiceAccountToken: false
+  securityContext:
+    fsGroup: 0
+    runAsGroup: 0
+    runAsUser: 0
+  initContainers:
+    - name: agent-os-init
+      image: __AGENT_OS_IMAGE__
+      imagePullPolicy: __AGENT_OS_IMAGE_PULL_POLICY__
+      command:
+        - /opt/agent-os/bin/agent-os-init.sh
+      volumeMounts:
+        - name: home
+          mountPath: /persistent-agent
+  containers:
+    - name: crewmate
+      image: __AGENT_OS_IMAGE__
+      imagePullPolicy: __AGENT_OS_IMAGE_PULL_POLICY__
+      env:
+        - name: FM_HOME
+          value: /home/agent
+        - name: HOME
+          value: /home/agent
+      resources:
+        requests:
+          cpu: 250m
+          memory: 512Mi
+        limits:
+          cpu: "2"
+          memory: 4Gi
+      volumeMounts:
+        - name: home
+          mountPath: /home/agent
+        - name: home
+          mountPath: /usr/local
+          subPath: usr-local
+  volumes:
+    - name: home
+      persistentVolumeClaim:
+        claimName: agent-os-crewmate-__AGENT_OS_CREWMATE_ID__-home

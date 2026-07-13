@@ -5,8 +5,8 @@ Update it from real runs; planned behavior and model narration never count as pr
 
 | Requirement | Current evidence | State |
 | --- | --- | --- |
-| Portable Kubernetes core without Akua | `docs/kubernetes.md` and `bin/agent-os-local.sh` provide the OrbStack build, deploy, status, shell, and attach path without an Akua account, credential, managed control plane, or hosted worker | Documented locally; clean published-source run remains required |
-| Persistent Firstmate and Herdr in Kubernetes | OrbStack demo plus generic package render and disposable-cluster run in `docs/evidence/2026-07-12-firstmate-package.md` | Proven locally |
+| Portable Kubernetes core without Akua | `tools/agent-os/packages/firstmate/` and focused render/behavior tests prove a digest-required package, namespace-scoped default RBAC, persistent home, explicit lifecycle commands, and no package credential input | Render and command contracts proven; clean published-image run remains required |
+| Persistent Firstmate and Herdr in Kubernetes | Canonical package render plus local lifecycle records in `docs/evidence/2026-07-12-firstmate-package.md` | Package render and local evidence proven; published-image run remains required |
 | Firstmate cluster-admin limited to the intelligence cluster | Dedicated local namespace and explicit demo ClusterRoleBinding | Proven locally only |
 | Direct Akua-managed KaaS and Hetzner bootstrap | Public endpoint study and `akua-intelligence-bootstrap` skill | Not yet run |
 | Distinct clustered token and bootstrap-token revocation | Explicit Secret mount in the Firstmate package and handoff procedure | Not yet run |
@@ -20,7 +20,7 @@ Update it from real runs; planned behavior and model narration never count as pr
 | Separate production read-only and scoped write identity | Cortex contract only | Not yet implemented or Red-approved |
 | Optional GitHub Issue/Project client | Firstmate read a private Cortex GitHub issue through `gh-axi` and delivered public PR #3 with no custom intake service; public Agent OS Issues are disabled because work tracking is private | Issue client proven locally; Project client remains optional and unproven |
 | Repeatable end-to-end eval and recordable demo | Same-Pod and separate-Pod run records now capture model, time, cost estimate, interventions, resource IDs, and failures | Local agent lifecycle captured; Akua/GitHub/product path incomplete |
-| Public installable image and release | Multi-architecture workflow run `29188585384` succeeded; local image only because pull-request builds do not publish | Publication not yet proven |
+| Public installable image and release | Multi-architecture release workflow builds `linux/amd64` and `linux/arm64`, publishes only outside pull requests, and records the resulting digest in its job summary | Publication not yet proven |
 
 ## Definition of done
 

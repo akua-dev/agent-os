@@ -5,9 +5,15 @@ set -eu
 
 COMMAND=${1:-}
 ID=${2:-}
-NAMESPACE=${AGENT_OS_NAMESPACE:-agent-os-demo}
-IMAGE=${AGENT_OS_IMAGE:-agent-os:dev}
+NAMESPACE=${AGENT_OS_NAMESPACE:-agent-os}
+IMAGE=${AGENT_OS_IMAGE:-}
+IMAGE_PULL_POLICY=${AGENT_OS_IMAGE_PULL_POLICY:-IfNotPresent}
 KUBECTL=${AGENT_OS_KUBECTL:-kubectl}
+TEMPLATE=${AGENT_OS_CREWMATE_TEMPLATE:-/opt/agent-os/tools/agent-os/packages/firstmate/crewmate.yaml}
+
+if [ ! -f "$TEMPLATE" ]; then
+  TEMPLATE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/tools/agent-os/packages/firstmate/crewmate.yaml"
+fi
 
 case "$ID" in
   ''|*[!a-z0-9-]*|-*|*-) echo "error: invalid crewmate id '$ID'" >&2; exit 2 ;;
@@ -26,74 +32,16 @@ PVC="$POD-home"
 
 case "$COMMAND" in
   create)
-    "$KUBECTL" "${KUBECTL_ARGS[@]}" -n "$NAMESPACE" apply -f - <<YAML
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: $PVC
-  namespace: $NAMESPACE
-  labels:
-    app.kubernetes.io/name: agent-os
-    app.kubernetes.io/component: crewmate
-    agent-os.akua.dev/crewmate: $ID
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 10Gi
----
-apiVersion: v1
-kind: Pod
-metadata:
-  name: $POD
-  namespace: $NAMESPACE
-  labels:
-    app.kubernetes.io/name: agent-os
-    app.kubernetes.io/component: crewmate
-    agent-os.akua.dev/crewmate: $ID
-spec:
-  automountServiceAccountToken: false
-  securityContext:
-    fsGroup: 0
-    runAsGroup: 0
-    runAsUser: 0
-  initContainers:
-    - name: agent-os-init
-      image: $IMAGE
-      imagePullPolicy: Never
-      command:
-        - /opt/agent-os/bin/agent-os-init.sh
-      volumeMounts:
-        - name: home
-          mountPath: /persistent-agent
-  containers:
-    - name: crewmate
-      image: $IMAGE
-      imagePullPolicy: Never
-      env:
-        - name: FM_HOME
-          value: /home/agent
-        - name: HOME
-          value: /home/agent
-      resources:
-        requests:
-          cpu: 250m
-          memory: 512Mi
-        limits:
-          cpu: "2"
-          memory: 4Gi
-      volumeMounts:
-        - name: home
-          mountPath: /home/agent
-        - name: home
-          mountPath: /usr/local
-          subPath: usr-local
-  volumes:
-    - name: home
-      persistentVolumeClaim:
-        claimName: $PVC
-YAML
+    if [ -z "$IMAGE" ]; then
+      echo "error: AGENT_OS_IMAGE must name the immutable image selected for this cluster" >&2
+      exit 2
+    fi
+    sed \
+      -e "s|__AGENT_OS_CREWMATE_ID__|$ID|g" \
+      -e "s|__AGENT_OS_NAMESPACE__|$NAMESPACE|g" \
+      -e "s|__AGENT_OS_IMAGE__|$IMAGE|g" \
+      -e "s|__AGENT_OS_IMAGE_PULL_POLICY__|$IMAGE_PULL_POLICY|g" \
+      "$TEMPLATE" | "$KUBECTL" "${KUBECTL_ARGS[@]}" -n "$NAMESPACE" apply -f -
     ;;
   status)
     "$KUBECTL" "${KUBECTL_ARGS[@]}" -n "$NAMESPACE" get pod "$POD"

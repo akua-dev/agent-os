@@ -1,5 +1,6 @@
 namespace: agent-os
-image: ghcr.io/akua-dev/agent-os:latest
+# Replace only with the immutable digest emitted by an Agent OS release.
+image: ghcr.io/akua-dev/agent-os@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 imagePullPolicy: IfNotPresent
-clusterAdmin: true
-akuaAuthSecret: agent-os-firstmate-akua-auth
+rbac: namespace
+storage: 20Gi
