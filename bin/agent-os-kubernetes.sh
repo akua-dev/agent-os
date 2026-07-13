@@ -21,11 +21,34 @@ MANAGES_NAMESPACE=0
 DESIRED_RBAC=none
 INSTALLATION_ID=
 OPERATION_ID=${AGENT_OS_OPERATION_ID:-"$(date -u '+%Y%m%d%H%M%S')-$$-$RANDOM"}
+LOCK=
+LOCK_NAMESPACE=
+EXPECTED_LOCK=
+LOCK_UID=
+LOCK_RV=
+LOCK_RENEW_PID=
+LOCK_DURATION_SECONDS=${AGENT_OS_LOCK_DURATION_SECONDS:-300}
+LOCK_CLOCK_SKEW_SECONDS=${AGENT_OS_LOCK_CLOCK_SKEW_SECONDS:-5}
+LOCK_ACQUIRE_SECONDS=${AGENT_OS_LOCK_ACQUIRE_SECONDS:-30}
+
+for seconds in "$LOCK_DURATION_SECONDS" "$LOCK_CLOCK_SKEW_SECONDS" "$LOCK_ACQUIRE_SECONDS"; do
+  case "$seconds" in ''|*[!0-9]*) echo "error: lifecycle Lease timing must use whole seconds" >&2; exit 2 ;; esac
+done
+[ "$LOCK_DURATION_SECONDS" -ge 3 ] || { echo "error: lifecycle Lease duration must be at least 3 seconds" >&2; exit 2; }
+
+. "$ROOT/bin/agent-os-kubernetes-lease.sh"
 
 cleanup() {
+  local status=$?
+  trap - EXIT
+  if ! release_lock && [ "$status" -eq 0 ]; then
+    status=3
+  fi
   rm -rf "$OUT" "$RENDER_INPUTS"
+  exit "$status"
 }
 trap cleanup EXIT
+trap lock_renewal_failed TERM
 
 usage() {
   echo "usage: $0 install|upgrade|rollback|status|uninstall|cleanup-cluster-rbac [--yes] [--delete-namespace]" >&2
@@ -107,6 +130,82 @@ namespace_identity() {
     -o 'jsonpath={.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}'
 }
 
+rendered_file_for_kind() {
+  local desired=$1 file
+  while IFS= read -r file; do
+    [ "$(rendered_resource_field "$file" kind)" = "$desired" ] && { printf '%s' "$file"; return; }
+  done < <(find "$OUT" -type f -name '*.yaml' -print)
+}
+
+create_managed_namespace_if_absent() {
+  local file identity
+  [ "$MANAGES_NAMESPACE" -eq 1 ] || return 0
+  [ -z "$(namespace_name)" ] || return 0
+  file=$(rendered_file_for_kind Namespace)
+  [ -n "$file" ] || { echo "error: managed namespace render is missing" >&2; exit 2; }
+  if ! "$KUBECTL" --context "$CONTEXT" create -f "$file" >/dev/null; then
+    identity=$(namespace_identity 2>/dev/null || true)
+    if [ "$identity" != "agent-os"$'\t'"$INSTALLATION_ID" ]; then
+      echo "error: namespace '$NAMESPACE' create conflicted without exact installation ownership" >&2
+      exit 2
+    fi
+  fi
+  identity=$(namespace_identity)
+  if [ "$identity" != "agent-os"$'\t'"$INSTALLATION_ID" ]; then
+    echo "error: namespace '$NAMESPACE' did not retain exact installation ownership" >&2
+    exit 2
+  fi
+}
+
+kube() {
+  "$KUBECTL" --context "$CONTEXT" -n "$LOCK_NAMESPACE" "$@"
+}
+
+lock_record() {
+  kube get lease "$LOCK" --ignore-not-found \
+    -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/lifecycle}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.spec.holderIdentity}{"\t"}{.spec.acquireTime}{"\t"}{.spec.renewTime}{"\t"}{.spec.leaseDurationSeconds}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}'
+}
+
+render_lock() {
+  local acquired_at=$1 renewed_at=$2 uid=${3:-} rv=${4:-}
+  cat <<YAML
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: $LOCK
+  namespace: $LOCK_NAMESPACE
+${uid:+  uid: $uid}
+${rv:+  resourceVersion: $rv}
+  labels:
+    app.kubernetes.io/managed-by: agent-os
+    agent-os.dev/lifecycle: primary
+  annotations:
+    agent-os.dev/installation-id: $INSTALLATION_ID
+spec:
+  holderIdentity: $OPERATION_ID
+  acquireTime: $acquired_at
+  renewTime: $renewed_at
+  leaseDurationSeconds: $LOCK_DURATION_SECONDS
+YAML
+}
+
+acquire_primary_lock() {
+  if [ -n "$(namespace_name)" ]; then
+    LOCK_NAMESPACE=$NAMESPACE
+    LOCK=agent-os-firstmate-lifecycle
+  elif [ "$COMMAND" = cleanup-cluster-rbac ]; then
+    LOCK_NAMESPACE=${AGENT_OS_CLUSTER_LOCK_NAMESPACE:-kube-system}
+    LOCK="agent-os-firstmate-lifecycle-$NAMESPACE"
+  elif [ "$COMMAND" = uninstall ]; then
+    return 0
+  else
+    echo "error: namespace '$NAMESPACE' is absent after namespace preparation" >&2
+    exit 2
+  fi
+  EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"primary"$'\t'"$INSTALLATION_ID"
+  acquire_lock
+}
+
 require_namespace_contract() {
   local name identity
   name=$(namespace_name)
@@ -165,6 +264,78 @@ live_resource_identity() {
     -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}'
 }
 
+live_resource_record() {
+  local scope=$1 kind=$2 name=$3
+  if [ "$scope" = cluster ]; then
+    "$KUBECTL" --context "$CONTEXT" get "$kind" "$name" --ignore-not-found \
+      -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}{"\t"}{.metadata.labels.agent-os\.dev/operation-id}'
+  else
+    "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get "$kind" "$name" --ignore-not-found \
+      -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}{"\t"}{.metadata.labels.agent-os\.dev/operation-id}'
+  fi
+}
+
+resource_api_path() {
+  local scope=$1 kind=$2 name=$3
+  case "$kind" in
+    Namespace) printf '/api/v1/namespaces/%s' "$name" ;;
+    Pod) printf '/api/v1/namespaces/%s/pods/%s' "$NAMESPACE" "$name" ;;
+    PersistentVolumeClaim) printf '/api/v1/namespaces/%s/persistentvolumeclaims/%s' "$NAMESPACE" "$name" ;;
+    Service) printf '/api/v1/namespaces/%s/services/%s' "$NAMESPACE" "$name" ;;
+    ServiceAccount) printf '/api/v1/namespaces/%s/serviceaccounts/%s' "$NAMESPACE" "$name" ;;
+    StatefulSet) printf '/apis/apps/v1/namespaces/%s/statefulsets/%s' "$NAMESPACE" "$name" ;;
+    Role) printf '/apis/rbac.authorization.k8s.io/v1/namespaces/%s/roles/%s' "$NAMESPACE" "$name" ;;
+    RoleBinding) printf '/apis/rbac.authorization.k8s.io/v1/namespaces/%s/rolebindings/%s' "$NAMESPACE" "$name" ;;
+    ClusterRoleBinding) printf '/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/%s' "$name" ;;
+    *) echo "error: unsupported atomic deletion target $scope $kind/$name" >&2; return 2 ;;
+  esac
+}
+
+delete_owned_resource() {
+  local scope=$1 kind=$2 name=$3 timeout=$4 record expected uid rv path
+  record=$(live_resource_record "$scope" "$kind" "$name")
+  [ -n "$record" ] || return 0
+  expected="$name"$'\t'"agent-os"$'\t'"$INSTALLATION_ID"
+  if [ "$(printf '%s' "$record" | cut -f1-3)" != "$expected" ]; then
+    echo "error: $kind '$name' changed ownership before deletion" >&2
+    exit 2
+  fi
+  uid=$(printf '%s' "$record" | cut -f4)
+  rv=$(printf '%s' "$record" | cut -f5)
+  [ -n "$uid" ] && [ -n "$rv" ] || { echo "error: $kind '$name' lacks deletion preconditions" >&2; exit 2; }
+  path=$(resource_api_path "$scope" "$kind" "$name")
+  if ! printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s","resourceVersion":"%s"}}\n' "$uid" "$rv" | \
+    "$KUBECTL" --context "$CONTEXT" delete --raw "$path" -f - >/dev/null; then
+    bounded_delete_failure "$kind/$name"
+    return $?
+  fi
+  if [ "$scope" = cluster ]; then
+    "$KUBECTL" --context "$CONTEXT" wait --for=delete "$kind/$name" --timeout="${timeout}s" || bounded_delete_failure "$kind/$name"
+  else
+    "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" wait --for=delete "$kind/$name" --timeout="${timeout}s" || bounded_delete_failure "$kind/$name"
+  fi
+}
+
+patch_workload_annotations() {
+  local annotations=$1 record expected uid rv patch current
+  record=$(live_resource_record namespaced StatefulSet agent-os-firstmate)
+  expected="agent-os-firstmate"$'\t'"agent-os"$'\t'"$INSTALLATION_ID"
+  if [ "$(printf '%s' "$record" | cut -f1-3)" != "$expected" ]; then
+    echo "error: StatefulSet ownership changed before annotation mutation" >&2
+    exit 2
+  fi
+  uid=$(printf '%s' "$record" | cut -f4)
+  rv=$(printf '%s' "$record" | cut -f5)
+  [ -n "$uid" ] && [ -n "$rv" ] || { echo "error: StatefulSet lacks annotation CAS identity" >&2; exit 2; }
+  patch=$(printf '{"metadata":{"uid":"%s","resourceVersion":"%s","annotations":%s}}' "$uid" "$rv" "$annotations")
+  "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" patch StatefulSet agent-os-firstmate --type=merge -p "$patch" >/dev/null
+  current=$(live_resource_record namespaced StatefulSet agent-os-firstmate)
+  if [ "$(printf '%s' "$current" | cut -f1-4)" != "$(printf '%s' "$record" | cut -f1-4)" ]; then
+    echo "error: StatefulSet UID or ownership changed during annotation mutation" >&2
+    exit 3
+  fi
+}
+
 require_namespaced_resource_owned_or_absent() {
   local kind=$1 name=$2 identity expected
   identity=$(live_resource_identity "$kind" "$name")
@@ -199,16 +370,8 @@ preflight_rendered_resources() {
 }
 
 delete_namespace_rbac() {
-  require_namespaced_resource_owned_or_absent RoleBinding agent-os-firstmate-runtime
-  require_namespaced_resource_owned_or_absent Role agent-os-firstmate-runtime
-  if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" delete rolebinding \
-    agent-os-firstmate-runtime --ignore-not-found --wait=true --timeout=180s; then
-    bounded_delete_failure "RoleBinding/agent-os-firstmate-runtime"
-  fi
-  if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" delete role \
-    agent-os-firstmate-runtime --ignore-not-found --wait=true --timeout=180s; then
-    bounded_delete_failure "Role/agent-os-firstmate-runtime"
-  fi
+  delete_owned_resource namespaced RoleBinding agent-os-firstmate-runtime 180
+  delete_owned_resource namespaced Role agent-os-firstmate-runtime 180
 }
 
 resource_observation() {
@@ -321,8 +484,10 @@ partial_recovery_action() {
   if [ -n "$state" ]; then
     identity=$(printf '%s' "$state" | cut -f1,4,5)
     if [ "$identity" = "agent-os-firstmate"$'\t'"agent-os"$'\t'"$INSTALLATION_ID" ]; then
-      printf upgrade
-      return
+      if partial_install_is_applicable; then
+        printf upgrade
+        return
+      fi
     fi
     return 1
   fi
@@ -385,10 +550,80 @@ report_partial_apply() {
   return 3
 }
 
-apply_rendered() {
-  if ! "$KUBECTL" --context "$CONTEXT" apply -f "$OUT"; then
-    report_partial_apply apply
+cas_patch_file() {
+  local file=$1 uid=$2 rv=$3 patch_file
+  patch_file=$(mktemp "$OUT/cas.XXXXXX")
+  awk -v uid="$uid" -v rv="$rv" '
+    !inserted && $1 == "metadata:" {
+      print
+      print "  uid: " uid
+      print "  resourceVersion: " rv
+      inserted=1
+      next
+    }
+    { print }
+  ' "$file" > "$patch_file"
+  printf '%s' "$patch_file"
+}
+
+mutate_rendered_resource() {
+  local file=$1 kind name scope record expected uid rv operation current patch_file
+  kind=$(rendered_resource_field "$file" kind)
+  name=$(rendered_resource_field "$file" name)
+  [ "$kind" != Namespace ] || return 0
+  scope=namespaced
+  [ "$kind" != ClusterRoleBinding ] || scope=cluster
+  record=$(live_resource_record "$scope" "$kind" "$name")
+  expected="$name"$'\t'"agent-os"$'\t'"$INSTALLATION_ID"
+  if [ -z "$record" ]; then
+    if ! "$KUBECTL" --context "$CONTEXT" create -f "$file" >/dev/null; then
+      current=$(live_resource_record "$scope" "$kind" "$name" 2>/dev/null || true)
+      if [ "$(printf '%s' "$current" | cut -f1-3)" != "$expected" ] || \
+        [ "$(printf '%s' "$current" | cut -f6)" != "$OPERATION_ID" ]; then
+        report_partial_apply create
+        return $?
+      fi
+    fi
+  else
+    if [ "$(printf '%s' "$record" | cut -f1-3)" != "$expected" ]; then
+      echo "error: $kind '$name' changed ownership before mutation" >&2
+      exit 2
+    fi
+    uid=$(printf '%s' "$record" | cut -f4)
+    rv=$(printf '%s' "$record" | cut -f5)
+    [ -n "$uid" ] && [ -n "$rv" ] || { echo "error: $kind '$name' lacks CAS identity" >&2; exit 2; }
+    patch_file=$(cas_patch_file "$file" "$uid" "$rv")
+    if [ "$scope" = cluster ]; then
+      if ! "$KUBECTL" --context "$CONTEXT" patch "$kind" "$name" --type=merge --patch-file "$patch_file" >/dev/null; then
+        report_partial_apply patch
+        return $?
+      fi
+    else
+      if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" patch "$kind" "$name" --type=merge --patch-file "$patch_file" >/dev/null; then
+        report_partial_apply patch
+        return $?
+      fi
+    fi
   fi
+  current=$(live_resource_record "$scope" "$kind" "$name")
+  operation=$(printf '%s' "$current" | cut -f6)
+  if [ "$(printf '%s' "$current" | cut -f1-3)" != "$expected" ] || [ -z "$(printf '%s' "$current" | cut -f4)" ] || \
+    [ "$operation" != "$OPERATION_ID" ]; then
+    report_partial_apply verify
+    return $?
+  fi
+  if [ -n "$record" ] && [ "$(printf '%s' "$current" | cut -f4)" != "$(printf '%s' "$record" | cut -f4)" ]; then
+    echo "error: $kind '$name' UID changed during mutation" >&2
+    exit 3
+  fi
+}
+
+apply_rendered() {
+  local file
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    mutate_rendered_resource "$file" || return $?
+  done < <(find "$OUT" -type f -name '*.yaml' -print)
   if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" rollout status \
     statefulset/agent-os-firstmate --timeout=180s; then
     report_partial_apply rollout
@@ -410,7 +645,7 @@ verify_desired_rbac() {
         {"apiGroups":[""],"resources":["pods","persistentvolumeclaims"],"verbs":["get","list","watch","create","delete","patch"]},
         {"apiGroups":[""],"resources":["pods/log","pods/exec"],"verbs":["get","list","watch","create","delete"]},
         {"apiGroups":["apps"],"resources":["statefulsets"],"verbs":["get","list","watch"]},
-        {"apiGroups":["coordination.k8s.io"],"resources":["leases"],"verbs":["get","list","watch","create","delete"]}
+        {"apiGroups":["coordination.k8s.io"],"resources":["leases"],"verbs":["get","create","update","delete"]}
       ]' >/dev/null ||
       ! printf '%s' "$binding_json" | jq -e --arg namespace "$NAMESPACE" '
         .roleRef == {"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"agent-os-firstmate-runtime"} and
@@ -514,10 +749,7 @@ delete_rendered_kind() {
     kind=$(rendered_resource_field "$file" kind)
     if [ "$kind" = "$desired_kind" ]; then
       name=$(rendered_resource_field "$file" name)
-      if ! "$KUBECTL" --context "$CONTEXT" delete --ignore-not-found \
-        --wait=true --timeout=180s -f "$file"; then
-        bounded_delete_failure "$kind/$name"
-      fi
+      delete_owned_resource namespaced "$kind" "$name" 180
     fi
   done < <(find "$OUT" -type f -name '*.yaml' -print)
 }
@@ -536,7 +768,7 @@ delete_rendered_namespaced_resources() {
 }
 
 namespace_is_empty() {
-  local resources resource objects object
+  local resources resource objects object lock
   if ! resources=$("$KUBECTL" --context "$CONTEXT" api-resources --verbs=list --namespaced -o name); then
     echo "error: could not inventory namespaced Kubernetes resource types" >&2
     return 1
@@ -554,6 +786,13 @@ namespace_is_empty() {
       [ -n "$object" ] || continue
       case "$object" in
         serviceaccount/default|configmap/kube-root-ca.crt) ;;
+        lease/agent-os-firstmate-lifecycle|lease.coordination.k8s.io/agent-os-firstmate-lifecycle)
+          lock=$(lock_record 2>/dev/null || true)
+          if ! verify_lock_record "$lock" || [ "$(printf '%s' "$lock" | cut -f9)" != "$LOCK_UID" ]; then
+            echo "error: namespace '$NAMESPACE' contains an unverified lifecycle Lease" >&2
+            return 1
+          fi
+          ;;
         *)
           echo "error: namespace '$NAMESPACE' still contains foreign resource '$object'" >&2
           return 1
@@ -582,10 +821,10 @@ delete_owned_empty_namespace() {
     echo "error: namespace '$NAMESPACE' ownership changed during deletion checks" >&2
     exit 2
   fi
-  if ! "$KUBECTL" --context "$CONTEXT" delete namespace "$NAMESPACE" \
-    --wait=true --timeout=180s; then
-    bounded_delete_failure "Namespace/$NAMESPACE"
-  fi
+  stop_lock_renewal
+  delete_owned_resource cluster Namespace "$NAMESPACE" 180
+  LOCK_UID=
+  LOCK_RV=
 }
 
 cleanup_cluster_rbac() {
@@ -611,15 +850,13 @@ cleanup_cluster_rbac() {
         exit 2
       fi
     fi
-    "$KUBECTL" --context "$CONTEXT" delete clusterrolebinding "$binding" --wait=false
-    "$KUBECTL" --context "$CONTEXT" wait --for=delete "clusterrolebinding/$binding" --timeout=60s
+    delete_owned_resource cluster ClusterRoleBinding "$binding" 60
   fi
   if [ -n "$(namespace_name)" ]; then
     workload=$(workload_state)
     require_workload_owned "$workload" optional
     if [ -n "$workload" ] && [ "$(printf '%s' "$workload" | cut -f3)" = required ]; then
-      "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" annotate statefulset agent-os-firstmate \
-        agent-os.dev/cluster-rbac-cleanup- >/dev/null
+      patch_workload_annotations '{"agent-os.dev/cluster-rbac-cleanup":null}'
     fi
   fi
   echo "evidence: clusterrolebinding/$binding absent"
@@ -629,6 +866,9 @@ case "$COMMAND" in
   install)
     [ "$CONFIRMED" -eq 0 ] && [ "$DELETE_NAMESPACE" -eq 0 ] || usage
     render
+    require_namespace_contract
+    create_managed_namespace_if_absent
+    acquire_primary_lock
     require_namespace_contract
     preflight_rendered_resources 1
     previous=$(workload_state)
@@ -643,6 +883,8 @@ case "$COMMAND" in
     [ "$CONFIRMED" -eq 0 ] && [ "$DELETE_NAMESPACE" -eq 0 ] || usage
     render
     require_namespace_contract
+    acquire_primary_lock
+    require_namespace_contract
     preflight_rendered_resources 1
     previous=$(workload_state)
     if [ -z "$previous" ]; then
@@ -656,8 +898,7 @@ case "$COMMAND" in
     if [ "$DESIRED_RBAC" != cluster-admin ] && \
       { [ "$previous_mode" = cluster-admin ] || [ -z "$previous_mode" ] || [ "$previous_cleanup" = required ]; }; then
       cleanup_required=1
-      "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" annotate statefulset agent-os-firstmate \
-        agent-os.dev/cluster-rbac-cleanup=required --overwrite >/dev/null
+      patch_workload_annotations '{"agent-os.dev/cluster-rbac-cleanup":"required"}'
     fi
     apply_rendered
     verify_desired_rbac
@@ -665,8 +906,7 @@ case "$COMMAND" in
       delete_namespace_rbac
     fi
     if [ "$DESIRED_RBAC" = cluster-admin ] && [ "$previous_cleanup" = required ]; then
-      "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" annotate statefulset agent-os-firstmate \
-        agent-os.dev/cluster-rbac-cleanup- >/dev/null
+      patch_workload_annotations '{"agent-os.dev/cluster-rbac-cleanup":null}'
     fi
     if [ "$cleanup_required" -eq 1 ]; then
       report_cluster_cleanup
@@ -677,8 +917,23 @@ case "$COMMAND" in
     [ "$CONFIRMED" -eq 0 ] && [ "$DELETE_NAMESPACE" -eq 0 ] || usage
     render
     require_namespace_contract
+    acquire_primary_lock
+    require_namespace_contract
+    preflight_rendered_resources 1
     previous=$(workload_state)
     require_workload_owned "$previous"
+    rollback_record=$(live_resource_record namespaced StatefulSet agent-os-firstmate)
+    if [ "$(printf '%s' "$rollback_record" | cut -f1-3)" != \
+      "agent-os-firstmate"$'\t'"agent-os"$'\t'"$INSTALLATION_ID" ] || \
+      [ -z "$(printf '%s' "$rollback_record" | cut -f4)" ] || [ -z "$(printf '%s' "$rollback_record" | cut -f5)" ]; then
+      echo "error: rollback requires exact StatefulSet UID and resourceVersion evidence" >&2
+      exit 2
+    fi
+    rollback_current=$(live_resource_record namespaced StatefulSet agent-os-firstmate)
+    if [ "$rollback_current" != "$rollback_record" ]; then
+      echo "error: StatefulSet changed before rollback mutation" >&2
+      exit 3
+    fi
     "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" rollout undo statefulset/agent-os-firstmate
     "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" rollout status statefulset/agent-os-firstmate --timeout=180s
     ;;
@@ -692,6 +947,8 @@ case "$COMMAND" in
       exit 2
     fi
     render
+    require_namespace_contract
+    acquire_primary_lock
     require_namespace_contract
     preflight_rendered_resources
     previous=$(workload_state)
@@ -716,6 +973,7 @@ case "$COMMAND" in
       exit 2
     fi
     render
+    acquire_primary_lock
     cleanup_cluster_rbac
     ;;
   *) usage ;;

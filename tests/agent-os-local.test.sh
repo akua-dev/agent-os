@@ -37,26 +37,59 @@ cat > "$FAKEBIN/kubectl" <<'SH'
 printf 'kubectl' >> "$AGENT_OS_TEST_LOG"
 printf ' %s' "$@" >> "$AGENT_OS_TEST_LOG"
 printf '\n' >> "$AGENT_OS_TEST_LOG"
+stdin_kind=''
+if [ "${*: -2}" = '-f -' ]; then
+  stdin_data=$(cat)
+  stdin_kind=$(printf '%s\n' "$stdin_data" | awk '$1 == "kind:" { print $2; exit }')
+  printf 'stdin-kind %s\n' "$stdin_kind" >> "$AGENT_OS_TEST_LOG"
+fi
 namespace=${AGENT_OS_NAMESPACE:-agent-os-demo}
-if [[ " $* " = *" get statefulset agent-os-firstmate --ignore-not-found -o name "* ]] && \
-  [ "${AGENT_OS_TEST_LOCAL_WORKLOAD:-absent}" = present ]; then
+operation=$(grep 'akua-input-operation ' "$AGENT_OS_TEST_LOG" | tail -n 1 | awk '{print $2}')
+namespace_present=0
+if [ "${AGENT_OS_TEST_LOCAL_WORKLOAD:-absent}" = present ] || grep -F ' create -f ' "$AGENT_OS_TEST_LOG" | grep -F 'namespace.yaml' >/dev/null; then namespace_present=1; fi
+stateful_present=0
+if [ "${AGENT_OS_TEST_LOCAL_WORKLOAD:-absent}" = present ] || grep -F 'statefulset.yaml' "$AGENT_OS_TEST_LOG" | grep -E ' create | patch ' >/dev/null; then stateful_present=1; fi
+if [[ " $* " = *" get statefulset agent-os-firstmate --ignore-not-found -o name "* ]] && [ "$stateful_present" -eq 1 ]; then
   printf 'statefulset.apps/agent-os-firstmate\n'
 fi
-if [[ " $* " = *" get namespace "*" --ignore-not-found -o name "* ]] && \
-  [ "${AGENT_OS_TEST_LOCAL_WORKLOAD:-absent}" = present ]; then
+if { [[ " $* " = *" get namespace "*" --ignore-not-found -o name "* ]] ||
+     [[ " $* " = *" get Namespace "*" --ignore-not-found -o name "* ]]; } &&
+   [ "$namespace_present" -eq 1 ]; then
   printf 'namespace/%s\n' "$namespace"
 fi
-if [[ " $* " = *" get namespace "*" -o jsonpath="* ]] && \
-  [ "${AGENT_OS_TEST_LOCAL_WORKLOAD:-absent}" = present ]; then
-  printf 'agent-os\tagent-os-firstmate:%s' "$namespace"
+if { [[ " $* " = *" get namespace "*" -o jsonpath="* ]] ||
+     [[ " $* " = *" get Namespace "*" -o jsonpath="* ]]; } &&
+   [ "$namespace_present" -eq 1 ]; then
+  if [[ " $* " = *'.metadata.resourceVersion'* ]]; then
+    printf '%s\tagent-os\tagent-os-firstmate:%s\tuid-namespace\trv-namespace\t%s' "$namespace" "$namespace" "$operation"
+  else
+    printf 'agent-os\tagent-os-firstmate:%s' "$namespace"
+  fi
 fi
-if [[ " $* " = *" get statefulset agent-os-firstmate --ignore-not-found -o jsonpath="* ]] && \
-  [ "${AGENT_OS_TEST_LOCAL_WORKLOAD:-absent}" = present ]; then
-  printf 'agent-os-firstmate\tcluster-admin\t\tagent-os\tagent-os-firstmate:%s' "$namespace"
+if { [[ " $* " = *" get statefulset agent-os-firstmate --ignore-not-found -o jsonpath="* ]] ||
+     [[ " $* " = *" get StatefulSet agent-os-firstmate --ignore-not-found -o jsonpath="* ]]; } &&
+   [ "$stateful_present" -eq 1 ]; then
+  if [[ " $* " = *'.metadata.resourceVersion'* ]]; then
+    printf 'agent-os-firstmate\tagent-os\tagent-os-firstmate:%s\tuid-statefulset\trv-statefulset\t%s' "$namespace" "$operation"
+  elif [[ " $* " = *'.metadata.annotations.agent-os\.dev/rbac-mode'* ]]; then
+    printf 'agent-os-firstmate\tcluster-admin\t\tagent-os\tagent-os-firstmate:%s' "$namespace"
+  else
+    printf 'agent-os-firstmate\tagent-os\tagent-os-firstmate:%s' "$namespace"
+  fi
 fi
-if [[ " $* " = *" get clusterrolebinding agent-os-firstmate-"*" --ignore-not-found -o jsonpath="* ]] && \
-  [ "${AGENT_OS_TEST_LOCAL_WORKLOAD:-absent}" = present ]; then
-  printf 'agent-os-firstmate-%s\tagent-os\tagent-os-firstmate:%s' "$namespace" "$namespace"
+if { [[ " $* " = *" get clusterrolebinding agent-os-firstmate-"*" --ignore-not-found -o jsonpath="* ]] ||
+     [[ " $* " = *" get ClusterRoleBinding agent-os-firstmate-"*" --ignore-not-found -o jsonpath="* ]]; }; then
+  if [ "${AGENT_OS_TEST_LOCAL_WORKLOAD:-absent}" = present ] || grep -F 'clusterrolebinding.yaml' "$AGENT_OS_TEST_LOG" | grep -E ' create | patch ' >/dev/null; then
+    printf 'agent-os-firstmate-%s\tagent-os\tagent-os-firstmate:%s' "$namespace" "$namespace"
+    [[ " $* " != *'.metadata.resourceVersion'* ]] || printf '\tuid-clusterrolebinding\trv-clusterrolebinding\t%s' "$operation"
+  fi
+fi
+if [[ " $* " = *" get lease agent-os-firstmate-lifecycle --ignore-not-found -o jsonpath="* ]]; then
+  last_write=$(grep -Fn 'stdin-kind Lease' "$AGENT_OS_TEST_LOG" | tail -n 1 | cut -d: -f1)
+  last_delete=$(grep -Fn '/leases/agent-os-firstmate-lifecycle' "$AGENT_OS_TEST_LOG" | grep 'delete --raw' | tail -n 1 | cut -d: -f1)
+  if [ -n "$last_write" ] && { [ -z "$last_delete" ] || [ "$last_write" -gt "$last_delete" ]; }; then
+    printf 'agent-os-firstmate-lifecycle\tagent-os\tprimary\tagent-os-firstmate:%s\t%s\t2026-07-13T00:00:00Z\t2026-07-13T00:00:00Z\t300\tuid-lock\trv-lock' "$namespace" "$operation"
+  fi
 fi
 SH
 chmod +x "$FAKEBIN/kubectl"
@@ -77,7 +110,9 @@ while [ "$#" -gt 0 ]; do
 done
 printf 'akua-input-image %s\n' "$(awk '/^image:/{print $2}' "$inputs")" >> "$AGENT_OS_TEST_LOG"
 namespace=$(awk '/^namespace:/{print $2}' "$inputs")
+operation=$(awk '/^operationId:/{print $2}' "$inputs")
 printf 'akua-input-namespace %s\n' "$namespace" >> "$AGENT_OS_TEST_LOG"
+printf 'akua-input-operation %s\n' "$operation" >> "$AGENT_OS_TEST_LOG"
 mkdir -p "$out"
 cat > "$out/statefulset.yaml" <<YAML
 apiVersion: apps/v1
@@ -87,11 +122,11 @@ metadata:
   namespace: $namespace
   labels:
     app.kubernetes.io/managed-by: agent-os
+    agent-os.dev/operation-id: $operation
   annotations:
     agent-os.dev/installation-id: agent-os-firstmate:$namespace
     agent-os.dev/rbac-mode: cluster-admin
 YAML
-printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: agent-os-firstmate-state\n  namespace: %s\n' "$namespace" > "$out/rendered.yaml"
 cat > "$out/namespace.yaml" <<YAML
 apiVersion: v1
 kind: Namespace
@@ -99,6 +134,7 @@ metadata:
   name: $namespace
   labels:
     app.kubernetes.io/managed-by: agent-os
+    agent-os.dev/operation-id: $operation
   annotations:
     agent-os.dev/installation-id: agent-os-firstmate:$namespace
 YAML
@@ -107,6 +143,11 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: agent-os-firstmate-$namespace
+  labels:
+    app.kubernetes.io/managed-by: agent-os
+    agent-os.dev/operation-id: $operation
+  annotations:
+    agent-os.dev/installation-id: agent-os-firstmate:$namespace
 YAML
 SH
 chmod +x "$FAKEBIN/akua"
@@ -138,8 +179,8 @@ test_deploy_starts_local_kubernetes_and_renders_the_orbstack_profile() {
     fail "deploy must render the canonical portable package"
   assert_call 'akua-input-image agent-os:local-default' \
     "OrbStack must derive its manifest from the rebuilt local image"
-  grep -Fq 'kubectl --context orbstack apply -f ' "$LOG" || \
-    fail "deploy must apply only the freshly rendered OrbStack profile"
+  grep -Eq 'kubectl --context orbstack (create -f|.* patch )' "$LOG" || \
+    fail "deploy must atomically create the freshly rendered OrbStack profile"
   if grep -F 'kubectl --context orbstack apply -k' "$LOG" >/dev/null; then
     fail "OrbStack must not maintain a second static installer"
   fi
@@ -166,8 +207,8 @@ test_redeploy_upgrades_an_existing_local_installation() {
 
   assert_call 'kubectl --context orbstack -n agent-os-demo get statefulset agent-os-firstmate --ignore-not-found -o name' \
     "redeploy must detect the existing local installation"
-  grep -Fq 'kubectl --context orbstack apply -f ' "$LOG" || \
-    fail "redeploy must upgrade the existing local installation"
+  grep -Fq 'kubectl --context orbstack -n agent-os-demo patch ' "$LOG" || \
+    fail "redeploy must atomically upgrade the existing local installation"
   pass "redeploy upgrades the content-addressed local installation"
 }
 
@@ -218,11 +259,11 @@ test_destroy_requires_exact_confirmation() {
   [ "$rc" -eq 2 ] || fail "destroy without --yes must exit 2, got $rc: $out"
   [ ! -s "$LOG" ] || fail "destroy without --yes invoked an external command"
 
-  cleanup_out=$(run_cli destroy --yes 2>&1) || cleanup_rc=$?
+  cleanup_out=$(AGENT_OS_TEST_LOCAL_WORKLOAD=present run_cli destroy --yes 2>&1) || cleanup_rc=$?
   [ "$cleanup_rc" -eq 3 ] || \
     fail "cluster-admin demo destroy must stop for separate privileged cleanup, got $cleanup_rc: $cleanup_out"
-  grep -Fq 'kubectl --context orbstack delete --ignore-not-found --wait=true --timeout=180s -f ' "$LOG" || \
-    fail "confirmed destroy must delete only resources from the rendered OrbStack profile"
+  grep -Fq 'kubectl --context orbstack delete --raw /apis/apps/v1/namespaces/agent-os-demo/statefulsets/agent-os-firstmate -f -' "$LOG" || \
+    fail "confirmed destroy must UID-delete the rendered OrbStack workload"
   if grep -E 'kubectl .* (get|delete) clusterrolebinding' "$LOG" >/dev/null; then
     fail "routine demo destroy must not inspect or delete cluster-scoped RBAC"
   fi

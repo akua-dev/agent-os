@@ -51,6 +51,8 @@ assert_grep 'verbs = ["get", "list", "watch", "create", "delete", "patch"]' "$FI
   "runtime RBAC must allow checkpoint updates on retained crewmate PVCs"
 assert_grep 'resources = ["leases"]' "$FIRSTMATE/package.k" \
   "runtime RBAC must permit serialized crewmate lifecycle operations"
+assert_grep 'verbs = ["get", "create", "update", "delete"]' "$FIRSTMATE/package.k" \
+  "runtime Lease authority must be exact and permit CAS renewal"
 assert_no_grep 'akuaAuthSecret' "$FIRSTMATE/package.k" \
   "the portable package must not require Akua authorization"
 assert_no_grep 'agent-os.akua.dev' "$FIRSTMATE/package.k" \

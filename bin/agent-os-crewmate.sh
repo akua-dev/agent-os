@@ -39,10 +39,21 @@ fi
 POD="agent-os-crewmate-$ID"
 PVC="$POD-home"
 LOCK="$POD-lifecycle"
+LOCK_NAMESPACE=$NAMESPACE
 EXPECTED_POD="$POD"$'\t'"agent-os"$'\t'"$ID"$'\t'"$INSTALLATION_ID"
 EXPECTED_PVC="$PVC"$'\t'"agent-os"$'\t'"$ID"$'\t'"$INSTALLATION_ID"
 EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"$ID"$'\t'"$INSTALLATION_ID"
 LOCK_UID=
+LOCK_RV=
+LOCK_RENEW_PID=
+LOCK_DURATION_SECONDS=${AGENT_OS_LOCK_DURATION_SECONDS:-300}
+LOCK_CLOCK_SKEW_SECONDS=${AGENT_OS_LOCK_CLOCK_SKEW_SECONDS:-5}
+LOCK_ACQUIRE_SECONDS=${AGENT_OS_LOCK_ACQUIRE_SECONDS:-30}
+
+for seconds in "$LOCK_DURATION_SECONDS" "$LOCK_CLOCK_SKEW_SECONDS" "$LOCK_ACQUIRE_SECONDS"; do
+  case "$seconds" in ''|*[!0-9]*) echo "error: lifecycle Lease timing must use whole seconds" >&2; exit 2 ;; esac
+done
+[ "$LOCK_DURATION_SECONDS" -ge 3 ] || { echo "error: lifecycle Lease duration must be at least 3 seconds" >&2; exit 2; }
 
 kube() {
   "$KUBECTL" "${KUBECTL_ARGS[@]}" -n "$NAMESPACE" "$@"
@@ -66,7 +77,7 @@ pvc_record() {
 
 lock_record() {
   kube get lease "$LOCK" --ignore-not-found \
-    -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.spec.holderIdentity}{"\t"}{.metadata.uid}'
+    -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.spec.holderIdentity}{"\t"}{.spec.acquireTime}{"\t"}{.spec.renewTime}{"\t"}{.spec.leaseDurationSeconds}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}'
 }
 
 require_owned_or_absent() {
@@ -127,12 +138,15 @@ render_pod() {
 }
 
 render_lock() {
+  local acquired_at=$1 renewed_at=$2 uid=${3:-} rv=${4:-}
   cat <<YAML
 apiVersion: coordination.k8s.io/v1
 kind: Lease
 metadata:
   name: $LOCK
   namespace: $NAMESPACE
+${uid:+  uid: $uid}
+${rv:+  resourceVersion: $rv}
   labels:
     app.kubernetes.io/managed-by: agent-os
     agent-os.dev/crewmate: $ID
@@ -140,48 +154,25 @@ metadata:
     agent-os.dev/installation-id: $INSTALLATION_ID
 spec:
   holderIdentity: $OPERATION_ID
-  leaseDurationSeconds: 300
+  acquireTime: $acquired_at
+  renewTime: $renewed_at
+  leaseDurationSeconds: $LOCK_DURATION_SECONDS
 YAML
 }
 
-release_lock() {
-  [ -n "$LOCK_UID" ] || return 0
-  printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s"}}\n' "$LOCK_UID" | \
-    kube delete --raw "/apis/coordination.k8s.io/v1/namespaces/$NAMESPACE/leases/$LOCK" -f - >/dev/null || true
-  LOCK_UID=
+. "$ROOT/bin/agent-os-kubernetes-lease.sh"
+
+finish_lifecycle() {
+  local status=$?
+  trap - EXIT
+  if ! release_lock && [ "$status" -eq 0 ]; then
+    status=3
+  fi
+  exit "$status"
 }
 
-acquire_lock() {
-  local record identity holder
-  if ! render_lock | kube create -f - >/dev/null; then
-    record=$(lock_record)
-    identity=$(printf '%s' "$record" | cut -f1-4)
-    holder=$(printf '%s' "$record" | cut -f5)
-    if [ -z "$record" ] || [ "$identity" != "$EXPECTED_LOCK" ]; then
-      echo "error: lifecycle Lease '$LOCK' is absent or has foreign ownership after create conflict" >&2
-      exit 2
-    fi
-    if ! kube wait --for=delete "lease/$LOCK" --timeout=30s >/dev/null; then
-      echo "error: lifecycle operation '$holder' still holds Lease '$LOCK' after 30s" >&2
-      exit 3
-    fi
-    if ! render_lock | kube create -f - >/dev/null; then
-      echo "error: lifecycle Lease '$LOCK' changed during bounded acquisition" >&2
-      exit 3
-    fi
-  fi
-  record=$(lock_record)
-  identity=$(printf '%s' "$record" | cut -f1-4)
-  holder=$(printf '%s' "$record" | cut -f5)
-  LOCK_UID=$(printf '%s' "$record" | cut -f6)
-  if [ "$identity" != "$EXPECTED_LOCK" ] || [ "$holder" != "$OPERATION_ID" ] || [ -z "$LOCK_UID" ]; then
-    LOCK_UID=
-    echo "error: lifecycle Lease '$LOCK' did not verify after acquisition" >&2
-    exit 2
-  fi
-}
-
-trap release_lock EXIT
+trap finish_lifecycle EXIT
+trap lock_renewal_failed TERM
 
 cleanup_new_owned_pod() {
   local expected_uid=${1:-} after current identity after_operation after_uid
@@ -223,14 +214,24 @@ create_and_wait() {
     pvc_before=$(require_owned_pvc_or_absent)
   fi
   pvc_current=$(require_owned_pvc_or_absent)
-  if [ -z "$pvc_before" ] || [ "$pvc_current" != "$pvc_before" ]; then
-    echo "error: PVC identity or resourceVersion changed before Pod creation" >&2
+  if [ -z "$pvc_before" ] || [ -z "$pvc_current" ]; then
+    echo "error: PVC identity disappeared before Pod creation" >&2
     exit 2
   fi
   pvc_uid=$(printf '%s' "$pvc_before" | cut -f9)
   pvc_rv=$(printf '%s' "$pvc_before" | cut -f10)
   if [ -z "$pvc_uid" ] || [ -z "$pvc_rv" ]; then
     echo "error: Pod creation requires exact PVC UID and resourceVersion evidence" >&2
+    exit 2
+  fi
+  if [ "$(printf '%s' "$pvc_current" | cut -f9)" != "$pvc_uid" ]; then
+    echo "error: PVC UID changed before Pod creation" >&2
+    exit 2
+  fi
+  invalidate_checkpoint_evidence
+  pvc_current=$(require_owned_pvc_or_absent)
+  if [ -z "$pvc_current" ] || [ "$(printf '%s' "$pvc_current" | cut -f9)" != "$pvc_uid" ]; then
+    echo "error: PVC UID changed while activating the writer" >&2
     exit 2
   fi
   if ! render_pod | kube create -f - >/dev/null; then
@@ -249,6 +250,12 @@ create_and_wait() {
   if [ -z "$pod_uid" ] || [ -z "$pod_rv" ]; then
     echo "error: created Pod lacks exact UID or resourceVersion evidence" >&2
     exit 1
+  fi
+  pvc_current=$(require_owned_pvc_or_absent)
+  if [ -z "$pvc_current" ] || [ "$(printf '%s' "$pvc_current" | cut -f9)" != "$pvc_uid" ]; then
+    cleanup_new_owned_pod "$pod_uid"
+    echo "error: PVC UID changed after Pod creation; replacement claim retained" >&2
+    exit 3
   fi
   if ! kube wait --for=condition=Ready "pod/$POD" --timeout=180s; then
     cleanup_new_owned_pod "$pod_uid"
@@ -306,21 +313,21 @@ stop_owned_pod() {
 invalidate_checkpoint_evidence() {
   local pvc uid rv patch
   pvc=$(require_owned_pvc_or_absent)
-  [ -n "$pvc" ] || return
+  [ -n "$pvc" ] || return 0
   uid=$(printf '%s' "$pvc" | cut -f9)
   rv=$(printf '%s' "$pvc" | cut -f10)
   if [ -z "$uid" ] || [ -z "$rv" ]; then
     echo "error: checkpoint invalidation requires exact PVC UID and resourceVersion evidence" >&2
     exit 2
   fi
-  patch=$(printf '{"metadata":{"uid":"%s","resourceVersion":"%s","annotations":{"agent-os.dev/checkpoint-state":"pending","agent-os.dev/checkpoint-at":null,"agent-os.dev/quiesced-operation":null,"agent-os.dev/checkpoint-operation":null}}}' "$uid" "$rv")
+  patch=$(printf '{"metadata":{"uid":"%s","resourceVersion":"%s","annotations":{"agent-os.dev/checkpoint-state":"pending","agent-os.dev/writer-state":"active","agent-os.dev/checkpoint-at":null,"agent-os.dev/quiesced-operation":null,"agent-os.dev/checkpoint-operation":null}}}' "$uid" "$rv")
   kube patch pvc "$PVC" --type=merge -p "$patch" >/dev/null
 }
 
 record_quiesced_generation() {
   local pvc uid rv patch
   pvc=$(require_owned_pvc_or_absent)
-  [ -n "$pvc" ] || return
+  [ -n "$pvc" ] || return 0
   if [ "$(printf '%s' "$pvc" | cut -f5)" != pending ]; then
     echo "error: checkpoint evidence changed before quiesced generation could be recorded" >&2
     exit 2
@@ -331,7 +338,7 @@ record_quiesced_generation() {
     echo "error: quiesced generation requires exact PVC UID and resourceVersion evidence" >&2
     exit 2
   fi
-  patch=$(printf '{"metadata":{"uid":"%s","resourceVersion":"%s","annotations":{"agent-os.dev/quiesced-operation":"%s"}}}' "$uid" "$rv" "$OPERATION_ID")
+  patch=$(printf '{"metadata":{"uid":"%s","resourceVersion":"%s","annotations":{"agent-os.dev/writer-state":"quiesced","agent-os.dev/quiesced-operation":"%s"}}}' "$uid" "$rv" "$OPERATION_ID")
   kube patch pvc "$PVC" --type=merge -p "$patch" >/dev/null
 }
 

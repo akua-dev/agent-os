@@ -72,7 +72,7 @@ namespaceRbacResources = [
             {
                 apiGroups = ["coordination.k8s.io"]
                 resources = ["leases"]
-                verbs = ["get", "list", "watch", "create", "delete"]
+                verbs = ["get", "create", "update", "delete"]
             },
         ]
     },
