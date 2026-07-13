@@ -23,6 +23,7 @@ Set `rbac: cluster-admin` only for an isolated intelligence cluster after a revi
 
 With `createNamespace: true`, the lifecycle helper creates an absent namespace with the package's exact installation identity and refuses to adopt an existing unowned namespace.
 With `createNamespace: false`, the namespace must already exist without Agent OS ownership metadata, and the lifecycle helper never deletes it.
+Every rendered namespaced resource carries the exact installation identity so lifecycle operations refuse foreign same-name resources before apply or deletion.
 
 The package carries no credential value or Secret reference.
 Any runtime credential is a separately created namespace-local Kubernetes Secret, referenced by the runtime helper only after its owner has approved that authority.

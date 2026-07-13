@@ -98,6 +98,47 @@ assert_grep 'https://github.com/akua-dev/akua/tree/v0.8.25' "$ROOT/THIRD_PARTY_N
   "Akua's exact source must be named"
 assert_grep 'https://github.com/derailed/k9s/tree/v0.51.0' "$ROOT/THIRD_PARTY_NOTICES.md" \
   "K9s's exact source must be named"
+assert_grep '1f328c5e9dd683d0c5e69f3d7d58f8371278dec2/LICENSE' "$ROOT/Dockerfile" \
+  "the image must bundle kubectl's license from the immutable Kubernetes source commit"
+assert_grep 'b300f2ec7ec9dc9addc39b2ad88c54097ded7ca0/LICENSE' "$ROOT/Dockerfile" \
+  "the image must bundle GitHub CLI's license from its immutable source commit"
+assert_grep '0d9b296af33f2b851fcbf4df3e9ec89751734ba4/LICENSE.md' "$ROOT/Dockerfile" \
+  "the image must bundle Bun's complete license from its immutable source commit"
+assert_grep '68fa3d2556542add76bf80255787b8625a5041a6/LICENSE' "$ROOT/Dockerfile" \
+  "the image must bundle Treehouse's license from its immutable source commit"
+assert_grep 'dc5a80059d3c0f1abbf28f20f43d994b8399bee6/LICENSE' "$ROOT/Dockerfile" \
+  "the image must bundle no-mistakes' license from its immutable source commit"
+assert_grep '/usr/share/licenses/kubectl/LICENSE' "$ROOT/Dockerfile" \
+  "kubectl's license must be installed in the image license bundle"
+assert_grep '/usr/share/licenses/gh/LICENSE' "$ROOT/Dockerfile" \
+  "GitHub CLI's license must be installed in the image license bundle"
+assert_grep '/usr/share/licenses/bun/LICENSE.md' "$ROOT/Dockerfile" \
+  "Bun's complete license must be installed in the image license bundle"
+assert_grep '/usr/share/licenses/treehouse/LICENSE' "$ROOT/Dockerfile" \
+  "Treehouse's license must be installed in the image license bundle"
+assert_grep '/usr/share/licenses/no-mistakes/LICENSE' "$ROOT/Dockerfile" \
+  "no-mistakes' license must be installed in the image license bundle"
+assert_grep '## kubectl' "$ROOT/THIRD_PARTY_NOTICES.md" "third-party notices must cover kubectl"
+assert_grep '## GitHub CLI' "$ROOT/THIRD_PARTY_NOTICES.md" "third-party notices must cover GitHub CLI"
+assert_grep '## Bun' "$ROOT/THIRD_PARTY_NOTICES.md" "third-party notices must cover Bun"
+assert_grep '## Treehouse' "$ROOT/THIRD_PARTY_NOTICES.md" "third-party notices must cover Treehouse"
+assert_grep '## no-mistakes' "$ROOT/THIRD_PARTY_NOTICES.md" "third-party notices must cover no-mistakes"
+assert_grep 'actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10' "$ROOT/.github/workflows/ci.yml" \
+  "CI checkout actions must be pinned to the reviewed full SHA"
+assert_grep 'oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6' "$ROOT/.github/workflows/ci.yml" \
+  "CI must pin Bun setup to a reviewed full SHA"
+assert_grep 'bun-version-file: tools/agent-os/.bun-version' "$ROOT/.github/workflows/ci.yml" \
+  "CI must use the repository-pinned Bun version"
+assert_grep 'bun run check' "$ROOT/.github/workflows/ci.yml" \
+  "CI behavior tests must execute the Agent OS tool check"
+assert_grep "mkdir -p \"\$RUNNER_TEMP/bin\"" "$ROOT/.github/workflows/ci.yml" \
+  "CI must create its local verified-tool destination before install"
+assert_grep 'bc57afbffe7e18aacd2146e2cd67151c56e7a3c279fe659312ff7ffb359cd03a' "$ROOT/.github/workflows/ci.yml" \
+  "CI must authenticate the x86_64 Akua release artifact"
+assert_grep '3a3c6bae72764cbd85a6e4e0877a05e5def8f7aeee8563b7918099214a1a313a' "$ROOT/.github/workflows/ci.yml" \
+  "CI must authenticate the aarch64 Akua release artifact"
+assert_no_grep 'https://cli.akua.dev/install' "$ROOT/.github/workflows/ci.yml" \
+  "CI must not execute the mutable remote Akua installer"
 assert_grep 'ghcr.io/akua-dev/agent-os' "$ROOT/.github/workflows/agent-os-image.yml" \
   "release workflow must publish the image expected by the portable package"
 assert_grep 'linux/amd64,linux/arm64' "$ROOT/.github/workflows/agent-os-image.yml" \

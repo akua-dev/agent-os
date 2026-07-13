@@ -47,7 +47,10 @@ RUN set -eu; \
   esac; \
   curl -fsSL "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" -o /usr/local/bin/kubectl; \
   echo "$sha  /usr/local/bin/kubectl" | sha256sum -c -; \
-  chmod 0755 /usr/local/bin/kubectl
+  chmod 0755 /usr/local/bin/kubectl; \
+  mkdir -p /usr/share/licenses/kubectl; \
+  curl -fsSL "https://raw.githubusercontent.com/kubernetes/kubernetes/1f328c5e9dd683d0c5e69f3d7d58f8371278dec2/LICENSE" -o /usr/share/licenses/kubectl/LICENSE; \
+  echo "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30  /usr/share/licenses/kubectl/LICENSE" | sha256sum -c -
 
 RUN set -eu; \
   case "$TARGETARCH" in \
@@ -60,6 +63,9 @@ RUN set -eu; \
   echo "$sha  /tmp/${asset}" | sha256sum -c -; \
   tar -xzf "/tmp/${asset}" -C /tmp; \
   install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${TARGETARCH}/bin/gh" /usr/local/bin/gh; \
+  mkdir -p /usr/share/licenses/gh; \
+  curl -fsSL "https://raw.githubusercontent.com/cli/cli/b300f2ec7ec9dc9addc39b2ad88c54097ded7ca0/LICENSE" -o /usr/share/licenses/gh/LICENSE; \
+  echo "6da4adc42392c8485e40b4251c7e332fc3352df1947c9ffade71dd60b14a7a4f  /usr/share/licenses/gh/LICENSE" | sha256sum -c -; \
   rm -rf "/tmp/${asset}" "/tmp/gh_${GH_VERSION}_linux_${TARGETARCH}"
 
 RUN set -eu; \
@@ -77,6 +83,11 @@ RUN set -eu; \
   echo "$no_mistakes_sha  /tmp/${no_mistakes_asset}" | sha256sum -c -; \
   tar -xzf "/tmp/${no_mistakes_asset}" -C /usr/local/bin; \
   chmod 0755 /usr/local/bin/treehouse /usr/local/bin/no-mistakes; \
+  mkdir -p /usr/share/licenses/treehouse /usr/share/licenses/no-mistakes; \
+  curl -fsSL "https://raw.githubusercontent.com/kunchenguid/treehouse/68fa3d2556542add76bf80255787b8625a5041a6/LICENSE" -o /usr/share/licenses/treehouse/LICENSE; \
+  echo "1b962d20f826f6a758c737f8aa4e8e76dc719b8aa78fcfacdfb46681bb36c2f4  /usr/share/licenses/treehouse/LICENSE" | sha256sum -c -; \
+  curl -fsSL "https://raw.githubusercontent.com/kunchenguid/no-mistakes/dc5a80059d3c0f1abbf28f20f43d994b8399bee6/LICENSE" -o /usr/share/licenses/no-mistakes/LICENSE; \
+  echo "945016bd37e1ba7211622ef60ee1d23ab727896ba7710edd21e8fbe983863969  /usr/share/licenses/no-mistakes/LICENSE" | sha256sum -c -; \
   rm -f "/tmp/${treehouse_asset}" "/tmp/${no_mistakes_asset}"
 
 RUN set -eu; \
@@ -90,6 +101,9 @@ RUN set -eu; \
   echo "$sha  /tmp/${asset}" | sha256sum -c -; \
   unzip -q "/tmp/${asset}" -d /tmp/bun; \
   install -m 0755 "/tmp/bun/bun-linux-${bun_arch}/bun" /usr/local/bin/bun; \
+  mkdir -p /usr/share/licenses/bun; \
+  curl -fsSL "https://raw.githubusercontent.com/oven-sh/bun/0d9b296af33f2b851fcbf4df3e9ec89751734ba4/LICENSE.md" -o /usr/share/licenses/bun/LICENSE.md; \
+  echo "2c6160ec8fb853f7e8f97d9b249e756c9b0ac44860a68b6bf4f1b0bcbc5c3741  /usr/share/licenses/bun/LICENSE.md" | sha256sum -c -; \
   rm -rf "/tmp/${asset}" /tmp/bun
 
 RUN set -eu; \

@@ -103,6 +103,12 @@ assert_contains "$rendered" 'app.kubernetes.io/managed-by: agent-os' \
   "rendered resources must carry the Agent OS ownership label"
 assert_contains "$rendered" 'agent-os.dev/installation-id: agent-os-firstmate:portable-agent-os' \
   "rendered resources must carry the exact installation identity"
+for resource_file in "$OUT"/*.yaml; do
+  assert_grep 'app.kubernetes.io/managed-by: agent-os' "$resource_file" \
+    "every rendered resource must carry the Agent OS ownership label"
+  assert_grep 'agent-os.dev/installation-id: agent-os-firstmate:portable-agent-os' "$resource_file" \
+    "every rendered resource must carry the exact installation identity"
+done
 assert_contains "$statefulset_rendered" 'agent-os.dev/rbac-mode: namespace' \
   "the rendered StatefulSet must record its RBAC mode"
 assert_not_contains "$rendered" 'kind: ClusterRoleBinding' \
@@ -140,6 +146,7 @@ pass "the portable package rejects mutable image tags"
 for invalid_image in \
   'ghcr.io/akua-dev/agent-os@sha256:abc' \
   'ghcr.io/akua-dev/agent-os@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaextra' \
+  'invalid@@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
   'prefix@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:suffix'; do
   invalid_inputs="$TMP/invalid-$(printf '%s' "$invalid_image" | tr '/:@' '---').yaml"
   sed "s|^image: .*|image: $invalid_image|" "$INPUTS" > "$invalid_inputs"

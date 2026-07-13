@@ -12,6 +12,13 @@ IMAGE_IS_OVERRIDE=
 COMMAND=${1:-}
 PROFILE="$ROOT/deploy/orbstack/inputs.yaml"
 
+case "$NAMESPACE" in
+  ''|*[!a-z0-9.-]*|[.-]*|*[-.])
+    echo "error: AGENT_OS_NAMESPACE must be a valid Kubernetes namespace" >&2
+    exit 2
+    ;;
+esac
+
 if [ "$CONTEXT" != orbstack ] && [ "${AGENT_OS_ALLOW_NON_ORBSTACK:-0}" != 1 ]; then
   echo "error: refusing Kubernetes context '$CONTEXT'; set AGENT_OS_ALLOW_NON_ORBSTACK=1 to opt in" >&2
   exit 2
@@ -24,12 +31,20 @@ local_image_tag() {
 }
 
 render_profile() {
-  local image=$1 inputs
+  local image=$1 inputs lifecycle
   inputs=$(mktemp)
   trap 'rm -f "$inputs"' RETURN
-  sed "s|^image: .*|image: $image|" "$PROFILE" > "$inputs"
+  awk -v image="$image" -v namespace="$NAMESPACE" '
+    $1 == "image:" { print "image: " image; next }
+    $1 == "namespace:" { print "namespace: " namespace; next }
+    { print }
+  ' "$PROFILE" > "$inputs"
+  lifecycle=install
+  if [ -n "$(kubectl --context "$CONTEXT" -n "$NAMESPACE" get statefulset agent-os-firstmate --ignore-not-found -o name)" ]; then
+    lifecycle=upgrade
+  fi
   AGENT_OS_CONTEXT="$CONTEXT" AGENT_OS_NAMESPACE="$NAMESPACE" AGENT_OS_INPUTS="$inputs" \
-    "$ROOT/bin/agent-os-kubernetes.sh" install
+    "$ROOT/bin/agent-os-kubernetes.sh" "$lifecycle"
 }
 
 cd "$ROOT"

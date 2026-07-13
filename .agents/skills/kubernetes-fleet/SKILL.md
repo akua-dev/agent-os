@@ -22,18 +22,27 @@ Load this skill only when the current firstmate is running in Kubernetes or is e
 - Create or select a namespace-local Kubernetes Secret only after its AI authority is explicitly authorized.
 - The Secret must contain the selected provider's `auth.json` key and must be provisioned independently instead of cloning or sharing the primary credential.
 - Pass only its name through `AGENT_OS_AI_SECRET` when invoking `bin/agent-os-crewmate.sh create <id>`.
-- The helper never reads or discovers the Secret, and the default Role intentionally has no Secret-read permission.
-- Kubernetes mounts the selected `auth.json` read-only into the child; a missing Secret or key keeps the Pod unready, makes create fail, removes the non-running Pod, and retains the PVC for an authorized retry.
+- The helper never reads or discovers the Secret value, and the default Role intentionally has no Secret-read permission.
+- Kubernetes projects only the selected `auth.json` key into a read-only authorization directory; a missing Secret or key keeps the Pod unready, makes create fail, removes the non-running Pod, and retains the PVC for an authorized retry.
 - Probe the selected model route before launching work; when quota is unavailable, use another explicitly granted provider or report the capacity blocker instead of repeatedly spawning agents.
 - Give every launched Herdr agent a task-unique name, close only a confirmed dead restored pane before reuse, and never replace a live agent.
 - Grade completion by the promised artifact or delivered Git state; Herdr `idle` alone is not a completion signal.
 - Use `bin/agent-os-crewmate.sh create <id>` to create a separate Pod and persistent home.
-- Use `status` to inspect it and `delete` only after unique work is checkpointed or delivered.
+- Use `status` to inspect it, `stop` to remove only the Pod, and `restart` to replace only the Pod on its retained PVC.
+- The ambiguous `delete` command is rejected.
+- `purge <id> --yes` is the only operation that destroys a persistent home.
+- Before purge, independently checkpoint or deliver unique work, then annotate the owned PVC with `agent-os.dev/checkpoint-state=clean` and a non-secret RFC3339 `agent-os.dev/checkpoint-at` value.
+- Purge verifies exact installation and crewmate ownership, displays the target, requires its own confirmation, and records requested and completed phases in `AGENT_OS_PURGE_EVIDENCE_FILE` or `$FM_HOME/data/crewmate-purge-evidence.log`.
+- Purge evidence contains only time, namespace, crewmate ID, resource names, phase, and checkpoint time.
 - Never mount the primary home into a child Pod.
 - The demo child receives no Kubernetes ServiceAccount token by default.
 - A Pod with an authorized ServiceAccount gets a token-file-backed `in-cluster` kubeconfig automatically, so Firstmate does not need to copy a bearer token into a temporary kubeconfig.
 - The OrbStack primary's cluster-admin binding is a local-demo trust decision, not a production-safe default.
 - Pin an explicit host context for host-side `kubectl`; inside an authorized Pod use the generated `in-cluster` context.
+
+For normal credential rotation, update the explicitly authorized namespace-local Secret, restart the owned Pod with the same PVC, prove a bounded request uses the replacement credential, and revoke the old credential only after that proof succeeds.
+For urgent revocation, stop the owned Pod first, revoke the old credential, update or select the approved replacement Secret, and restart only when that replacement is ready.
+Never print, copy, persist, or place credential values in command arguments or evidence during either flow.
 
 Use ordinary `kubectl exec`, Herdr, files, and Git to supervise the child.
 Do not add a custom inter-agent chat protocol or Task/Run service.

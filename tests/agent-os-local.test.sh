@@ -32,7 +32,34 @@ if [ "${1:-}" = image ] && [ "${2:-}" = inspect ]; then
 fi
 SH
 chmod +x "$FAKEBIN/docker"
-make_fake kubectl
+cat > "$FAKEBIN/kubectl" <<'SH'
+#!/usr/bin/env bash
+printf 'kubectl' >> "$AGENT_OS_TEST_LOG"
+printf ' %s' "$@" >> "$AGENT_OS_TEST_LOG"
+printf '\n' >> "$AGENT_OS_TEST_LOG"
+namespace=${AGENT_OS_NAMESPACE:-agent-os-demo}
+if [[ " $* " = *" get statefulset agent-os-firstmate --ignore-not-found -o name "* ]] && \
+  [ "${AGENT_OS_TEST_LOCAL_WORKLOAD:-absent}" = present ]; then
+  printf 'statefulset.apps/agent-os-firstmate\n'
+fi
+if [[ " $* " = *" get namespace "*" --ignore-not-found -o name "* ]] && \
+  [ "${AGENT_OS_TEST_LOCAL_WORKLOAD:-absent}" = present ]; then
+  printf 'namespace/%s\n' "$namespace"
+fi
+if [[ " $* " = *" get namespace "*" -o jsonpath="* ]] && \
+  [ "${AGENT_OS_TEST_LOCAL_WORKLOAD:-absent}" = present ]; then
+  printf 'agent-os\tagent-os-firstmate:%s' "$namespace"
+fi
+if [[ " $* " = *" get statefulset agent-os-firstmate --ignore-not-found -o jsonpath="* ]] && \
+  [ "${AGENT_OS_TEST_LOCAL_WORKLOAD:-absent}" = present ]; then
+  printf 'agent-os-firstmate\tcluster-admin\t\tagent-os\tagent-os-firstmate:%s' "$namespace"
+fi
+if [[ " $* " = *" get clusterrolebinding agent-os-firstmate-"*" --ignore-not-found -o jsonpath="* ]] && \
+  [ "${AGENT_OS_TEST_LOCAL_WORKLOAD:-absent}" = present ]; then
+  printf 'agent-os-firstmate-%s\tagent-os\tagent-os-firstmate:%s' "$namespace" "$namespace"
+fi
+SH
+chmod +x "$FAKEBIN/kubectl"
 make_fake orbctl
 cat > "$FAKEBIN/akua" <<'SH'
 #!/usr/bin/env bash
@@ -49,28 +76,38 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 printf 'akua-input-image %s\n' "$(awk '/^image:/{print $2}' "$inputs")" >> "$AGENT_OS_TEST_LOG"
+namespace=$(awk '/^namespace:/{print $2}' "$inputs")
+printf 'akua-input-namespace %s\n' "$namespace" >> "$AGENT_OS_TEST_LOG"
 mkdir -p "$out"
 cat > "$out/statefulset.yaml" <<YAML
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: agent-os-firstmate
-  namespace: agent-os-demo
-  annotations:
-    agent-os.dev/rbac-mode: cluster-admin
-YAML
-printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  namespace: agent-os-demo\n' > "$out/rendered.yaml"
-cat > "$out/namespace.yaml" <<'YAML'
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: agent-os-demo
+  namespace: $namespace
   labels:
     app.kubernetes.io/managed-by: agent-os
   annotations:
-    agent-os.dev/installation-id: agent-os-firstmate:agent-os-demo
+    agent-os.dev/installation-id: agent-os-firstmate:$namespace
+    agent-os.dev/rbac-mode: cluster-admin
 YAML
-printf 'apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\n' > "$out/clusterrolebinding.yaml"
+printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: agent-os-firstmate-state\n  namespace: %s\n' "$namespace" > "$out/rendered.yaml"
+cat > "$out/namespace.yaml" <<YAML
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: $namespace
+  labels:
+    app.kubernetes.io/managed-by: agent-os
+  annotations:
+    agent-os.dev/installation-id: agent-os-firstmate:$namespace
+YAML
+cat > "$out/clusterrolebinding.yaml" <<YAML
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agent-os-firstmate-$namespace
+YAML
 SH
 chmod +x "$FAKEBIN/akua"
 
@@ -123,6 +160,28 @@ test_rebuild_deploy_uses_a_new_immutable_local_tag() {
   pass "rebuild deploy renders the rebuilt local image instead of a stale mutable tag"
 }
 
+test_redeploy_upgrades_an_existing_local_installation() {
+  : > "$LOG"
+  AGENT_OS_TEST_LOCAL_WORKLOAD=present AGENT_OS_TEST_IMAGE_ID=sha256:redeploy run_cli deploy
+
+  assert_call 'kubectl --context orbstack -n agent-os-demo get statefulset agent-os-firstmate --ignore-not-found -o name' \
+    "redeploy must detect the existing local installation"
+  grep -Fq 'kubectl --context orbstack apply -f ' "$LOG" || \
+    fail "redeploy must upgrade the existing local installation"
+  pass "redeploy upgrades the content-addressed local installation"
+}
+
+test_namespace_override_updates_the_rendered_profile() {
+  : > "$LOG"
+  AGENT_OS_NAMESPACE=agent-os-custom run_cli deploy
+
+  assert_call 'akua-input-namespace agent-os-custom' \
+    "namespace override must update the canonical profile inputs"
+  grep -Fq 'kubectl --context orbstack -n agent-os-custom' "$LOG" || \
+    fail "namespace override must target the same rendered namespace"
+  pass "namespace override stays consistent with package rendering"
+}
+
 test_explicit_image_override_is_used_without_retagging() {
   : > "$LOG"
   AGENT_OS_IMAGE=example.test/agent-os:custom run_cli build
@@ -162,7 +221,7 @@ test_destroy_requires_exact_confirmation() {
   cleanup_out=$(run_cli destroy --yes 2>&1) || cleanup_rc=$?
   [ "$cleanup_rc" -eq 3 ] || \
     fail "cluster-admin demo destroy must stop for separate privileged cleanup, got $cleanup_rc: $cleanup_out"
-  grep -Fq 'kubectl --context orbstack delete --ignore-not-found -f ' "$LOG" || \
+  grep -Fq 'kubectl --context orbstack delete --ignore-not-found --wait=true -f ' "$LOG" || \
     fail "confirmed destroy must delete only resources from the rendered OrbStack profile"
   if grep -E 'kubectl .* (get|delete) clusterrolebinding' "$LOG" >/dev/null; then
     fail "routine demo destroy must not inspect or delete cluster-scoped RBAC"
@@ -189,6 +248,8 @@ test_non_orbstack_context_is_fail_closed() {
 test_status_pins_context_and_namespace
 test_deploy_starts_local_kubernetes_and_renders_the_orbstack_profile
 test_rebuild_deploy_uses_a_new_immutable_local_tag
+test_redeploy_upgrades_an_existing_local_installation
+test_namespace_override_updates_the_rendered_profile
 test_explicit_image_override_is_used_without_retagging
 test_empty_image_override_uses_content_addressed_default
 test_destroy_requires_exact_confirmation

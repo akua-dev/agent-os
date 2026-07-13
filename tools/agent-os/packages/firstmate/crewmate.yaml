@@ -6,7 +6,11 @@ metadata:
   labels:
     app.kubernetes.io/name: agent-os
     app.kubernetes.io/component: crewmate
+    app.kubernetes.io/managed-by: agent-os
     agent-os.dev/crewmate: __AGENT_OS_CREWMATE_ID__
+  annotations:
+    agent-os.dev/installation-id: agent-os-firstmate:__AGENT_OS_NAMESPACE__
+    agent-os.dev/checkpoint-state: pending
 spec:
   accessModes:
     - ReadWriteOnce
@@ -22,7 +26,10 @@ metadata:
   labels:
     app.kubernetes.io/name: agent-os
     app.kubernetes.io/component: crewmate
+    app.kubernetes.io/managed-by: agent-os
     agent-os.dev/crewmate: __AGENT_OS_CREWMATE_ID__
+  annotations:
+    agent-os.dev/installation-id: agent-os-firstmate:__AGENT_OS_NAMESPACE__
 spec:
   automountServiceAccountToken: false
   securityContext:
@@ -69,14 +76,19 @@ spec:
           mountPath: /usr/local
           subPath: usr-local
         - name: ai-auth
-          mountPath: /home/agent/.pi/agent/auth.json
-          subPath: auth.json
+          mountPath: /home/agent/.pi/agent
           readOnly: true
   volumes:
     - name: home
       persistentVolumeClaim:
         claimName: agent-os-crewmate-__AGENT_OS_CREWMATE_ID__-home
     - name: ai-auth
-      secret:
-        secretName: __AGENT_OS_AI_SECRET__
+      projected:
         defaultMode: 256
+        sources:
+          - secret:
+              name: __AGENT_OS_AI_SECRET__
+              optional: false
+              items:
+                - key: auth.json
+                  path: auth.json

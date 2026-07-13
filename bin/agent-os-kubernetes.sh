@@ -123,10 +123,72 @@ require_namespace_contract() {
 workload_state() {
   "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get statefulset agent-os-firstmate \
     --ignore-not-found \
-    -o 'jsonpath={.metadata.name}{"\t"}{.metadata.annotations.agent-os\.dev/rbac-mode}{"\t"}{.metadata.annotations.agent-os\.dev/cluster-rbac-cleanup}'
+    -o 'jsonpath={.metadata.name}{"\t"}{.metadata.annotations.agent-os\.dev/rbac-mode}{"\t"}{.metadata.annotations.agent-os\.dev/cluster-rbac-cleanup}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}'
+}
+
+require_workload_owned() {
+  local state=$1 required=${2:-required} identity
+  if [ -z "$state" ]; then
+    if [ "$required" = required ]; then
+      echo "error: agent-os-firstmate does not exist" >&2
+      exit 2
+    fi
+    return
+  fi
+  identity=$(printf '%s' "$state" | cut -f1,4,5)
+  if [ "$identity" != "agent-os-firstmate"$'\t'"agent-os"$'\t'"$INSTALLATION_ID" ]; then
+    echo "error: StatefulSet 'agent-os-firstmate' does not have the exact installation identity" >&2
+    exit 2
+  fi
+}
+
+rendered_resource_field() {
+  local file=$1 field=$2
+  awk -v field="$field" '$1 == field ":" { print $2; exit }' "$file"
+}
+
+live_resource_identity() {
+  local kind=$1 name=$2
+  "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get "$kind" "$name" --ignore-not-found \
+    -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}'
+}
+
+require_namespaced_resource_owned_or_absent() {
+  local kind=$1 name=$2 identity expected
+  identity=$(live_resource_identity "$kind" "$name")
+  expected="$name"$'\t'"agent-os"$'\t'"$INSTALLATION_ID"
+  if [ -n "$identity" ] && [ "$identity" != "$expected" ]; then
+    echo "error: $kind '$name' does not have the exact Agent OS installation identity" >&2
+    exit 2
+  fi
+}
+
+preflight_rendered_resources() {
+  local include_cluster=${1:-0} file kind name identity binding
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    kind=$(rendered_resource_field "$file" kind)
+    name=$(rendered_resource_field "$file" name)
+    case "$kind" in
+      Namespace) ;;
+      ClusterRoleBinding)
+        [ "$include_cluster" -eq 1 ] || continue
+        identity=$("$KUBECTL" --context "$CONTEXT" get clusterrolebinding "$name" --ignore-not-found \
+          -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}')
+        binding="$name"$'\t'"agent-os"$'\t'"$INSTALLATION_ID"
+        if [ -n "$identity" ] && [ "$identity" != "$binding" ]; then
+          echo "error: ClusterRoleBinding '$name' does not have the exact Agent OS installation identity" >&2
+          exit 2
+        fi
+        ;;
+      *) require_namespaced_resource_owned_or_absent "$kind" "$name" ;;
+    esac
+  done < <(find "$OUT" -type f -name '*.yaml' -print)
 }
 
 delete_namespace_rbac() {
+  require_namespaced_resource_owned_or_absent RoleBinding agent-os-firstmate-runtime
+  require_namespaced_resource_owned_or_absent Role agent-os-firstmate-runtime
   "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" delete rolebinding agent-os-firstmate-runtime --ignore-not-found
   "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" delete role agent-os-firstmate-runtime --ignore-not-found
 }
@@ -137,14 +199,24 @@ apply_rendered() {
 }
 
 verify_desired_rbac() {
-  local role_name binding_identity expected_identity
+  local role_json binding_json
   if [ "$DESIRED_RBAC" = namespace ]; then
-    role_name=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get role agent-os-firstmate-runtime \
-      -o 'jsonpath={.metadata.name}')
-    binding_identity=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get rolebinding agent-os-firstmate-runtime \
-      -o 'jsonpath={.roleRef.kind}{"\t"}{.roleRef.name}{"\t"}{.subjects[0].kind}{"\t"}{.subjects[0].name}{"\t"}{.subjects[0].namespace}')
-    expected_identity="Role"$'\t'"agent-os-firstmate-runtime"$'\t'"ServiceAccount"$'\t'"agent-os-firstmate"$'\t'"$NAMESPACE"
-    if [ "$role_name" != agent-os-firstmate-runtime ] || [ "$binding_identity" != "$expected_identity" ]; then
+    if ! command -v jq >/dev/null 2>&1; then
+      echo "error: jq is required to verify namespace RBAC exactly" >&2
+      exit 2
+    fi
+    role_json=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get role agent-os-firstmate-runtime -o json)
+    binding_json=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get rolebinding agent-os-firstmate-runtime -o json)
+    if ! printf '%s' "$role_json" | jq -e '
+      .metadata.name == "agent-os-firstmate-runtime" and
+      .rules == [
+        {"apiGroups":[""],"resources":["pods","persistentvolumeclaims"],"verbs":["get","list","watch","create","delete","patch"]},
+        {"apiGroups":[""],"resources":["pods/log","pods/exec"],"verbs":["get","list","watch","create","delete"]},
+        {"apiGroups":["apps"],"resources":["statefulsets"],"verbs":["get","list","watch"]}
+      ]' >/dev/null ||
+      ! printf '%s' "$binding_json" | jq -e --arg namespace "$NAMESPACE" '
+        .roleRef == {"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"agent-os-firstmate-runtime"} and
+        .subjects == [{"kind":"ServiceAccount","name":"agent-os-firstmate","namespace":$namespace}]' >/dev/null; then
       echo "error: desired namespace RBAC did not verify after apply" >&2
       exit 2
     fi
@@ -161,17 +233,25 @@ report_cluster_cleanup() {
   echo "required evidence: clusterrolebinding/agent-os-firstmate-$NAMESPACE absent" >&2
 }
 
-delete_rendered_namespaced_resources() {
-  local files file kind
-  files=$(find "$OUT" -type f -name '*.yaml' -print)
+delete_rendered_kind() {
+  local desired_kind=$1 file kind
   while IFS= read -r file; do
     [ -n "$file" ] || continue
-    kind=$(awk '$1 == "kind:" { print $2; exit }' "$file")
-    case "$kind" in
-      Namespace|ClusterRoleBinding) ;;
-      *) "$KUBECTL" --context "$CONTEXT" delete --ignore-not-found -f "$file" ;;
-    esac
-  done <<< "$files"
+    kind=$(rendered_resource_field "$file" kind)
+    if [ "$kind" = "$desired_kind" ]; then
+      "$KUBECTL" --context "$CONTEXT" delete --ignore-not-found --wait=true -f "$file"
+    fi
+  done < <(find "$OUT" -type f -name '*.yaml' -print)
+}
+
+delete_rendered_namespaced_resources() {
+  local kind
+  delete_rendered_kind StatefulSet
+  "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" wait --for=delete pod/agent-os-firstmate-0 --timeout=180s
+  for kind in Service RoleBinding Role ServiceAccount; do
+    delete_rendered_kind "$kind"
+  done
+  delete_rendered_kind PersistentVolumeClaim
 }
 
 namespace_is_empty() {
@@ -183,7 +263,7 @@ namespace_is_empty() {
   while IFS= read -r resource; do
     [ -n "$resource" ] || continue
     case "$resource" in
-      events|events.events.k8s.io|leases.coordination.k8s.io) continue ;;
+      events|events.events.k8s.io) continue ;;
     esac
     if ! objects=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get "$resource" -o name); then
       echo "error: could not inventory '$resource' in namespace '$NAMESPACE'" >&2
@@ -225,7 +305,7 @@ delete_owned_empty_namespace() {
 }
 
 cleanup_cluster_rbac() {
-  local binding identity workload
+  local binding identity workload mode cleanup_marker
   binding="agent-os-firstmate-$NAMESPACE"
   identity=$("$KUBECTL" --context "$CONTEXT" get clusterrolebinding "$binding" --ignore-not-found \
     -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}')
@@ -234,12 +314,26 @@ cleanup_cluster_rbac() {
     exit 2
   fi
   if [ -n "$identity" ]; then
+    workload=
+    if [ -n "$(namespace_name)" ]; then
+      workload=$(workload_state)
+      require_workload_owned "$workload" optional
+    fi
+    if [ -n "$workload" ]; then
+      mode=$(printf '%s' "$workload" | cut -f2)
+      cleanup_marker=$(printf '%s' "$workload" | cut -f3)
+      if [ "$mode" = cluster-admin ] || [ "$cleanup_marker" != required ]; then
+        echo "error: ClusterRoleBinding '$binding' is not proven stale by the workload cleanup marker" >&2
+        exit 2
+      fi
+    fi
     "$KUBECTL" --context "$CONTEXT" delete clusterrolebinding "$binding"
     "$KUBECTL" --context "$CONTEXT" wait --for=delete "clusterrolebinding/$binding" --timeout=60s
   fi
   if [ -n "$(namespace_name)" ]; then
     workload=$(workload_state)
-    if [ -n "$workload" ]; then
+    require_workload_owned "$workload" optional
+    if [ -n "$workload" ] && [ "$(printf '%s' "$workload" | cut -f3)" = required ]; then
       "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" annotate statefulset agent-os-firstmate \
         agent-os.dev/cluster-rbac-cleanup- >/dev/null
     fi
@@ -252,7 +346,10 @@ case "$COMMAND" in
     [ "$CONFIRMED" -eq 0 ] && [ "$DELETE_NAMESPACE" -eq 0 ] || usage
     render
     require_namespace_contract
-    if [ -n "$(workload_state)" ]; then
+    preflight_rendered_resources 1
+    previous=$(workload_state)
+    require_workload_owned "$previous" optional
+    if [ -n "$previous" ]; then
       echo "error: agent-os-firstmate already exists; use upgrade" >&2
       exit 2
     fi
@@ -262,11 +359,13 @@ case "$COMMAND" in
     [ "$CONFIRMED" -eq 0 ] && [ "$DELETE_NAMESPACE" -eq 0 ] || usage
     render
     require_namespace_contract
+    preflight_rendered_resources 1
     previous=$(workload_state)
     if [ -z "$previous" ]; then
       echo "error: agent-os-firstmate does not exist; use install" >&2
       exit 2
     fi
+    require_workload_owned "$previous"
     previous_mode=$(printf '%s' "$previous" | cut -f2)
     previous_cleanup=$(printf '%s' "$previous" | cut -f3)
     cleanup_required=0
@@ -292,6 +391,10 @@ case "$COMMAND" in
     ;;
   rollback)
     [ "$CONFIRMED" -eq 0 ] && [ "$DELETE_NAMESPACE" -eq 0 ] || usage
+    render
+    require_namespace_contract
+    previous=$(workload_state)
+    require_workload_owned "$previous"
     "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" rollout undo statefulset/agent-os-firstmate
     "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" rollout status statefulset/agent-os-firstmate --timeout=180s
     ;;
@@ -306,7 +409,9 @@ case "$COMMAND" in
     fi
     render
     require_namespace_contract
+    preflight_rendered_resources
     previous=$(workload_state)
+    require_workload_owned "$previous" optional
     previous_mode=$(printf '%s' "$previous" | cut -f2)
     previous_cleanup=$(printf '%s' "$previous" | cut -f3)
     delete_rendered_namespaced_resources
@@ -315,7 +420,8 @@ case "$COMMAND" in
       delete_owned_empty_namespace
     fi
     if [ "$DESIRED_RBAC" = cluster-admin ] || [ "$previous_mode" = cluster-admin ] || \
-      [ "$previous_cleanup" = required ] || { [ -n "$previous" ] && [ -z "$previous_mode" ]; }; then
+      [ "$previous_cleanup" = required ] || [ -z "$previous" ] || \
+      { [ -n "$previous" ] && [ -z "$previous_mode" ]; }; then
       report_cluster_cleanup
       exit 3
     fi
