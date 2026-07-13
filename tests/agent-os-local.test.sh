@@ -22,11 +22,22 @@ SH
 }
 
 make_fake docker
+cat > "$FAKEBIN/docker" <<'SH'
+#!/usr/bin/env bash
+printf '%s' "$(basename "$0")" >> "$AGENT_OS_TEST_LOG"
+printf ' %s' "$@" >> "$AGENT_OS_TEST_LOG"
+printf '\n' >> "$AGENT_OS_TEST_LOG"
+if [ "${1:-}" = image ] && [ "${2:-}" = inspect ]; then
+  printf '%s\n' "${AGENT_OS_TEST_IMAGE_ID:?AGENT_OS_TEST_IMAGE_ID is required for image inspection}"
+fi
+SH
+chmod +x "$FAKEBIN/docker"
 make_fake kubectl
 make_fake orbctl
 
 run_cli() {
-  PATH="$FAKEBIN:$PATH" AGENT_OS_TEST_LOG="$LOG" "$CLI" "$@"
+  PATH="$FAKEBIN:$PATH" AGENT_OS_TEST_LOG="$LOG" \
+    AGENT_OS_TEST_IMAGE_ID="${AGENT_OS_TEST_IMAGE_ID:-sha256:default}" "$CLI" "$@"
 }
 
 assert_call() {
@@ -52,11 +63,33 @@ test_deploy_starts_local_kubernetes_and_applies_kustomize() {
   pass "deploy starts and targets only OrbStack"
 }
 
-test_build_uses_local_image_name() {
+test_rebuild_deploy_uses_a_new_immutable_local_tag() {
   : > "$LOG"
-  run_cli build
-  assert_call 'docker build -t agent-os:dev .' "build must use the local demo image tag"
-  pass "build uses the deterministic local image tag"
+  AGENT_OS_TEST_IMAGE_ID=sha256:stale run_cli build
+  AGENT_OS_TEST_IMAGE_ID=sha256:rebuilt run_cli build
+  AGENT_OS_TEST_IMAGE_ID=sha256:rebuilt run_cli deploy
+
+  assert_call 'docker build -t agent-os:dev .' "build must retain the local demo image tag"
+  assert_call 'docker tag agent-os:dev agent-os:local-rebuilt' \
+    "build must assign the rebuilt image a unique local tag"
+  assert_call 'kubectl --context orbstack -n agent-os-demo set image statefulset/agent-os-firstmate agent-os-init=agent-os:local-rebuilt firstmate=agent-os:local-rebuilt' \
+    "deploy must replace the stale mutable tag with the rebuilt local tag"
+  pass "rebuild deploy selects the rebuilt local image instead of a stale mutable tag"
+}
+
+test_explicit_image_override_is_used_without_retagging() {
+  : > "$LOG"
+  AGENT_OS_IMAGE=example.test/agent-os:custom run_cli build
+  AGENT_OS_IMAGE=example.test/agent-os:custom run_cli deploy
+
+  assert_call 'docker build -t example.test/agent-os:custom .' \
+    "build must preserve an explicit image override"
+  assert_call 'kubectl --context orbstack -n agent-os-demo set image statefulset/agent-os-firstmate agent-os-init=example.test/agent-os:custom firstmate=example.test/agent-os:custom' \
+    "deploy must preserve an explicit image override"
+  if grep -F 'docker tag example.test/agent-os:custom' "$LOG" >/dev/null; then
+    fail "explicit image overrides must not be retagged"
+  fi
+  pass "explicit image override remains intact"
 }
 
 test_destroy_requires_exact_confirmation() {
@@ -88,6 +121,7 @@ test_non_orbstack_context_is_fail_closed() {
 
 test_status_pins_context_and_namespace
 test_deploy_starts_local_kubernetes_and_applies_kustomize
-test_build_uses_local_image_name
+test_rebuild_deploy_uses_a_new_immutable_local_tag
+test_explicit_image_override_is_used_without_retagging
 test_destroy_requires_exact_confirmation
 test_non_orbstack_context_is_fail_closed
