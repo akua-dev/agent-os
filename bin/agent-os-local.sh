@@ -62,7 +62,7 @@ case "$COMMAND" in
     ;;
   destroy)
     if [ "${2:-}" != --yes ]; then
-      echo "error: destroy requires --yes and deletes only namespace '$NAMESPACE'" >&2
+      echo "error: destroy requires --yes and removes only namespaced Agent OS resources from '$NAMESPACE'" >&2
       exit 2
     fi
     AGENT_OS_CONTEXT="$CONTEXT" AGENT_OS_NAMESPACE="$NAMESPACE" AGENT_OS_INPUTS="$PROFILE" \

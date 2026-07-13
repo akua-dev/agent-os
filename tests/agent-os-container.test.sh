@@ -108,6 +108,21 @@ assert_grep 'id: build' "$ROOT/.github/workflows/agent-os-image.yml" \
   "release workflow must expose its build result"
 assert_grep 'steps.build.outputs.digest' "$ROOT/.github/workflows/agent-os-image.yml" \
   "release workflow must record the immutable published digest"
+assert_grep 'actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "release checkout action must be pinned to the reviewed full SHA"
+assert_grep 'docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "release QEMU action must be pinned to the reviewed full SHA"
+assert_grep 'docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "release Buildx action must be pinned to the reviewed full SHA"
+assert_grep 'docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "release login action must be pinned to the reviewed full SHA"
+assert_grep 'docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "release metadata action must be pinned to the reviewed full SHA"
+assert_grep 'docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "release build action must be pinned to the reviewed full SHA"
+if grep -E 'uses: (actions/checkout|docker/[^@]+)@v[0-9]+' "$ROOT/.github/workflows/agent-os-image.yml" >/dev/null; then
+  fail "release workflow must not use mutable major action tags"
+fi
 bash -n "$ROOT/bin/agent-os-container-entrypoint.sh"
 bash -n "$ROOT/bin/agent-os-kubeconfig.sh"
 pass "container files pin dependencies and exclude host credentials"

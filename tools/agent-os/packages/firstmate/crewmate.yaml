@@ -47,6 +47,14 @@ spec:
           value: /home/agent
         - name: HOME
           value: /home/agent
+      readinessProbe:
+        exec:
+          command:
+            - herdr
+            - status
+            - --json
+        initialDelaySeconds: 2
+        periodSeconds: 5
       resources:
         requests:
           cpu: 250m

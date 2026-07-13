@@ -10,8 +10,8 @@ Transcripts explain failures but do not override an incorrect outcome.
 
 The first regression set covers these observed contracts:
 
-- a mate receives no AI credential unless a Secret reference or explicit grant is selected;
-- an empty credential grant produces a mate with no AI credential mount;
+- a mate receives no AI credential unless an explicit namespace-local Secret reference is selected;
+- a missing credential grant is rejected before any mate resource is created;
 - a granted Pi auth file is mounted read-only from a Kubernetes Secret;
 - an in-cluster kubeconfig follows the projected token file and never embeds its contents;
 - a restored dead Herdr terminal may be replaced, while an idle or working agent may not;

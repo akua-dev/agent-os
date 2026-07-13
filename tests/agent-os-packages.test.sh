@@ -11,6 +11,7 @@ TMP=$(fm_test_tmproot agent-os-packages)
 INPUTS="$TMP/inputs.yaml"
 OUT="$TMP/rendered"
 MUTABLE_INPUTS="$TMP/mutable-image.yaml"
+CLUSTER_ADMIN_INPUTS="$TMP/cluster-admin.yaml"
 
 mkdir -p "$TMP"
 
@@ -38,6 +39,12 @@ assert_grep 'kind = "Role"' "$FIRSTMATE/package.k" \
   "the portable package must render the namespace runtime Role"
 assert_grep 'kind = "RoleBinding"' "$FIRSTMATE/package.k" \
   "the portable package must bind its explicit ServiceAccount to that Role"
+assert_grep '"app.kubernetes.io/managed-by" = "agent-os"' "$FIRSTMATE/package.k" \
+  "package resources must carry the Agent OS ownership label"
+assert_grep '"agent-os.dev/installation-id"' "$FIRSTMATE/package.k" \
+  "cluster and namespace resources must carry the installation identity"
+assert_grep '"agent-os.dev/rbac-mode" = input.rbac' "$FIRSTMATE/package.k" \
+  "the workload must record the applied RBAC mode for safe reconciliation"
 assert_grep 'resources = ["pods", "persistentvolumeclaims"]' "$FIRSTMATE/package.k" \
   "runtime apply authority must exclude Pod subresources from patch access"
 assert_grep 'verbs = ["get", "list", "watch", "create", "delete", "patch"]' "$FIRSTMATE/package.k" \
@@ -60,6 +67,14 @@ assert_grep "\$patch: delete" "$ROOT/deploy/akua/firstmate-auth-revoke.yaml" \
   "Akua overlay must define explicit authorization mount cleanup"
 assert_grep 'mountPath: /var/run/secrets/agent-os/akua' "$ROOT/deploy/akua/firstmate-auth-revoke.yaml" \
   "Akua overlay cleanup must use the strategic merge key for volume mounts"
+assert_grep "kubectl --context \"\$context\" -n \"\$namespace\" patch statefulset agent-os-firstmate --type=strategic --patch-file \"\$grant_patch\"" \
+  "$ROOT/.agents/skills/akua-intelligence-bootstrap/SKILL.md" \
+  "Akua authorization grant must pin context, namespace, target, patch type, and patch file"
+assert_grep "kubectl --context \"\$context\" -n \"\$namespace\" patch statefulset agent-os-firstmate --type=strategic --patch-file \"\$revoke_patch\"" \
+  "$ROOT/.agents/skills/akua-intelligence-bootstrap/SKILL.md" \
+  "Akua authorization revocation must use the same explicit targeting contract"
+assert_grep 'a missing credential grant is rejected before any mate resource is created' "$ROOT/docs/agent-evals.md" \
+  "the eval contract must match fail-closed runtime authorization"
 assert_grep '@sha256:' "$FIRSTMATE/inputs.example.yaml" \
   "the example must use an immutable image digest"
 [ ! -f "$MATE/package.k" ] || fail "mate creation must not remain a separately installable package"
@@ -76,6 +91,7 @@ akua render --no-agent-mode --package "$FIRSTMATE/package.k" --inputs "$INPUTS" 
   fail "the portable package must render without an Akua account or credential"
 
 rendered=$(cat "$OUT"/*.yaml)
+statefulset_rendered=$(cat "$(grep -Rl '^kind: StatefulSet$' "$OUT")")
 assert_contains "$rendered" 'kind: ServiceAccount' "rendered topology must create a ServiceAccount"
 assert_contains "$rendered" 'kind: Role' "rendered topology must create namespace-scoped runtime RBAC"
 assert_contains "$rendered" 'kind: RoleBinding' "rendered topology must bind namespace runtime RBAC"
@@ -83,12 +99,30 @@ assert_contains "$rendered" 'kind: PersistentVolumeClaim' "rendered topology mus
 assert_contains "$rendered" 'kind: StatefulSet' "rendered topology must run Firstmate as a StatefulSet"
 assert_contains "$rendered" 'ghcr.io/akua-dev/agent-os@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
   "rendered topology must retain the immutable image digest"
+assert_contains "$rendered" 'app.kubernetes.io/managed-by: agent-os' \
+  "rendered resources must carry the Agent OS ownership label"
+assert_contains "$rendered" 'agent-os.dev/installation-id: agent-os-firstmate:portable-agent-os' \
+  "rendered resources must carry the exact installation identity"
+assert_contains "$statefulset_rendered" 'agent-os.dev/rbac-mode: namespace' \
+  "the rendered StatefulSet must record its RBAC mode"
 assert_not_contains "$rendered" 'kind: ClusterRoleBinding' \
   "the default portable topology must not grant cluster-admin"
 assert_not_contains "$rendered" 'AKUA_' \
   "the portable rendered topology must not require Akua configuration"
 assert_not_contains "$rendered" 'agent-os.akua.dev' \
   "the portable rendered topology must not use Akua-owned annotations"
+
+sed 's/^rbac: namespace/rbac: cluster-admin/' "$INPUTS" > "$CLUSTER_ADMIN_INPUTS"
+akua render --no-agent-mode --package "$FIRSTMATE/package.k" --inputs "$CLUSTER_ADMIN_INPUTS" \
+  --out "$TMP/cluster-admin-rendered" >/dev/null || \
+  fail "the reviewed cluster-admin package profile must render"
+cluster_binding=$(cat "$(grep -Rl '^kind: ClusterRoleBinding$' "$TMP/cluster-admin-rendered")")
+assert_contains "$cluster_binding" 'name: agent-os-firstmate-portable-agent-os' \
+  "cluster-admin RBAC must use the deterministic installation binding name"
+assert_contains "$cluster_binding" 'app.kubernetes.io/managed-by: agent-os' \
+  "cluster-admin RBAC must carry the exact ownership label"
+assert_contains "$cluster_binding" 'agent-os.dev/installation-id: agent-os-firstmate:portable-agent-os' \
+  "cluster-admin RBAC must carry the exact installation annotation"
 
 cat > "$MUTABLE_INPUTS" <<'YAML'
 namespace: portable-agent-os
@@ -102,6 +136,19 @@ if akua render --no-agent-mode --package "$FIRSTMATE/package.k" --inputs "$MUTAB
   fail "the portable package must reject a mutable image tag"
 fi
 pass "the portable package rejects mutable image tags"
+
+for invalid_image in \
+  'ghcr.io/akua-dev/agent-os@sha256:abc' \
+  'ghcr.io/akua-dev/agent-os@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaextra' \
+  'prefix@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:suffix'; do
+  invalid_inputs="$TMP/invalid-$(printf '%s' "$invalid_image" | tr '/:@' '---').yaml"
+  sed "s|^image: .*|image: $invalid_image|" "$INPUTS" > "$invalid_inputs"
+  if akua render --no-agent-mode --package "$FIRSTMATE/package.k" --inputs "$invalid_inputs" \
+    --out "$TMP/invalid-rendered" >/dev/null 2>&1; then
+    fail "the portable package accepted malformed digest reference '$invalid_image'"
+  fi
+done
+pass "the portable package requires one complete 64-hex SHA-256 digest"
 
 assert_grep 'bin/agent-os-kubernetes.sh install' "$ROOT/docs/kubernetes.md" \
   "Kubernetes docs must make the generic installer the default quickstart"

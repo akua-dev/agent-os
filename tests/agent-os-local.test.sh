@@ -50,7 +50,27 @@ while [ "$#" -gt 0 ]; do
 done
 printf 'akua-input-image %s\n' "$(awk '/^image:/{print $2}' "$inputs")" >> "$AGENT_OS_TEST_LOG"
 mkdir -p "$out"
-printf 'apiVersion: v1\nkind: ConfigMap\n' > "$out/rendered.yaml"
+cat > "$out/statefulset.yaml" <<YAML
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: agent-os-firstmate
+  namespace: agent-os-demo
+  annotations:
+    agent-os.dev/rbac-mode: cluster-admin
+YAML
+printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  namespace: agent-os-demo\n' > "$out/rendered.yaml"
+cat > "$out/namespace.yaml" <<'YAML'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agent-os-demo
+  labels:
+    app.kubernetes.io/managed-by: agent-os
+  annotations:
+    agent-os.dev/installation-id: agent-os-firstmate:agent-os-demo
+YAML
+printf 'apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\n' > "$out/clusterrolebinding.yaml"
 SH
 chmod +x "$FAKEBIN/akua"
 
@@ -133,16 +153,23 @@ test_empty_image_override_uses_content_addressed_default() {
 }
 
 test_destroy_requires_exact_confirmation() {
-  local out rc=0
+  local out rc=0 cleanup_out cleanup_rc=0
   : > "$LOG"
   out=$(run_cli destroy 2>&1) || rc=$?
   [ "$rc" -eq 2 ] || fail "destroy without --yes must exit 2, got $rc: $out"
   [ ! -s "$LOG" ] || fail "destroy without --yes invoked an external command"
 
-  run_cli destroy --yes
+  cleanup_out=$(run_cli destroy --yes 2>&1) || cleanup_rc=$?
+  [ "$cleanup_rc" -eq 3 ] || \
+    fail "cluster-admin demo destroy must stop for separate privileged cleanup, got $cleanup_rc: $cleanup_out"
   grep -Fq 'kubectl --context orbstack delete --ignore-not-found -f ' "$LOG" || \
     fail "confirmed destroy must delete only resources from the rendered OrbStack profile"
-  pass "destroy requires confirmation and remains package-scoped"
+  if grep -E 'kubectl .* (get|delete) clusterrolebinding' "$LOG" >/dev/null; then
+    fail "routine demo destroy must not inspect or delete cluster-scoped RBAC"
+  fi
+  assert_contains "$cleanup_out" 'cleanup-cluster-rbac --yes' \
+    "demo destroy must print the separately confirmed privileged cleanup command"
+  pass "destroy requires confirmation and reports privileged RBAC cleanup"
 }
 
 test_non_orbstack_context_is_fail_closed() {

@@ -1,4 +1,5 @@
 import akua.ctx
+import regex
 
 schema Input:
     """Inputs for one persistent Firstmate on a conformant Kubernetes cluster."""
@@ -16,21 +17,26 @@ schema Input:
     memoryLimit: str = "8Gi"
 
     check:
-        allowMutableImage or "@sha256:" in image, "image must use an immutable @sha256 digest unless the local profile explicitly allows a mutable image"
+        allowMutableImage or regex.match(image, r"^.+@sha256:[0-9a-fA-F]{64}$"), "image must use one complete immutable @sha256 digest unless the local profile explicitly allows a mutable image"
 
 input: Input = ctx.input()
 
 labels = {
     "app.kubernetes.io/name" = "agent-os"
     "app.kubernetes.io/component" = "firstmate"
+    "app.kubernetes.io/managed-by" = "agent-os"
 }
+
+installationId = "agent-os-firstmate:${input.namespace}"
+ownershipAnnotations = { "agent-os.dev/installation-id" = installationId }
 
 namespaceResources = [{
     apiVersion = "v1"
     kind = "Namespace"
     metadata = {
         name = input.namespace
-        labels = { "app.kubernetes.io/part-of" = "agent-os" }
+        labels = labels | { "app.kubernetes.io/part-of" = "agent-os" }
+        annotations = ownershipAnnotations
     }
 }] if input.createNamespace else []
 
@@ -88,6 +94,7 @@ clusterAdminResources = [{
     metadata = {
         name = "agent-os-firstmate-${input.namespace}"
         labels = labels
+        annotations = ownershipAnnotations
     }
     roleRef = {
         apiGroup = "rbac.authorization.k8s.io"
@@ -109,6 +116,7 @@ resources = namespaceResources + [
             name = "agent-os-firstmate"
             namespace = input.namespace
             labels = labels
+            annotations = ownershipAnnotations
         }
         automountServiceAccountToken = True
     },
@@ -132,6 +140,7 @@ resources = namespaceResources + [
             name = "agent-os-firstmate"
             namespace = input.namespace
             labels = labels
+            annotations = ownershipAnnotations
         }
         spec = {
             clusterIP = "None"
@@ -146,6 +155,9 @@ resources = namespaceResources + [
             name = "agent-os-firstmate"
             namespace = input.namespace
             labels = labels
+            annotations = ownershipAnnotations | {
+                "agent-os.dev/rbac-mode" = input.rbac
+            }
         }
         spec = {
             serviceName = "agent-os-firstmate"
