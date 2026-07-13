@@ -3,7 +3,7 @@
 Date: 2026-07-13
 Kubernetes context: `orbstack`
 Namespace: `agent-os-demo`
-Issue: [#2 Make local rebuilds select the new Agent OS image](https://github.com/akua-dev/agent-os/issues/2)
+Issue: private Cortex tracker item; public implementation PR below
 Delivery PR: [#3 fix: select rebuilt local demo image](https://github.com/akua-dev/agent-os/pull/3)
 Final review surface: [#1 feat: run Firstmate as a Kubernetes agent OS](https://github.com/akua-dev/agent-os/pull/1)
 
@@ -30,15 +30,16 @@ files, treehouse worktrees, and Herdr terminals remain the operating substrate.
   Firstmate home. No credential value was copied into the brief or evidence.
 
 The evaluator initially discovered that the public Agent OS repository had
-Issues disabled. It enabled only that native repository surface, then created
-Issue #2 from the observed stale-image failure. No GitHub Project or additional
-intake service was required.
+Issues disabled. It enabled only that native repository surface and created an
+implementation issue from the observed stale-image failure. The tracker item
+was later transferred into private Cortex and public Agent OS Issues were
+disabled again. No GitHub Project or additional intake service was required.
 
 ## Parent-only supervision
 
-The evaluator prompted only the primary Firstmate. Firstmate read Issue #2 with
-`gh-axi`, registered the existing Agent OS clone, wrote the child brief, and
-spawned the crewmate through:
+The evaluator prompted only the primary Firstmate. Firstmate read the issue
+with `gh-axi`, registered the existing Agent OS clone, wrote the child brief,
+and spawned the crewmate through:
 
 ```text
 spawned fix-local-rebuild-image-r2 harness=pi kind=ship mode=direct-PR
@@ -84,7 +85,7 @@ integration.
 
 ## GitHub result and timings
 
-- Issue #2 created: `2026-07-13T08:55:04Z`.
+- Private issue created: `2026-07-13T08:55:04Z`.
 - PR #3 created: `2026-07-13T09:01:43Z`.
 - Issue-to-review-ready-PR: 6 minutes 39 seconds.
 - PR #3 merged into `feat/orbstack-demo`: `2026-07-13T09:05:28Z`.
