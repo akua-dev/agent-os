@@ -41,12 +41,21 @@ jobs:
           if [ "$GITHUB_REF" = refs/heads/main ]; then
             [ "$REF_PROTECTED" = true ] || { echo "::error::main is not reported protected"; exit 1; }
           elif [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            tag=${GITHUB_REF#refs/tags/}
+            [ "$(git cat-file -t "$GITHUB_REF")" = tag ] || { echo "::error::release tag must be annotated"; exit 1; }
+            record_commit=$(git for-each-ref --format='%(contents)' "$GITHUB_REF" | sed -n 's/^release-record-commit=\([0-9a-f]\{40\}\)$/\1/p')
+            [ -n "$record_commit" ] || { echo "::error::release tag lacks immutable record commit"; exit 1; }
             git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
-            [ "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA" ] || {
-              echo "::error::release tag must point at the exact protected-main head"
+            git merge-base --is-ancestor "$record_commit" refs/remotes/origin/main
+            gh api "repos/$GITHUB_REPOSITORY/branches/main/protection" >/dev/null
+            git show "$record_commit:image/releases/$tag.json" > "$RUNNER_TEMP/release-record.json"
+            ruleset_id=$(jq -r .tag_ruleset_id "$RUNNER_TEMP/release-record.json")
+            gh api "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id" > "$RUNNER_TEMP/tag-ruleset.json"
+            ruleset_sha=$(jq -cS . "$RUNNER_TEMP/tag-ruleset.json" | sha256sum | awk '{print $1}')
+            [ "$ruleset_sha" = "$(jq -r .tag_ruleset_sha256 "$RUNNER_TEMP/release-record.json")" ] || {
+              echo "::error::release tag ruleset differs from immutable record"
               exit 1
             }
-            gh api "repos/$GITHUB_REPOSITORY/branches/main/protection" >/dev/null
           else
             echo "::error::unsupported publication ref $GITHUB_REF"
             exit 1
@@ -59,17 +68,25 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
       - name: Prepare exact source bundle
         id: source
         run: |
           set -eu
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            git clone --depth=1 --branch main https://github.com/akua-dev/agent-os.git "$RUNNER_TEMP/trusted-agent-os"
-            AGENT_OS_SOURCE_ROOT="$RUNNER_TEMP/trusted-agent-os" \
-              bin/agent-os-source-bundle.sh "$GITHUB_WORKSPACE/image" > "$RUNNER_TEMP/source-metadata"
+            [ "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}" ]
+            AGENT_OS_SOURCE_MODE=event AGENT_OS_SOURCE_EVENT_COMMIT="${{ github.event.pull_request.head.sha }}" \
+              bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/source-metadata"
           else
-            bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/source-metadata"
+            if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+              record_commit=$(git for-each-ref --format='%(contents)' "$GITHUB_REF" | sed -n 's/^release-record-commit=\([0-9a-f]\{40\}\)$/\1/p')
+              AGENT_OS_SOURCE_MODE=release AGENT_OS_SOURCE_RELEASE_TAG="${GITHUB_REF#refs/tags/}" \
+                AGENT_OS_RELEASE_RECORD_COMMIT="$record_commit" bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/source-metadata"
+            else
+              bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/source-metadata"
+            fi
           fi
           cat "$RUNNER_TEMP/source-metadata" >> "$GITHUB_OUTPUT"
 
@@ -92,6 +109,8 @@ jobs:
             AGENT_OS_SOURCE_TREE=${{ steps.source.outputs.tree }}
             AGENT_OS_SOURCE_BRANCH=${{ steps.source.outputs.branch }}
             AGENT_OS_SOURCE_ORIGIN=${{ steps.source.outputs.origin }}
+            AGENT_OS_SOURCE_MODE=${{ steps.source.outputs.mode }}
+            AGENT_OS_SOURCE_REF=${{ steps.source.outputs.ref }}
 
   publish:
     if: github.event_name == 'push'
@@ -110,7 +129,13 @@ jobs:
         id: source
         run: |
           set -eu
-          bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/source-metadata"
+          if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            record_commit=$(git for-each-ref --format='%(contents)' "$GITHUB_REF" | sed -n 's/^release-record-commit=\([0-9a-f]\{40\}\)$/\1/p')
+            AGENT_OS_SOURCE_MODE=release AGENT_OS_SOURCE_RELEASE_TAG="${GITHUB_REF#refs/tags/}" \
+              AGENT_OS_RELEASE_RECORD_COMMIT="$record_commit" bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/source-metadata"
+          else
+            bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/source-metadata"
+          fi
           cat "$RUNNER_TEMP/source-metadata" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
@@ -152,6 +177,8 @@ jobs:
             AGENT_OS_SOURCE_TREE=${{ steps.source.outputs.tree }}
             AGENT_OS_SOURCE_BRANCH=${{ steps.source.outputs.branch }}
             AGENT_OS_SOURCE_ORIGIN=${{ steps.source.outputs.origin }}
+            AGENT_OS_SOURCE_MODE=${{ steps.source.outputs.mode }}
+            AGENT_OS_SOURCE_REF=${{ steps.source.outputs.ref }}
 
       - name: Record published image digest
         run: |

@@ -189,7 +189,7 @@ ${rv:+  resourceVersion: $rv_value}
     app.kubernetes.io/managed-by: agent-os
     agent-os.dev/lifecycle: primary
   annotations:
-    agent-os.dev/installation-id: $INSTALLATION_ID
+    agent-os.dev/installation-id: ${LOCK_INSTALLATION_ID:-$INSTALLATION_ID}
 spec:
   holderIdentity: $LOCK_HOLDER_ID
   acquireTime: $acquired_at

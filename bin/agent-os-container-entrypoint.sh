@@ -10,9 +10,40 @@ SOURCE_COMMIT=$(cat /opt/agent-os-source.commit)
 SOURCE_TREE=$(cat /opt/agent-os-source.tree)
 SOURCE_BRANCH=$(cat /opt/agent-os-source.branch)
 SOURCE_ORIGIN=$(cat /opt/agent-os-source.origin)
+SOURCE_MODE=$(cat /opt/agent-os-source.mode)
+SOURCE_REF=$(cat /opt/agent-os-source.ref)
 case "$SOURCE_BRANCH" in ''|*[!A-Za-z0-9._/-]*|/*|*/|*..*) echo "error: image source branch provenance is invalid" >&2; exit 2 ;; esac
-TRUSTED_REF="refs/remotes/agent-os-verified/$SOURCE_BRANCH"
+[ "$SOURCE_ORIGIN" = https://github.com/akua-dev/agent-os.git ] || { echo "error: image source origin is invalid" >&2; exit 2; }
+case "$SOURCE_MODE" in
+  main) [ "$SOURCE_REF" = refs/heads/main ] || exit 2; TRUSTED_REF=refs/remotes/agent-os-verified/main ;;
+  release) [[ "$SOURCE_REF" =~ ^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || exit 2; TRUSTED_REF=refs/remotes/agent-os-verified/release ;;
+  event) echo "error: pull-request validation images are not runnable" >&2; exit 2 ;;
+  *) echo "error: image source mode is invalid" >&2; exit 2 ;;
+esac
 IMAGE_REF="refs/remotes/agent-os-image/$SOURCE_BRANCH"
+
+trusted_git() {
+  env -u GIT_CONFIG -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT \
+    -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+    -u GIT_SSH -u GIT_SSH_COMMAND GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_TERMINAL_PROMPT=0 command git -c credential.helper= -c core.hooksPath=/dev/null \
+    -c http.proxy= -c https.proxy= "$@"
+}
+
+validate_git_config() {
+  local config="$FM_ROOT/.git/config" origin
+  [ -f "$config" ] || { echo "error: canonical FM_ROOT Git config is unavailable" >&2; exit 2; }
+  if trusted_git config --file "$config" --no-includes --name-only --get-regexp \
+    '^(url\.|include\.|includeIf\.|core\.hooksPath$|credential\.|http\.proxy$|https\.proxy$|remote\..*\.proxy$|alias\.)' >/dev/null 2>&1; then
+    echo "error: canonical FM_ROOT Git config contains untrusted execution or transport settings" >&2
+    exit 2
+  fi
+  origin=$(trusted_git config --file "$config" --no-includes --get remote.origin.url || true)
+  [ "$origin" = "$SOURCE_ORIGIN" ] && [ "$origin" = https://github.com/akua-dev/agent-os.git ] || {
+    echo "error: canonical FM_ROOT origin provenance changed" >&2
+    exit 2
+  }
+}
 
 mkdir -p \
   "$FM_HOME/config" \
@@ -28,92 +59,94 @@ mkdir -p \
 
 if [ ! -e "$FM_ROOT/.git" ]; then
   [ ! -e "$FM_ROOT" ] || { echo "error: canonical FM_ROOT exists without Git provenance" >&2; exit 2; }
-  git clone --no-local --branch "$SOURCE_BRANCH" "$IMAGE_SOURCE" "$FM_ROOT"
-  [ "$(git -C "$FM_ROOT" rev-parse HEAD)" = "$SOURCE_COMMIT" ] || {
+  trusted_git -c protocol.file.allow=always clone --no-local --branch "$SOURCE_BRANCH" "$IMAGE_SOURCE" "$FM_ROOT"
+  trusted_git -C "$FM_ROOT" remote set-url origin "$SOURCE_ORIGIN"
+  validate_git_config
+  [ "$(trusted_git -C "$FM_ROOT" rev-parse HEAD)" = "$SOURCE_COMMIT" ] || {
     echo "error: canonical FM_ROOT bootstrap commit provenance failed" >&2
     exit 2
   }
-  git -C "$FM_ROOT" remote set-url origin "$SOURCE_ORIGIN"
   rm -rf "$FM_ROOT/.git/hooks"
 else
   [ -d "$FM_ROOT/.git" ] || { echo "error: canonical FM_ROOT Git metadata is invalid" >&2; exit 2; }
-  [ "$(git -C "$FM_ROOT" remote get-url origin)" = "$SOURCE_ORIGIN" ] || {
-    echo "error: canonical FM_ROOT origin provenance changed" >&2
-    exit 2
-  }
-  [ -z "$(git -C "$FM_ROOT" status --porcelain)" ] || { echo "error: canonical FM_ROOT is not clean" >&2; exit 2; }
-  git -C "$FM_ROOT" fetch --no-tags "$IMAGE_SOURCE" \
+  validate_git_config
+  [ -z "$(trusted_git -C "$FM_ROOT" status --porcelain)" ] || { echo "error: canonical FM_ROOT is not clean" >&2; exit 2; }
+  trusted_git -c protocol.file.allow=always -C "$FM_ROOT" fetch --no-tags "$IMAGE_SOURCE" \
     "refs/heads/$SOURCE_BRANCH:$IMAGE_REF"
-  [ "$(git -C "$FM_ROOT" rev-parse "$IMAGE_REF")" = "$SOURCE_COMMIT" ] || {
+  [ "$(trusted_git -C "$FM_ROOT" rev-parse "$IMAGE_REF")" = "$SOURCE_COMMIT" ] || {
     echo "error: image source trusted ref provenance failed" >&2
     exit 2
   }
-  [ "$(git -C "$FM_ROOT" rev-parse "$IMAGE_REF^{tree}")" = "$SOURCE_TREE" ] || {
+  [ "$(trusted_git -C "$FM_ROOT" rev-parse "$IMAGE_REF^{tree}")" = "$SOURCE_TREE" ] || {
     echo "error: image source trusted tree provenance failed" >&2
     exit 2
   }
-  current_branch=$(git -C "$FM_ROOT" symbolic-ref --quiet --short HEAD || true)
+  current_branch=$(trusted_git -C "$FM_ROOT" symbolic-ref --quiet --short HEAD || true)
   if [ -z "$current_branch" ]; then
-    git -C "$FM_ROOT" merge-base --is-ancestor HEAD "$IMAGE_REF" || {
+    trusted_git -C "$FM_ROOT" merge-base --is-ancestor HEAD "$IMAGE_REF" || {
       echo "error: detached canonical FM_ROOT lacks trusted fast-forward provenance" >&2
       exit 2
     }
-    if git -C "$FM_ROOT" show-ref --verify --quiet "refs/heads/$SOURCE_BRANCH"; then
-      [ "$(git -C "$FM_ROOT" rev-parse "refs/heads/$SOURCE_BRANCH")" = "$(git -C "$FM_ROOT" rev-parse HEAD)" ] || {
+    if trusted_git -C "$FM_ROOT" show-ref --verify --quiet "refs/heads/$SOURCE_BRANCH"; then
+      [ "$(trusted_git -C "$FM_ROOT" rev-parse "refs/heads/$SOURCE_BRANCH")" = "$(trusted_git -C "$FM_ROOT" rev-parse HEAD)" ] || {
         echo "error: canonical default branch conflicts with detached provenance" >&2
         exit 2
       }
     else
-      git -C "$FM_ROOT" branch "$SOURCE_BRANCH" HEAD
+      trusted_git -C "$FM_ROOT" branch "$SOURCE_BRANCH" HEAD
     fi
-    git -C "$FM_ROOT" checkout "$SOURCE_BRANCH"
+    trusted_git -C "$FM_ROOT" checkout "$SOURCE_BRANCH"
   fi
-  [ "$(git -C "$FM_ROOT" symbolic-ref --short HEAD)" = "$SOURCE_BRANCH" ] || {
+  [ "$(trusted_git -C "$FM_ROOT" symbolic-ref --short HEAD)" = "$SOURCE_BRANCH" ] || {
     echo "error: canonical FM_ROOT is not on the declared default branch" >&2
     exit 2
   }
-  if git -C "$FM_ROOT" merge-base --is-ancestor HEAD "$IMAGE_REF"; then
-    git -C "$FM_ROOT" merge --ff-only "$IMAGE_REF"
-  elif ! git -C "$FM_ROOT" merge-base --is-ancestor "$SOURCE_COMMIT" HEAD; then
+  if trusted_git -C "$FM_ROOT" merge-base --is-ancestor HEAD "$IMAGE_REF"; then
+    trusted_git -C "$FM_ROOT" merge --ff-only "$IMAGE_REF"
+  elif ! trusted_git -C "$FM_ROOT" merge-base --is-ancestor "$SOURCE_COMMIT" HEAD; then
     echo "error: canonical FM_ROOT source transition is not fast-forward compatible" >&2
     exit 2
   fi
-  git -C "$FM_ROOT" update-ref -d "$IMAGE_REF"
+  trusted_git -C "$FM_ROOT" update-ref -d "$IMAGE_REF"
 fi
 
-[ "$(git -C "$FM_ROOT" symbolic-ref --short HEAD)" = "$SOURCE_BRANCH" ] || {
+[ "$(trusted_git -C "$FM_ROOT" symbolic-ref --short HEAD)" = "$SOURCE_BRANCH" ] || {
   echo "error: canonical FM_ROOT is not on the declared default branch" >&2
   exit 2
 }
-[ "$(git -C "$FM_ROOT" rev-parse "$SOURCE_COMMIT^{tree}")" = "$SOURCE_TREE" ] || {
+[ "$(trusted_git -C "$FM_ROOT" rev-parse "$SOURCE_COMMIT^{tree}")" = "$SOURCE_TREE" ] || {
   echo "error: canonical FM_ROOT image source tree provenance failed" >&2
   exit 2
 }
-[ "$(git -C "$FM_ROOT" remote get-url origin)" = "$SOURCE_ORIGIN" ] || {
-  echo "error: canonical FM_ROOT origin provenance changed" >&2
-  exit 2
-}
-GIT_TERMINAL_PROMPT=0 git -c credential.helper= -C "$FM_ROOT" fetch --no-tags --prune origin \
-  "refs/heads/$SOURCE_BRANCH:$TRUSTED_REF" || {
+validate_git_config
+trusted_git -C "$FM_ROOT" fetch --no-tags --prune "$SOURCE_ORIGIN" \
+  "$SOURCE_REF:$TRUSTED_REF" || {
   echo "error: fresh trusted source provenance is unavailable" >&2
   exit 3
 }
-git -C "$FM_ROOT" merge-base --is-ancestor "$SOURCE_COMMIT" "$TRUSTED_REF" || {
+trusted_git -C "$FM_ROOT" merge-base --is-ancestor "$SOURCE_COMMIT" "$TRUSTED_REF" || {
   echo "error: image source commit is not reachable from the fresh trusted ref" >&2
   exit 2
 }
-git -C "$FM_ROOT" merge-base --is-ancestor HEAD "$TRUSTED_REF" || {
-  echo "error: canonical FM_ROOT contains source not reachable from the fresh trusted ref" >&2
+if [ "$SOURCE_MODE" = main ]; then
+  trusted_git -C "$FM_ROOT" merge-base --is-ancestor HEAD "$TRUSTED_REF" || {
+    echo "error: canonical FM_ROOT contains source not reachable from the fresh trusted ref" >&2
+    exit 2
+  }
+  trusted_git -C "$FM_ROOT" merge --ff-only "$TRUSTED_REF"
+else
+  [ "$(trusted_git -C "$FM_ROOT" rev-parse HEAD)" = "$SOURCE_COMMIT" ] || {
+    echo "error: release FM_ROOT differs from its immutable release commit" >&2
+    exit 2
+  }
+fi
+[ "$(trusted_git -C "$FM_ROOT" rev-parse HEAD)" = "$(trusted_git -C "$FM_ROOT" rev-parse "$TRUSTED_REF^{commit}")" ] || {
+  echo "error: canonical FM_ROOT HEAD is not the exact fresh trusted source ref" >&2
   exit 2
 }
-git -C "$FM_ROOT" merge --ff-only "$TRUSTED_REF"
-[ "$(git -C "$FM_ROOT" rev-parse HEAD)" = "$(git -C "$FM_ROOT" rev-parse "$TRUSTED_REF")" ] || {
-  echo "error: canonical FM_ROOT HEAD is not the exact fresh trusted remote ref" >&2
-  exit 2
-}
-git -C "$FM_ROOT" update-ref "refs/remotes/origin/$SOURCE_BRANCH" "$TRUSTED_REF"
-[ -z "$(git -C "$FM_ROOT" status --porcelain)" ] || { echo "error: canonical FM_ROOT is not clean" >&2; exit 2; }
-[ -z "$(git -C "$FM_ROOT" ls-files -- config data projects state .no-mistakes)" ] || {
+trusted_git -C "$FM_ROOT" update-ref "refs/remotes/origin/$SOURCE_BRANCH" "$TRUSTED_REF"
+[ -z "$(trusted_git -C "$FM_ROOT" status --porcelain)" ] || { echo "error: canonical FM_ROOT is not clean" >&2; exit 2; }
+[ -z "$(trusted_git -C "$FM_ROOT" ls-files -- config data projects state .no-mistakes)" ] || {
   echo "error: canonical FM_ROOT contains operational state" >&2
   exit 2
 }

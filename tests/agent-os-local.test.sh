@@ -242,6 +242,7 @@ test_rebuild_deploy_uses_a_new_immutable_local_tag() {
 
   grep -F 'docker build ' "$LOG" | grep -F -- '--build-arg AGENT_OS_SOURCE_COMMIT=' | \
     grep -F -- '--build-arg AGENT_OS_SOURCE_TREE=' | grep -F -- '--build-arg AGENT_OS_SOURCE_BRANCH=main' | \
+    grep -F -- '--build-arg AGENT_OS_SOURCE_MODE=main' | grep -F -- '--build-arg AGENT_OS_SOURCE_REF=refs/heads/main' | \
     grep -F -- '-t agent-os:dev .' >/dev/null || \
     fail "build must pass verified exact-source arguments"
   assert_call 'docker tag agent-os:dev agent-os:local-rebuilt' \

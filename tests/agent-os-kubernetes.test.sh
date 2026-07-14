@@ -9,6 +9,8 @@ assert_grep 'configure_control_lock' "$ROOT/bin/agent-os-crewmate.sh" \
   "crewmate mutations must acquire the stable installation control lock"
 assert_grep 'CONTROL_LOCK_UID' "$ROOT/bin/agent-os-crewmate.sh" \
   "crewmate mutations must retain control-lock CAS evidence"
+assert_grep 'agent-os.dev/installation-id: ${LOCK_INSTALLATION_ID:-$INSTALLATION_ID}' "$ROOT/bin/agent-os-crewmate.sh" \
+  "crewmate control Leases must render their scope-specific installation identity"
 assert_grep 'configure_control_lock' "$ROOT/bin/agent-os-akua-auth.sh" \
   "authorization mutations must acquire the stable installation control lock"
 assert_grep 'agent-os-firstmate-lifecycle' "$ROOT/bin/agent-os-akua-auth.sh" \
@@ -21,6 +23,18 @@ assert_grep 'compensate_rollback' "$ROOT/bin/agent-os-kubernetes.sh" \
   "failed rollback must restore the current revision and authority"
 assert_grep 'wait_for_revision_history_absence' "$ROOT/bin/agent-os-kubernetes.sh" \
   "uninstall must retire historical ServiceAccounts only after revision history"
+assert_grep 'fail_grant_closed "grant CAS failed ambiguously"' "$ROOT/bin/agent-os-akua-auth.sh" \
+  "ambiguous grant mutations must enter fail-closed reconciliation"
+assert_grep 'fail_grant_closed "grant rollout failed"' "$ROOT/bin/agent-os-akua-auth.sh" \
+  "failed grant rollouts must enter fail-closed reconciliation"
+assert_grep 'reconcile_failed_akua_upgrade' "$ROOT/bin/agent-os-kubernetes.sh" \
+  "upgrade authorization drift must be removed and verified fail closed"
+assert_grep 'inventory_revision_service_accounts' "$ROOT/bin/agent-os-kubernetes.sh" \
+  "uninstall must inventory every historical revision ServiceAccount"
+assert_grep 'verify_no_runtime_authority' "$ROOT/bin/agent-os-kubernetes.sh" \
+  "RBAC none must verify namespace, cluster, and control authority absence"
+assert_grep 'rollback_source_digest' "$ROOT/bin/agent-os-kubernetes.sh" \
+  "rollback compensation must verify its immutable source revision digest"
 
 LAUNCHER="$ROOT/bin/agent-os-crewmate.sh"
 TMP=$(fm_test_tmproot agent-os-kubernetes)
@@ -64,6 +78,18 @@ for argument in "$@"; do
   [[ "$argument" = --request-timeout=* ]] || filtered_args+=("$argument")
 done
 set -- "${filtered_args[@]}"
+effective_binding_account() {
+  local binding=$1 account patch
+  patch=$(grep -F " patch rolebinding $binding " "$AGENT_OS_TEST_LOG" | tail -n 1 | sed -n 's/.* -p //p')
+  account=$(printf '%s' "$patch" | jq -r '.subjects[0].name // empty' 2>/dev/null || true)
+  if [ -z "$account" ]; then
+    account=$(grep 'akua-input-service-account ' "$AGENT_OS_TEST_LOG" | tail -n 1 | awk '{print $2}')
+  fi
+  if [ "${AGENT_OS_TEST_COMMAND:-}" = rollback ] && [ -z "$patch" ]; then
+    account=${AGENT_OS_TEST_WORKLOAD_SERVICE_ACCOUNT:-agent-os-firstmate}
+  fi
+  printf '%s' "${account:-agent-os-firstmate}"
+}
 stdin_data=''
 previous=''
 for argument in "$@"; do
@@ -149,8 +175,7 @@ if [[ " $* " = *" get RoleBinding agent-os-lifecycle-"*" -o json "* ]] || \
   [[ " $* " = *" get rolebinding agent-os-lifecycle-"*" -o json "* ]]; then
   control_name=$(printf '%s\n' "$*" | sed -n 's/.* get [Rr]ole[Bb]inding \([^ ]*\) .*/\1/p')
   if ! grep -Fq "/rolebindings/$control_name" "$AGENT_OS_TEST_LOG"; then
-    control_account=$(grep 'akua-input-service-account ' "$AGENT_OS_TEST_LOG" | tail -n 1 | awk '{print $2}')
-    [ -n "$control_account" ] || control_account=agent-os-firstmate
+    control_account=$(effective_binding_account "$control_name")
     printf '{"metadata":{"name":"%s","uid":"uid-control-binding","resourceVersion":"rv-control-binding","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}},"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"%s"},"subjects":[{"kind":"ServiceAccount","name":"%s","namespace":"portable-agent-os"}]}\n' "$control_name" "$control_name" "$control_account"
   fi
   exit 0
@@ -469,8 +494,7 @@ case " $* " in
     control_kind=$(printf '%s\n' "$*" | sed -n 's/.* get \([Rr]ole\|[Rr]ole[Bb]inding\) .*/\1/p')
     case "$control_kind" in role) control_kind=Role ;; rolebinding) control_kind=RoleBinding ;; esac
     if ! grep -Fq "/$([ "$control_kind" = Role ] && printf roles || printf rolebindings)/$control_name" "$AGENT_OS_TEST_LOG"; then
-      control_account=$(grep 'akua-input-service-account ' "$AGENT_OS_TEST_LOG" | tail -n 1 | awk '{print $2}')
-      [ -n "$control_account" ] || control_account=agent-os-firstmate
+      control_account=$(effective_binding_account "$control_name")
       if [ "$control_kind" = Role ]; then
         printf '{"metadata":{"name":"%s","uid":"uid-control-role","resourceVersion":"rv-control-role","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}},"rules":[{"apiGroups":["coordination.k8s.io"],"resources":["leases"],"resourceNames":["%s"],"verbs":["get","update"]}]}\n' "$control_name" "$control_name"
       else
@@ -486,12 +510,11 @@ case " $* " in
     fi
     ;;
   *" get rolebinding agent-os-firstmate-runtime -o json "*)
-    service_account=$(grep 'akua-input-service-account ' "$AGENT_OS_TEST_LOG" | tail -n 1 | awk '{print $2}')
-    [ -n "$service_account" ] || service_account=agent-os-firstmate
+    service_account=$(effective_binding_account agent-os-firstmate-runtime)
     if [ "${AGENT_OS_TEST_RBAC_STATE:-exact}" = extra-subject ]; then
-      printf '{"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"agent-os-firstmate-runtime"},"subjects":[{"kind":"ServiceAccount","name":"%s","namespace":"portable-agent-os"},{"kind":"ServiceAccount","name":"foreign","namespace":"portable-agent-os"}]}\n' "$service_account"
+      printf '{"metadata":{"name":"agent-os-firstmate-runtime","uid":"uid-runtime-binding","resourceVersion":"rv-runtime-binding","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}},"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"agent-os-firstmate-runtime"},"subjects":[{"kind":"ServiceAccount","name":"%s","namespace":"portable-agent-os"},{"kind":"ServiceAccount","name":"foreign","namespace":"portable-agent-os"}]}\n' "$service_account"
     else
-      printf '{"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"agent-os-firstmate-runtime"},"subjects":[{"kind":"ServiceAccount","name":"%s","namespace":"portable-agent-os"}]}\n' "$service_account"
+      printf '{"metadata":{"name":"agent-os-firstmate-runtime","uid":"uid-runtime-binding","resourceVersion":"rv-runtime-binding","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}},"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"agent-os-firstmate-runtime"},"subjects":[{"kind":"ServiceAccount","name":"%s","namespace":"portable-agent-os"}]}\n' "$service_account"
     fi
     ;;
   *" get role agent-os-firstmate-runtime -o jsonpath="*)
@@ -1191,6 +1214,7 @@ run_generic() {
     AGENT_OS_TEST_NAMESPACE_STATE="${AGENT_OS_TEST_NAMESPACE_STATE:-absent}" \
     AGENT_OS_TEST_WORKLOAD_STATE="$workload_state" AGENT_OS_TEST_RESOURCE_STATE="$resource_state" \
     AGENT_OS_TEST_CLUSTER_RBAC_STATE="${AGENT_OS_TEST_CLUSTER_RBAC_STATE:-absent}" \
+    AGENT_OS_TEST_COMMAND="${1:-}" \
     AGENT_OS_OPERATION_ID=operation-test \
     AGENT_OS_CONTEXT=kind-agent-os AGENT_OS_NAMESPACE=portable-agent-os "$GENERIC" "$@"
 }

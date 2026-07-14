@@ -212,6 +212,17 @@ reconcile_failed_grant() {
     "$(printf '%s' "$observed" | cut -f2)" "$(printf '%s' "$observed" | cut -f3)" >&2
 }
 
+fail_grant_closed() {
+  local reason=$1
+  reconcile_failed_grant || {
+    echo "incomplete: $reason and fail-closed reconciliation is unverified" >&2
+    exit 3
+  }
+  echo "incomplete: $reason; authorization overlay removed and rejected identity retained" >&2
+  echo "safe recovery: inspect the named Secret metadata, then run revoke before a new grant" >&2
+  exit 3
+}
+
 configure_control_lock
 LOCK=$CONTROL_LOCK
 LOCK_NAMESPACE=$CONTROL_NAMESPACE
@@ -267,16 +278,19 @@ sed "s/__AKUA_AUTH_SECRET__/$SECRET/g" "$TEMPLATE" | awk -v uid="$uid_value" -v 
   echo "error: Akua authorization Secret identity changed before StatefulSet CAS" >&2
   exit 3
 }
-target_kube patch statefulset agent-os-firstmate --type=strategic --patch-file "$PATCH_FILE" >/dev/null
-target_kube rollout status statefulset/agent-os-firstmate --timeout=180s
+if ! target_kube patch statefulset agent-os-firstmate --type=strategic --patch-file "$PATCH_FILE" >/dev/null; then
+  [ "$COMMAND" != grant ] || fail_grant_closed "grant CAS failed ambiguously"
+  echo "error: revoke CAS failed" >&2
+  exit 3
+fi
+if ! target_kube rollout status statefulset/agent-os-firstmate --timeout=180s; then
+  [ "$COMMAND" != grant ] || fail_grant_closed "grant rollout failed"
+  echo "incomplete: revoke rollout failed" >&2
+  exit 3
+fi
 if [ "$COMMAND" = grant ]; then
   if ! verify_overlay present "$STATE_UID"; then
-    reconcile_failed_grant || {
-      echo "incomplete: grant verification failed and fail-closed reconciliation is unverified" >&2
-      exit 3
-    }
-    echo "safe recovery: inspect the named Secret metadata, then run revoke before a new grant" >&2
-    exit 3
+    fail_grant_closed "grant verification failed"
   fi
 else
   verify_overlay absent "$STATE_UID"

@@ -113,10 +113,28 @@ assert_no_grep '!.pi/' "$ROOT/.dockerignore" "local harness homes must never be 
 assert_grep 'agent-os-source.tar' "$ROOT/Dockerfile" "image must consume the tracked exact-source export"
 assert_grep 'agent-os-bootstrap.tar' "$ROOT/Dockerfile" "image must consume the shallow sanitized bootstrap"
 assert_grep 'rev-parse "$AGENT_OS_SOURCE_COMMIT^{tree}"' "$ROOT/Dockerfile" "image source bootstrap must verify its exact tree"
+assert_grep 'cmp /tmp/verified-source.tar /tmp/agent-os-source.tar' "$ROOT/Dockerfile" \
+  "image source must be byte-identical to the archive materialized from the verified commit"
 assert_grep 'AS source-bootstrap' "$ROOT/Dockerfile" "source processing must stay in an isolated build stage"
 assert_no_grep 'COPY \. /opt/agent-os' "$ROOT/Dockerfile" "the image must never copy the ambient workspace"
 assert_grep 'fetch --depth=1 --no-tags' "$ROOT/bin/agent-os-source-bundle.sh" \
   "source preparation must fetch an allowlisted remote ref freshly"
+assert_grep 'GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null' "$ROOT/bin/agent-os-source-bundle.sh" \
+  "source preparation must isolate trusted Git operations from ambient configuration"
+assert_grep 'AGENT_OS_SOURCE_MODE=event AGENT_OS_SOURCE_EVENT_COMMIT' "$IMAGE_WORKFLOW" \
+  "pull requests must build their exact event head without publication credentials"
+assert_no_grep 'git clone --depth=1 --branch main' "$IMAGE_WORKFLOW" \
+  "pull-request validation must not substitute protected main for the reviewed source"
+assert_grep 'release-record-commit=' "$IMAGE_WORKFLOW" \
+  "historical releases must name an immutable allowlisted release record"
+assert_grep 'tag_ruleset_sha256' "$ROOT/bin/agent-os-source-bundle.sh" \
+  "release records must bind the protected tag ruleset"
+assert_grep 'source_archive_sha256' "$ROOT/bin/agent-os-source-bundle.sh" \
+  "release records must bind the exact archived source"
+assert_grep 'GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "runtime provenance must isolate trusted Git operations"
+assert_grep 'canonical FM_ROOT Git config contains untrusted' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "runtime provenance must reject persistent transport and execution overrides"
 assert_grep 'status --porcelain --untracked-files=all' "$ROOT/bin/agent-os-source-bundle.sh" \
   "source preparation must reject a dirty workspace"
 assert_no_grep 'bundle create.*HEAD' "$ROOT/bin/agent-os-source-bundle.sh" \
@@ -124,7 +142,7 @@ assert_no_grep 'bundle create.*HEAD' "$ROOT/bin/agent-os-source-bundle.sh" \
 assert_grep 'merge --ff-only' "$ROOT/bin/agent-os-container-entrypoint.sh" "persistent source transitions must be fast-forward only"
 assert_grep 'refs/remotes/agent-os-verified' "$ROOT/bin/agent-os-container-entrypoint.sh" \
   "canonical runtime source must use a freshly fetched verification ref"
-assert_grep 'fetch --no-tags --prune origin' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+assert_grep 'trusted_git -C "$FM_ROOT" fetch --no-tags --prune "$SOURCE_ORIGIN"' "$ROOT/bin/agent-os-container-entrypoint.sh" \
   "runtime provenance must fail closed unless the trusted remote is reachable"
 assert_no_grep 'checkout --detach' "$ROOT/bin/agent-os-container-entrypoint.sh" \
   "canonical runtime source must remain on the declared default branch"
@@ -174,8 +192,8 @@ assert_grep 'needs: [behavior, provenance, validate]' "$IMAGE_WORKFLOW" \
   "the packages-write job must require exact behavior, provenance, and image gates"
 assert_grep 'github.ref_protected' "$IMAGE_WORKFLOW" \
   "main publication must require GitHub protected-ref provenance"
-assert_grep 'release tag must point at the exact protected-main head' "$IMAGE_WORKFLOW" \
-  "tag publication must require the exact tested protected-main commit"
+assert_grep 'release tag ruleset differs from immutable record' "$IMAGE_WORKFLOW" \
+  "tag publication must require its recorded protected-tag ruleset"
 assert_grep 'Section 13' "$ROOT/docs/herdr-compliance.md" \
   "the Herdr audit must account for the network-interaction clause"
 assert_grep 'https://github.com/akua-dev/akua/tree/v0.8.25' "$ROOT/THIRD_PARTY_NOTICES.md" \

@@ -4,6 +4,8 @@ ARG AGENT_OS_SOURCE_COMMIT
 ARG AGENT_OS_SOURCE_TREE
 ARG AGENT_OS_SOURCE_BRANCH=main
 ARG AGENT_OS_SOURCE_ORIGIN=https://github.com/akua-dev/agent-os.git
+ARG AGENT_OS_SOURCE_MODE=main
+ARG AGENT_OS_SOURCE_REF=refs/heads/main
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends git \
@@ -16,17 +18,18 @@ RUN set -eu; \
   test -n "$AGENT_OS_SOURCE_TREE"; \
   test "$AGENT_OS_SOURCE_BRANCH" = main; \
   test "$AGENT_OS_SOURCE_ORIGIN" = https://github.com/akua-dev/agent-os.git; \
+  case "$AGENT_OS_SOURCE_MODE" in main|event|release) ;; *) exit 1 ;; esac; \
+  test -n "$AGENT_OS_SOURCE_REF"; \
+  grep -Fx "mode=$AGENT_OS_SOURCE_MODE" /tmp/agent-os-source.attestation; \
   grep -Fx "commit=$AGENT_OS_SOURCE_COMMIT" /tmp/agent-os-source.attestation; \
   grep -Fx "tree=$AGENT_OS_SOURCE_TREE" /tmp/agent-os-source.attestation; \
   grep -Fx "branch=$AGENT_OS_SOURCE_BRANCH" /tmp/agent-os-source.attestation; \
   grep -Fx "origin=$AGENT_OS_SOURCE_ORIGIN" /tmp/agent-os-source.attestation; \
-  grep -Fx "ref=refs/heads/$AGENT_OS_SOURCE_BRANCH" /tmp/agent-os-source.attestation; \
+  grep -Fx "ref=$AGENT_OS_SOURCE_REF" /tmp/agent-os-source.attestation; \
   source_sha=$(sha256sum /tmp/agent-os-source.tar | awk '{print $1}'); \
   bootstrap_sha=$(sha256sum /tmp/agent-os-bootstrap.tar | awk '{print $1}'); \
   grep -Fx "source_sha256=$source_sha" /tmp/agent-os-source.attestation; \
   grep -Fx "bootstrap_sha256=$bootstrap_sha" /tmp/agent-os-source.attestation; \
-  mkdir -p /opt/agent-os; \
-  tar -xf /tmp/agent-os-source.tar -C /opt/agent-os; \
   tar -xf /tmp/agent-os-bootstrap.tar -C /opt; \
   mv /opt/bootstrap.git /opt/agent-os-bootstrap.git; \
   test "$(git --git-dir=/opt/agent-os-bootstrap.git rev-parse "$AGENT_OS_SOURCE_COMMIT")" = "$AGENT_OS_SOURCE_COMMIT"; \
@@ -35,11 +38,18 @@ RUN set -eu; \
   test "$(git --git-dir=/opt/agent-os-bootstrap.git remote get-url origin)" = "$AGENT_OS_SOURCE_ORIGIN"; \
   test -z "$(git --git-dir=/opt/agent-os-bootstrap.git ls-tree -r --name-only "$AGENT_OS_SOURCE_COMMIT" -- config data projects state .no-mistakes)"; \
   test ! -e /opt/agent-os-bootstrap.git/hooks; \
-  rm -f /tmp/agent-os-source.tar /tmp/agent-os-bootstrap.tar /tmp/agent-os-source.attestation; \
+  git --git-dir=/opt/agent-os-bootstrap.git archive --format=tar --output=/tmp/verified-source.tar "$AGENT_OS_SOURCE_COMMIT"; \
+  cmp /tmp/verified-source.tar /tmp/agent-os-source.tar; \
+  mkdir -p /opt/agent-os; \
+  tar -xf /tmp/verified-source.tar -C /opt/agent-os; \
+  test "$(git --git-dir=/opt/agent-os-bootstrap.git rev-parse "$AGENT_OS_SOURCE_COMMIT^{tree}")" = "$AGENT_OS_SOURCE_TREE"; \
+  rm -f /tmp/verified-source.tar /tmp/agent-os-source.tar /tmp/agent-os-bootstrap.tar /tmp/agent-os-source.attestation; \
   printf '%s\n' "$AGENT_OS_SOURCE_COMMIT" > /opt/agent-os-source.commit; \
   printf '%s\n' "$AGENT_OS_SOURCE_TREE" > /opt/agent-os-source.tree; \
   printf '%s\n' "$AGENT_OS_SOURCE_BRANCH" > /opt/agent-os-source.branch; \
-  printf '%s\n' "$AGENT_OS_SOURCE_ORIGIN" > /opt/agent-os-source.origin
+  printf '%s\n' "$AGENT_OS_SOURCE_ORIGIN" > /opt/agent-os-source.origin; \
+  printf '%s\n' "$AGENT_OS_SOURCE_MODE" > /opt/agent-os-source.mode; \
+  printf '%s\n' "$AGENT_OS_SOURCE_REF" > /opt/agent-os-source.ref
 
 FROM node:24-trixie-slim@sha256:366fdef91728b1b7fa18c84fba63b6e79ed77b7e10cc206878e9705da4d7b169
 
@@ -218,6 +228,8 @@ COPY --from=source-bootstrap /opt/agent-os-source.commit /opt/agent-os-source.co
 COPY --from=source-bootstrap /opt/agent-os-source.tree /opt/agent-os-source.tree
 COPY --from=source-bootstrap /opt/agent-os-source.branch /opt/agent-os-source.branch
 COPY --from=source-bootstrap /opt/agent-os-source.origin /opt/agent-os-source.origin
+COPY --from=source-bootstrap /opt/agent-os-source.mode /opt/agent-os-source.mode
+COPY --from=source-bootstrap /opt/agent-os-source.ref /opt/agent-os-source.ref
 
 RUN install -D -m 0644 /opt/agent-os/THIRD_PARTY_NOTICES.md /usr/share/doc/agent-os/THIRD_PARTY_NOTICES.md \
   && install -D -m 0644 /opt/agent-os/THIRD_PARTY_SOURCES.md /usr/share/doc/agent-os/THIRD_PARTY_SOURCES.md

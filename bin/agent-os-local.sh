@@ -61,7 +61,10 @@ case "$COMMAND" in
     source_tree=$(printf '%s\n' "$source_metadata" | awk -F= '$1 == "tree" { print $2 }')
     source_branch=$(printf '%s\n' "$source_metadata" | awk -F= '$1 == "branch" { print $2 }')
     source_origin=$(printf '%s\n' "$source_metadata" | awk -F= '$1 == "origin" { sub(/^[^=]*=/, ""); print }')
-    [ -n "$source_commit" ] && [ -n "$source_tree" ] && [ -n "$source_branch" ] && [ -n "$source_origin" ] || {
+    source_mode=$(printf '%s\n' "$source_metadata" | awk -F= '$1 == "mode" { print $2 }')
+    source_ref=$(printf '%s\n' "$source_metadata" | awk -F= '$1 == "ref" { sub(/^[^=]*=/, ""); print }')
+    [ -n "$source_commit" ] && [ -n "$source_tree" ] && [ -n "$source_branch" ] && [ -n "$source_origin" ] && \
+      [ -n "$source_mode" ] && [ -n "$source_ref" ] || {
       echo "error: exact-source bootstrap metadata is incomplete" >&2
       exit 2
     }
@@ -70,6 +73,8 @@ case "$COMMAND" in
       --build-arg "AGENT_OS_SOURCE_TREE=$source_tree" \
       --build-arg "AGENT_OS_SOURCE_BRANCH=$source_branch" \
       --build-arg "AGENT_OS_SOURCE_ORIGIN=$source_origin" \
+      --build-arg "AGENT_OS_SOURCE_MODE=$source_mode" \
+      --build-arg "AGENT_OS_SOURCE_REF=$source_ref" \
       -t "$IMAGE" .
     if [ -z "$IMAGE_IS_OVERRIDE" ]; then
       docker tag "$IMAGE" "$(local_image_tag)"
