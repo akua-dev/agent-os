@@ -11,12 +11,26 @@ FM_HOME_DIR="$TMP/home"
 WORK="$TMP/work"
 LEASE=
 TEST_FLOCK="$TEST_ROOT/flock"
+TEST_LOCK_ROOT="$TEST_ROOT/locks"
 PRESERVE_TREEHOUSE_STATE=false
 
 fm_git_identity fmtest fmtest@example.com
 
-mkdir -p "$FM_HOME_DIR/state" "$FM_HOME_DIR/data" "$TREEHOUSE_POOL"
-printf '#!/usr/bin/env bash\nexit 0\n' > "$TEST_FLOCK"
+mkdir -p "$FM_HOME_DIR/state" "$FM_HOME_DIR/data" "$TREEHOUSE_POOL" "$TEST_LOCK_ROOT"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -eu' \
+  'fd=${2:?lock file descriptor is required}' \
+  'target=${AGENT_OS_TEST_LOCK_FILE_HINT:?lock file identity is required}' \
+  'key=$(printf "%s" "$target" | /usr/bin/cksum | /usr/bin/awk "{print \$1}")' \
+  'lock="$AGENT_OS_TEST_LOCK_ROOT/$key"' \
+  'if ! /bin/mkdir "$lock" 2>/dev/null; then' \
+  '  owner=$(/bin/cat "$lock/owner" 2>/dev/null || true)' \
+  '  if [ -n "$owner" ] && /bin/kill -0 "$owner" 2>/dev/null; then exit 1; fi' \
+  '  /bin/rm -rf "$lock"' \
+  '  /bin/mkdir "$lock"' \
+  'fi' \
+  'printf "%s\n" "$PPID" > "$lock/owner"' > "$TEST_FLOCK"
 chmod +x "$TEST_FLOCK"
 touch "$TREEHOUSE_POOL/treehouse-state.lock"
 git init -q -b main "$WORK"
@@ -92,7 +106,45 @@ run_sync() {
     AGENT_OS_SOURCE_SHA256="$sha" AGENT_OS_SOURCE_BRANCH=main \
     AGENT_OS_SOURCE_ORIGIN=https://github.com/akua-dev/agent-os.git \
     AGENT_OS_SOURCE_MODE=release AGENT_OS_TEST_FLOCK_BIN="$TEST_FLOCK" \
-    AGENT_OS_TEST_BOUND_PATHS=true "$SYNC"
+    AGENT_OS_TEST_LOCK_ROOT="$TEST_LOCK_ROOT" AGENT_OS_TEST_BOUND_PATHS=true "$SYNC"
+}
+
+fleet_mutation_signature() {
+  local id gitdir policy
+  for id in linked standalone; do
+    gitdir=$(git -C "$TMP/$id" rev-parse --absolute-git-dir)
+    printf '%s:%s:%s\n' "$id" "$(git -C "$TMP/$id" rev-parse HEAD)" \
+      "$(git -C "$TMP/$id" remote get-url origin)"
+    for policy in "$gitdir/agent-os-runtime-source" \
+      "$TMP/$id/config/agent-os-source-policy" \
+      "$TMP/$id/config/agent-os-source-policy.pending" \
+      "$TMP/$id/config/agent-os-source-policy.required"; do
+      if [ -f "$policy" ]; then
+        printf '%s:%s\n' "$policy" "$(shasum -a 256 "$policy" | awk '{print $1}')"
+      else
+        printf '%s:absent\n' "$policy"
+      fi
+    done
+  done
+  if [ -d "$TMP/foreign-guard/.git" ]; then
+    printf 'foreign-guard:%s:%s\n' "$(git -C "$TMP/foreign-guard" rev-parse HEAD)" \
+      "$(git -C "$TMP/foreign-guard" remote get-url origin)"
+    if [ -f "$TMP/foreign-guard/.git/agent-os-runtime-source" ]; then
+      shasum -a 256 "$TMP/foreign-guard/.git/agent-os-runtime-source"
+    else
+      printf 'foreign-guard-policy:absent\n'
+    fi
+  fi
+}
+
+expect_rejection_without_mutation() {
+  local label=$1 before after
+  before=$(fleet_mutation_signature)
+  if run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null 2>&1; then
+    fail "$label was accepted"
+  fi
+  after=$(fleet_mutation_signature)
+  [ "$after" = "$before" ] || fail "$label allowed source, remote, marker, or policy mutation"
 }
 
 make_primary primary-b "$B_COMMIT"
@@ -255,100 +307,114 @@ fi
 rm "$FM_HOME_DIR/state/nested.meta"
 pass "secondmate selection rejects canonical home overlap"
 
+git clone -q "$LEASE" "$TMP/foreign-guard"
+git -C "$TMP/foreign-guard" checkout -q --detach "$A_COMMIT"
+
 write_treehouse_state
 PRESERVE_TREEHOUSE_STATE=true
+jq 'del(.worktrees[] | select(.lease_holder == "standalone"))' \
+  "$TREEHOUSE_POOL/treehouse-state.json" > "$TEST_ROOT/state-next.json"
+mv "$TEST_ROOT/state-next.json" "$TREEHOUSE_POOL/treehouse-state.json"
+run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null || \
+  fail "primary-owned standalone assignment required Treehouse self-attestation"
+run_sync "$TMP/primary-a" "$A_COMMIT" "$A_TREE" "$A_SHA" >/dev/null || \
+  fail "primary-owned standalone assignment could not select its rollback source"
+pass "primary-owned standalone assignment needs no child or Treehouse attestation"
+
+mv "$FM_HOME_DIR/state/standalone.meta" "$TEST_ROOT/standalone.meta"
+printf -- '- standalone - standby (home: %s/standalone; state: idle)\n' "$TMP" \
+  > "$FM_HOME_DIR/data/secondmates.md"
+expect_rejection_without_mutation "registry-only standalone self-attestation"
+mv "$TEST_ROOT/standalone.meta" "$FM_HOME_DIR/state/standalone.meta"
+: > "$FM_HOME_DIR/data/secondmates.md"
+pass "standalone assignment requires primary-owned proof"
+
+write_treehouse_state
 jq 'del(.worktrees[] | select(.lease_holder == "linked"))' \
   "$TREEHOUSE_POOL/treehouse-state.json" > "$TEST_ROOT/state-next.json"
 mv "$TEST_ROOT/state-next.json" "$TREEHOUSE_POOL/treehouse-state.json"
-if run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null 2>&1; then
-  fail "missing Treehouse lease evidence was accepted"
-fi
-[ "$(git -C "$TMP/linked" rev-parse HEAD)" = "$A_COMMIT" ] || \
-  fail "missing Treehouse lease evidence allowed source mutation"
+expect_rejection_without_mutation "missing Treehouse lease evidence"
 
 write_treehouse_state
 jq '(.worktrees[] | select(.lease_holder == "linked") | .leased) = false' \
   "$TREEHOUSE_POOL/treehouse-state.json" > "$TEST_ROOT/state-next.json"
 mv "$TEST_ROOT/state-next.json" "$TREEHOUSE_POOL/treehouse-state.json"
-if run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null 2>&1; then
-  fail "stale Treehouse lease evidence was accepted"
-fi
+expect_rejection_without_mutation "stale Treehouse lease evidence"
 
 write_treehouse_state
 jq '(.worktrees[] | select(.lease_holder == "linked") | .lease_holder) = "other"' \
   "$TREEHOUSE_POOL/treehouse-state.json" > "$TEST_ROOT/state-next.json"
 mv "$TEST_ROOT/state-next.json" "$TREEHOUSE_POOL/treehouse-state.json"
-if run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null 2>&1; then
-  fail "other-holder Treehouse lease evidence was accepted"
-fi
+expect_rejection_without_mutation "other-holder Treehouse lease evidence"
 
 write_treehouse_state
 jq '.worktrees += [.worktrees[] | select(.lease_holder == "linked")]' \
   "$TREEHOUSE_POOL/treehouse-state.json" > "$TEST_ROOT/state-next.json"
 mv "$TEST_ROOT/state-next.json" "$TREEHOUSE_POOL/treehouse-state.json"
-if run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null 2>&1; then
-  fail "duplicate Treehouse lease evidence was accepted"
-fi
+expect_rejection_without_mutation "duplicate Treehouse lease evidence"
 
 write_treehouse_state
 jq '.worktrees += [(.worktrees[] | select(.lease_holder == "linked") | .path += "-planted")]' \
   "$TREEHOUSE_POOL/treehouse-state.json" > "$TEST_ROOT/state-next.json"
 mv "$TEST_ROOT/state-next.json" "$TREEHOUSE_POOL/treehouse-state.json"
-if run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null 2>&1; then
-  fail "ambiguous planted Treehouse holder evidence was accepted"
-fi
+expect_rejection_without_mutation "ambiguous planted Treehouse holder evidence"
 
 printf '{unreadable\n' > "$TREEHOUSE_POOL/treehouse-state.json"
-if run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null 2>&1; then
-  fail "unreadable Treehouse lease evidence was accepted"
-fi
+expect_rejection_without_mutation "unreadable Treehouse lease evidence"
 PRESERVE_TREEHOUSE_STATE=false
 write_treehouse_state
 pass "secondmate selection requires one exact active Treehouse lease holder"
 
-git -C "$LEASE" worktree add -q --detach "$TMP/toctou-victim" "$A_COMMIT"
 git clone -q "$LEASE" "$TMP/toctou-foreign"
 git -C "$TMP/toctou-foreign" checkout -q --detach "$A_COMMIT"
-mkdir -p "$TMP/toctou-victim/config" "$TMP/toctou-foreign/config"
-foreign_head=$(git -C "$TMP/toctou-foreign" rev-parse HEAD)
-AGENT_OS_TEST_BOUND_PATHS=true
-export AGENT_OS_TEST_BOUND_PATHS
-. "$ROOT/bin/agent-os-runtime-bound.sh"
-trusted_git() {
-  env -i HOME=/nonexistent PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C \
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
-    /usr/bin/git -c credential.helper= -c core.hooksPath=/dev/null "$@"
+linked_gitdir=$(git -C "$TMP/linked" rev-parse --absolute-git-dir)
+linked_commondir=$(cat "$linked_gitdir/commondir")
+linked_pointer=$(cat "$TMP/linked/.git")
+foreign_before=$(find "$TMP/toctou-foreign/.git" -type f -print0 | sort -z | \
+  xargs -0 shasum -a 256 | shasum -a 256 | awk '{print $1}')
+fleet_before=$(fleet_mutation_signature)
+write_treehouse_state
+PRESERVE_TREEHOUSE_STATE=true
+AGENT_OS_TEST_BARRIER_PHASE=fetch
+AGENT_OS_TEST_BARRIER_READY="$TEST_ROOT/toctou-ready"
+AGENT_OS_TEST_BARRIER_RELEASE="$TEST_ROOT/toctou-release"
+export AGENT_OS_TEST_BARRIER_PHASE AGENT_OS_TEST_BARRIER_READY AGENT_OS_TEST_BARRIER_RELEASE
+rm -f "$AGENT_OS_TEST_BARRIER_READY" "$AGENT_OS_TEST_BARRIER_RELEASE"
+run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" \
+  > "$TEST_ROOT/toctou-runtime.out" 2>&1 &
+runtime_pid=$!
+for _ in $(seq 1 500); do
+  [ -f "$AGENT_OS_TEST_BARRIER_READY" ] && break
+  sleep 0.01
+done
+[ -f "$AGENT_OS_TEST_BARRIER_READY" ] || {
+  kill "$runtime_pid" 2>/dev/null || true
+  fail "runtime TOCTOU barrier was not reached"
 }
-agent_os_open_bound_dir "$TMP/toctou-victim" || fail "TOCTOU victim home could not be bound"
-toctou_home=$AGENT_OS_BOUND_PATH
-agent_os_open_bound_dir "$TMP/toctou-victim/config" || fail "TOCTOU victim configuration could not be bound"
-toctou_config=$AGENT_OS_BOUND_PATH
-toctou_git_path=$(git -C "$TMP/toctou-victim" rev-parse --absolute-git-dir)
-agent_os_open_bound_dir "$toctou_git_path" || fail "TOCTOU victim Git directory could not be bound"
-toctou_git=$AGENT_OS_BOUND_PATH
-rm "$TMP/toctou-victim/.git"
-printf 'gitdir: %s/toctou-foreign/.git\n' "$TMP" > "$TMP/toctou-victim/.git"
-mv "$TMP/toctou-victim/config" "$TMP/toctou-victim-config-owned"
-ln -s "$TMP/toctou-foreign/config" "$TMP/toctou-victim/config"
-if agent_os_bound_dir_matches "$TMP/toctou-victim/config" "$toctou_config"; then
-  fail "swapped secondmate configuration retained its validated identity"
+if AGENT_OS_TEST_BARRIER_PHASE= run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" \
+  >/dev/null 2>&1; then
+  touch "$AGENT_OS_TEST_BARRIER_RELEASE"
+  wait "$runtime_pid" 2>/dev/null || true
+  fail "secondmate ownership lock admitted a concurrent runtime mutation"
 fi
-if [ "$(git -C "$TMP/toctou-victim" rev-parse --absolute-git-dir)" -ef "$toctou_git" ]; then
-  fail "swapped secondmate Git pointer retained its validated identity"
+printf 'gitdir: %s/toctou-foreign/.git\n' "$TMP" > "$TMP/linked/.git"
+printf '%s\n' "$TMP/toctou-foreign/.git" > "$linked_gitdir/commondir"
+touch "$AGENT_OS_TEST_BARRIER_RELEASE"
+if wait "$runtime_pid"; then
+  fail "runtime accepted a Git pointer and common-directory swap"
 fi
-agent_os_bound_git "$toctou_git" "$toctou_home" checkout -q --detach "$B_COMMIT" || \
-  fail "captured secondmate Git directory could not select its exact source"
-agent_os_bound_git "$toctou_git" "$toctou_home" remote set-url origin \
-  https://github.com/akua-dev/agent-os.git
-printf 'mode=release\ncommit=%s\nsource_sha256=%s\n' "$B_COMMIT" "$B_SHA" \
-  > "$toctou_git/agent-os-runtime-source"
-[ "$(git -C "$TMP/toctou-foreign" rev-parse HEAD)" = "$foreign_head" ] || \
-  fail "pointer swap redirected a captured Git mutation into a foreign repository"
-[ ! -e "$TMP/toctou-foreign/.git/agent-os-runtime-source" ] || \
-  fail "pointer swap redirected marker mutation into a foreign repository"
-[ ! -e "$TMP/toctou-foreign/config/agent-os-source-policy" ] || \
-  fail "configuration swap redirected policy mutation into a foreign home"
-pass "captured secondmate directories defeat Git pointer swaps"
+printf '%s\n' "$linked_pointer" > "$TMP/linked/.git"
+printf '%s\n' "$linked_commondir" > "$linked_gitdir/commondir"
+unset AGENT_OS_TEST_BARRIER_PHASE AGENT_OS_TEST_BARRIER_READY AGENT_OS_TEST_BARRIER_RELEASE
+foreign_after=$(find "$TMP/toctou-foreign/.git" -type f -print0 | sort -z | \
+  xargs -0 shasum -a 256 | shasum -a 256 | awk '{print $1}')
+[ "$foreign_after" = "$foreign_before" ] || \
+  fail "runtime TOCTOU redirected Git mutation into a foreign repository"
+[ "$(fleet_mutation_signature)" = "$fleet_before" ] || \
+  fail "runtime TOCTOU changed secondmate source, remote, marker, or policy state"
+PRESERVE_TREEHOUSE_STATE=false
+write_treehouse_state
+pass "runtime lock and bound common directory defeat live Git pointer swaps"
 
 printf 'tampered\n' >> "$TMP/standalone/AGENTS.md"
 if run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null 2>&1; then

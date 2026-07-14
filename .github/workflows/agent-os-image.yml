@@ -307,6 +307,8 @@ jobs:
             claim_ref="$claim_prefix/initial"
             load_claim "$claim_ref"
             CLAIM_OWNERS="|$CLAIM_OWNER|"
+            CLAIM_CHAIN_FILE="$RUNNER_TEMP/candidate-claim-chain.tsv"
+            printf '%s\t%s\n' "$CLAIM_OWNER" "$CLAIM_SHA" > "$CLAIM_CHAIN_FILE"
             depth=0
             while [ "$depth" -lt 32 ]; do
               next_ref="$claim_prefix/recover-$CLAIM_OWNER"
@@ -315,7 +317,14 @@ jobs:
                 2> "$RUNNER_TEMP/candidate-next-claim.err"; then
                 claim_ref=$next_ref
                 load_claim "$claim_ref"
+                case "$CLAIM_OWNERS" in
+                  *"|$CLAIM_OWNER|"*)
+                    echo "::error::candidate reservation recovery chain repeats an owner"
+                    exit 1
+                    ;;
+                esac
                 CLAIM_OWNERS="${CLAIM_OWNERS}${CLAIM_OWNER}|"
+                printf '%s\t%s\n' "$CLAIM_OWNER" "$CLAIM_SHA" >> "$CLAIM_CHAIN_FILE"
                 depth=$((depth + 1))
                 continue
               fi
@@ -409,12 +418,56 @@ jobs:
             --format json --depth 1 "$IMAGE@$reservation_digest" > "$RUNNER_TEMP/candidate-reservation-referrers.json"
           referrer_count=$(jq -er '.referrers | length' "$RUNNER_TEMP/candidate-reservation-referrers.json")
           if [ "$referrer_count" -eq 0 ]; then
-            artifact_owner=$CLAIM_OWNER
-            artifact_claim_sha=$CLAIM_SHA
-            load_build_attempt "$artifact_owner" "$artifact_claim_sha" "$reservation_digest"
             artifact_name="agent-os-candidate-record-$GITHUB_SHA"
             gh api --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$artifact_name&per_page=100" \
               > "$RUNNER_TEMP/candidate-trusted-artifacts.json"
+            artifact_name="agent-os-candidate-build-$GITHUB_SHA"
+            gh api --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$artifact_name&per_page=100" \
+              > "$RUNNER_TEMP/candidate-build-artifacts.json"
+            chain_state="$RUNNER_TEMP/candidate-claim-chain-state.tsv"
+            : > "$chain_state"
+            while IFS=$'\t' read -r owner claim_sha; do
+              load_build_attempt "$owner" "$claim_sha" "$reservation_digest"
+              record_count=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$owner" \
+                '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | length' \
+                "$RUNNER_TEMP/candidate-trusted-artifacts.json")
+              build_count=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$owner" \
+                '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | length' \
+                "$RUNNER_TEMP/candidate-build-artifacts.json")
+              [ "$record_count" -le 1 ] && [ "$build_count" -le 1 ] || {
+                echo "::error::candidate claim owner has conflicting durable evidence"
+                exit 1
+              }
+              if [ "$record_count" -eq 1 ] && [ "$build_count" -eq 0 ]; then
+                evidence_state=exact-record
+              elif [ "$record_count" -eq 0 ] && [ "$build_count" -eq 1 ]; then
+                evidence_state=exact-build
+              elif [ "$record_count" -eq 0 ] && [ "$build_count" -eq 0 ]; then
+                evidence_state=absent
+              else
+                evidence_state=ambiguous
+              fi
+              printf '%s\t%s\t%s\t%s\n' "$owner" "$claim_sha" \
+                "$BUILD_ATTEMPT_STATE" "$evidence_state" >> "$chain_state"
+            done < "$CLAIM_CHAIN_FILE"
+            decision=$(bin/agent-os-candidate-state.sh "$chain_state")
+            IFS=$'\t' read -r candidate_action artifact_owner <<EOF
+$decision
+EOF
+            case "$candidate_action" in
+              build)
+                artifact_owner=$CLAIM_OWNER
+                BUILD_ATTEMPT_STATE=absent
+                ;;
+              reuse-record|reuse-build)
+                [[ "$artifact_owner" =~ ^[0-9]+$ ]]
+                BUILD_ATTEMPT_STATE=attempted
+                ;;
+              *)
+                echo "::error::candidate claim-chain decision is invalid"
+                exit 1
+                ;;
+            esac
             trusted_artifact_count=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$artifact_owner" \
               '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | length' \
               "$RUNNER_TEMP/candidate-trusted-artifacts.json")
@@ -422,7 +475,8 @@ jobs:
               echo "::error::candidate reservation has conflicting trusted artifacts"
               exit 1
             }
-            if [ "$trusted_artifact_count" -eq 1 ]; then
+            if [ "$candidate_action" = reuse-record ]; then
+              [ "$trusted_artifact_count" -eq 1 ] || exit 1
               validate_artifact_run "$artifact_owner"
               trusted_artifact_id=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$artifact_owner" \
                 '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | .[0].id' \
@@ -460,17 +514,12 @@ jobs:
               cp "$RUNNER_TEMP/candidate-trusted-artifact/agent-os-bootstrap.tar" image/agent-os-bootstrap.tar
               image_digest=$(jq -er .image_digest "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
               bootstrap_sha=$(jq -er .bootstrap_archive_sha256 "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
-              decision=$(bin/agent-os-candidate-state.sh "$BUILD_ATTEMPT_STATE" exact-record exact)
-              [ "$decision" = reuse-record ]
               ensure_build_owner
               printf 'build=false\nrecord_artifact=true\ncandidate_record_digest=%s\nimage_digest=%s\nbootstrap_sha256=%s\n' \
                 "$candidate_record_digest" "$image_digest" "$bootstrap_sha" >> "$GITHUB_OUTPUT"
               echo "::notice::candidate reservation recovered from durable trusted artifact"
               exit 0
             fi
-            artifact_name="agent-os-candidate-build-$GITHUB_SHA"
-            gh api --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$artifact_name&per_page=100" \
-              > "$RUNNER_TEMP/candidate-build-artifacts.json"
             build_artifact_count=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$artifact_owner" \
               '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | length' \
               "$RUNNER_TEMP/candidate-build-artifacts.json")
@@ -478,7 +527,8 @@ jobs:
               echo "::error::candidate reservation has conflicting exact build evidence"
               exit 1
             }
-            if [ "$build_artifact_count" -eq 1 ]; then
+            if [ "$candidate_action" = reuse-build ]; then
+              [ "$build_artifact_count" -eq 1 ] || exit 1
               validate_artifact_run "$artifact_owner"
               build_artifact_id=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$artifact_owner" \
                 '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | .[0].id' \
@@ -501,16 +551,13 @@ jobs:
               archive_sha=$(jq -er .oci_archive_sha256 "$RUNNER_TEMP/candidate-build-artifact/candidate-build.json")
               [ "$(sha256sum "$RUNNER_TEMP/candidate-build-artifact/candidate-image.tar" | awk '{print $1}')" = "$archive_sha" ]
               cp "$RUNNER_TEMP/candidate-build-artifact/candidate-image.tar" "$RUNNER_TEMP/candidate-image.tar"
-              decision=$(bin/agent-os-candidate-state.sh "$BUILD_ATTEMPT_STATE" exact-build exact)
-              [ "$decision" = reuse-build ]
               ensure_build_owner
               printf 'build=false\npublish_image=true\nrecord_artifact=false\nimage_digest=%s\nbootstrap_sha256=%s\n' \
                 "$image_digest" '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' >> "$GITHUB_OUTPUT"
               echo "::notice::candidate reservation recovered from exact build evidence"
               exit 0
             fi
-            decision=$(bin/agent-os-candidate-state.sh "$BUILD_ATTEMPT_STATE" absent exact)
-            [ "$decision" = build ]
+            [ "$candidate_action" = build ]
             ensure_build_owner
             printf 'build=true\nrecord_artifact=false\nbootstrap_sha256=%s\nclaim_sha=%s\nclaim_owner=%s\n' \
               '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' "$CLAIM_SHA" "$CLAIM_OWNER" >> "$GITHUB_OUTPUT"

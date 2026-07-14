@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
-export AGENT_OS_BOUND_PATH
+export AGENT_OS_BOUND_PATH AGENT_OS_BOUND_TEST_FALLBACK_ACTIVE
+AGENT_OS_BOUND_TEST_FALLBACK_ACTIVE=false
 
 agent_os_open_bound_dir() {
   local dir=$1 fd fd_root
@@ -17,6 +18,7 @@ agent_os_open_bound_dir() {
   elif [ "${AGENT_OS_TEST_BOUND_PATHS:-}" = true ]; then
     exec {fd}<&-
     AGENT_OS_BOUND_PATH=$(cd "$dir" && pwd -P)
+    AGENT_OS_BOUND_TEST_FALLBACK_ACTIVE=true
     return 0
   else
     exec {fd}<&-
@@ -30,7 +32,8 @@ agent_os_bound_dir_matches() {
 }
 
 agent_os_bound_git() {
-  local git_dir=$1 work_tree=$2
-  shift 2
-  trusted_git --git-dir="$git_dir" --work-tree="$work_tree" "$@"
+  local git_dir=$1 common_dir=$2 work_tree=$3
+  shift 3
+  trusted_git --agent-os-common-dir "$common_dir" \
+    --git-dir="$git_dir" --work-tree="$work_tree" "$@"
 }

@@ -4,45 +4,91 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 STATE="$ROOT/bin/agent-os-candidate-state.sh"
+TMP=$(fm_test_tmproot agent-os-candidate-state)
+mkdir -p "$TMP"
+OWNER_A=101
+OWNER_B=202
+OWNER_C=303
+CLAIM_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+CLAIM_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+CLAIM_C=cccccccccccccccccccccccccccccccccccccccc
+
+write_chain() {
+  printf '%b\n' "$@" > "$TMP/chain.tsv"
+}
 
 expect_decision() {
-  local expected=$1 attempt=$2 evidence=$3 claim=$4 actual
-  actual=$("$STATE" "$attempt" "$evidence" "$claim") || \
-    fail "state $attempt/$evidence/$claim did not produce $expected"
-  [ "$actual" = "$expected" ] || \
-    fail "state $attempt/$evidence/$claim produced $actual instead of $expected"
+  local expected=$1 actual
+  actual=$("$STATE" "$TMP/chain.tsv") || fail "claim chain did not produce $expected"
+  [ "$actual" = "$expected" ] || fail "claim chain produced $actual instead of $expected"
 }
 
 expect_refusal() {
-  local attempt=$1 evidence=$2 claim=$3
-  if "$STATE" "$attempt" "$evidence" "$claim" >/dev/null 2>&1; then
-    fail "state $attempt/$evidence/$claim authorized another build"
+  if "$STATE" "$TMP/chain.tsv" >/dev/null 2>&1; then
+    fail "claim chain authorized another build"
   fi
 }
 
-expect_decision build absent absent exact
-expect_decision reuse-build attempted exact-build exact
-expect_decision reuse-record attempted exact-record exact
+write_chain "$OWNER_A\t$CLAIM_A\tabsent\tabsent"
+expect_decision build
+
+write_chain \
+  "$OWNER_A\t$CLAIM_A\tattempted\texact-build" \
+  "$OWNER_B\t$CLAIM_B\tabsent\tabsent"
+expect_decision $'reuse-build\t'"$OWNER_A"
+
+write_chain \
+  "$OWNER_A\t$CLAIM_A\tattempted\texact-record" \
+  "$OWNER_B\t$CLAIM_B\tabsent\tabsent" \
+  "$OWNER_C\t$CLAIM_C\tabsent\tabsent"
+expect_decision $'reuse-record\t'"$OWNER_A"
 
 builds=0
-decision=$("$STATE" absent absent exact) || fail "initial candidate did not authorize its one build"
+write_chain "$OWNER_A\t$CLAIM_A\tabsent\tabsent"
+decision=$("$STATE" "$TMP/chain.tsv") || fail "initial claim did not authorize its build"
 [ "$decision" = build ] && builds=$((builds + 1))
-decision=$("$STATE" attempted exact-build exact) || fail "durable candidate build was not reusable"
+write_chain \
+  "$OWNER_A\t$CLAIM_A\tattempted\texact-build" \
+  "$OWNER_B\t$CLAIM_B\tabsent\tabsent"
+decision=$("$STATE" "$TMP/chain.tsv") || fail "handoff did not reuse ancestor evidence"
 [ "$decision" = build ] && builds=$((builds + 1))
-[ "$builds" -eq 1 ] || fail "candidate state machine authorized $builds builds"
+write_chain \
+  "$OWNER_A\t$CLAIM_A\tattempted\texact-build" \
+  "$OWNER_B\t$CLAIM_B\tabsent\tabsent" \
+  "$OWNER_C\t$CLAIM_C\tabsent\tabsent"
+decision=$("$STATE" "$TMP/chain.tsv") || fail "second handoff did not reuse ancestor evidence"
+[ "$decision" = build ] && builds=$((builds + 1))
+[ "$builds" -eq 1 ] || fail "claim-chain classifier authorized $builds builds"
 
-for attempt in attempted corrupt mismatched unreadable metadata-read-error partial ambiguous; do
-  expect_refusal "$attempt" absent exact
-done
-for evidence in corrupt mismatched unreadable metadata-read-error partial ambiguous; do
-  expect_refusal attempted "$evidence" exact
-done
-for claim in missing mismatched unreadable ambiguous; do
-  expect_refusal absent absent "$claim"
-done
-expect_refusal attempted partial exact
-expect_refusal attempted absent exact
-expect_refusal absent exact-build exact
-expect_refusal absent exact-record exact
+write_chain \
+  "$OWNER_A\t$CLAIM_A\tattempted\tabsent" \
+  "$OWNER_B\t$CLAIM_B\tabsent\tabsent"
+expect_refusal
 
-pass "candidate state machine permits one build and exact reuse only"
+write_chain \
+  "$OWNER_A\t$CLAIM_A\tattempted\texact-build" \
+  "$OWNER_B\t$CLAIM_B\tattempted\texact-build"
+expect_refusal
+
+write_chain \
+  "$OWNER_A\t$CLAIM_A\tabsent\texact-build" \
+  "$OWNER_B\t$CLAIM_B\tabsent\tabsent"
+expect_refusal
+
+for state in corrupt mismatched unreadable metadata-read-error partial ambiguous; do
+  write_chain "$OWNER_A\t$CLAIM_A\t$state\tabsent"
+  expect_refusal
+  write_chain "$OWNER_A\t$CLAIM_A\tattempted\t$state"
+  expect_refusal
+done
+
+write_chain \
+  "$OWNER_A\t$CLAIM_A\tabsent\tabsent" \
+  "$OWNER_A\t$CLAIM_B\tabsent\tabsent"
+expect_refusal
+write_chain \
+  "$OWNER_A\t$CLAIM_A\tabsent\tabsent" \
+  "$OWNER_B\t$CLAIM_A\tabsent\tabsent"
+expect_refusal
+
+pass "candidate claim-chain classifier permits one build and ancestor reuse only"
