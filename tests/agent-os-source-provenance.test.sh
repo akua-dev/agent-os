@@ -113,6 +113,16 @@ assert_grep 'ref: ${{ github.event.workflow_run.head_sha }}' "$ROOT/.github/work
   "publication checkout must use the exact CI-approved commit"
 assert_grep 'SOURCE_REVISION=${{ github.event.workflow_run.head_sha }}' "$ROOT/.github/workflows/agent-os-image.yml" \
   "published OCI provenance must use the exact CI-approved commit"
+assert_grep "github.event_name == 'workflow_run' && 'publish-main'" "$ROOT/.github/workflows/agent-os-image.yml" \
+  "protected-main publications must share one canceling concurrency group"
+assert_grep 'git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main' \
+  "$ROOT/.github/workflows/agent-os-image.yml" \
+  "publication must refresh protected main immediately before publishing"
+assert_grep 'current_main=$(git rev-parse refs/remotes/origin/main)' \
+  "$ROOT/.github/workflows/agent-os-image.yml" \
+  "publication must resolve the current protected-main commit"
+assert_grep 'if [ "$CI_HEAD_SHA" != "$current_main" ]; then' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "publication must reject an out-of-order stale CI run"
 assert_no_grep 'tags: ["v*"]' "$ROOT/.github/workflows/agent-os-image.yml" \
   "arbitrary tag pushes must not trigger publication"
 for action in \
