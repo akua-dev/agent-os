@@ -15,19 +15,21 @@ SOURCE_REF=$(cat /opt/agent-os-source.ref)
 case "$SOURCE_BRANCH" in ''|*[!A-Za-z0-9._/-]*|/*|*/|*..*) echo "error: image source branch provenance is invalid" >&2; exit 2 ;; esac
 [ "$SOURCE_ORIGIN" = https://github.com/akua-dev/agent-os.git ] || { echo "error: image source origin is invalid" >&2; exit 2; }
 case "$SOURCE_MODE" in
-  main) [ "$SOURCE_REF" = refs/heads/main ] || exit 2; TRUSTED_SOURCE_REF=$SOURCE_REF; TRUSTED_REF=refs/remotes/agent-os-verified/main ;;
+  main) [ "$SOURCE_REF" = refs/heads/main ] || exit 2; TRUSTED_SOURCE_REF=$SOURCE_REF; TRUSTED_REF=refs/remotes/agent-os-verified/main; AGENT_OS_SOURCE_UPDATE_POLICY=fast-forward ;;
   candidate)
     [ "$SOURCE_REF" = "refs/agent-os/candidates/$SOURCE_COMMIT" ] || exit 2
-    TRUSTED_SOURCE_REF=refs/heads/main
-    TRUSTED_REF=refs/remotes/agent-os-verified/main
+    TRUSTED_SOURCE_REF=$SOURCE_COMMIT
+    TRUSTED_REF=refs/remotes/agent-os-verified/candidate
+    AGENT_OS_SOURCE_UPDATE_POLICY=immutable
     ;;
-  release) [[ "$SOURCE_REF" =~ ^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || exit 2; TRUSTED_SOURCE_REF=$SOURCE_REF; TRUSTED_REF=refs/remotes/agent-os-verified/release ;;
+  release) [[ "$SOURCE_REF" =~ ^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || exit 2; TRUSTED_SOURCE_REF=$SOURCE_REF; TRUSTED_REF=refs/remotes/agent-os-verified/release; AGENT_OS_SOURCE_UPDATE_POLICY=immutable ;;
   event) echo "error: pull-request validation images are not runnable" >&2; exit 2 ;;
   *) echo "error: image source mode is invalid" >&2; exit 2 ;;
 esac
+export AGENT_OS_SOURCE_UPDATE_POLICY
 IMAGE_REF="refs/remotes/agent-os-image/$SOURCE_BRANCH"
-GIT_BIN=$(command -v git)
-case "$GIT_BIN" in /*) ;; *) echo "error: trusted Git executable is unavailable" >&2; exit 2 ;; esac
+GIT_BIN=/usr/bin/git
+[ -x "$GIT_BIN" ] || { echo "error: trusted Git executable is unavailable" >&2; exit 2; }
 
 trusted_git() {
   env -i HOME=/nonexistent PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C \

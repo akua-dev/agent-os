@@ -125,6 +125,12 @@ assert_grep 'env -i' "$ROOT/bin/agent-os-source-bundle.sh" \
   "source preparation must use an environment allowlist for trusted Git operations"
 assert_grep 'validate_source_git_config' "$ROOT/bin/agent-os-source-bundle.sh" \
   "source preparation must reject executable repository-local Git configuration"
+assert_grep 'GIT_BIN=/usr/bin/git' "$ROOT/bin/agent-os-source-bundle.sh" \
+  "source preparation must pin trusted Git outside the caller PATH"
+assert_no_grep 'config --worktree' "$ROOT/bin/agent-os-source-bundle.sh" \
+  "standard clones must not alias their local config through --worktree"
+assert_grep 'extensions.worktreeconfig' "$ROOT/bin/agent-os-source-bundle.sh" \
+  "source preparation must inspect config.worktree only when explicitly enabled"
 assert_grep 'canonical_github_origin' "$ROOT/bin/agent-os-source-bundle.sh" \
   "source preparation must canonicalize the trusted GitHub HTTPS origin"
 assert_grep 'https://github.com/akua-dev/agent-os|https://github.com/akua-dev/agent-os.git)' "$ROOT/bin/agent-os-source-bundle.sh" \
@@ -145,6 +151,8 @@ assert_grep 'GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null' "$ROOT/bin/agent
   "runtime provenance must isolate trusted Git operations"
 assert_grep 'env -i' "$ROOT/bin/agent-os-container-entrypoint.sh" \
   "runtime provenance must clear ambient Git paths, objects, helpers, and transport state"
+assert_grep 'GIT_BIN=/usr/bin/git' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "runtime provenance must pin trusted Git outside persistent user paths"
 assert_grep 'canonical FM_ROOT Git config key is not allowlisted' "$ROOT/bin/agent-os-container-entrypoint.sh" \
   "runtime provenance must use a strict repository-config allowlist"
 assert_no_grep 'config --file "$config" --no-includes --name-only --get-regexp' "$ROOT/bin/agent-os-container-entrypoint.sh" \
@@ -218,8 +226,14 @@ assert_grep '.enforcement == "active" and .target == "tag"' "$IMAGE_WORKFLOW" \
   "tag publication must require an active tag-targeting ruleset"
 assert_grep '.bypass_actors | length == 0' "$IMAGE_WORKFLOW" \
   "tag publication must reject rulesets with bypass actors"
-assert_grep 'candidate-record-' "$IMAGE_WORKFLOW" \
-  "protected main must retain one commit-addressed release candidate record"
+assert_no_grep '$IMAGE:candidate-record-' "$IMAGE_WORKFLOW" \
+  "candidate records must never depend on a mutable registry tag"
+assert_grep 'pre-existing release candidate lacks an independently trusted record' "$IMAGE_WORKFLOW" \
+  "publication must reject unrecorded pre-existing candidate images"
+assert_no_grep 'EXISTING_CANDIDATE_IMAGE_DIGEST' "$IMAGE_WORKFLOW" \
+  "publication must never adopt a pre-existing image from its embedded provenance"
+assert_grep 'oras manifest push --descriptor "$IMAGE@$candidate_record_digest"' "$IMAGE_WORKFLOW" \
+  "candidate records must be created only at their content-addressed digest"
 assert_grep 'candidate record coordinate already contains different artifacts' "$IMAGE_WORKFLOW" \
   "candidate record creation must reject immutable coordinate conflicts"
 assert_grep 'release candidate image provenance conflicts with the exact protected-main source' "$IMAGE_WORKFLOW" \
@@ -230,8 +244,18 @@ assert_grep 'source_mode:"candidate"' "$IMAGE_WORKFLOW" \
   "candidate records must bind the immutable runtime source policy"
 assert_grep 'platform_manifests' "$IMAGE_WORKFLOW" \
   "candidate records must bind every published platform manifest"
+assert_grep 'candidate-platform-subjects' "$IMAGE_WORKFLOW" \
+  "candidate attestations must map one-to-one onto platform manifests"
+assert_grep 'candidate-sbom-' "$IMAGE_WORKFLOW" \
+  "candidate validation must inspect each exact SBOM statement"
+assert_grep '.predicateType == "https://spdx.dev/Document"' "$IMAGE_WORKFLOW" \
+  "candidate validation must bind every SBOM subject to its platform"
 assert_grep 'buildkit_outputs_sha256' "$IMAGE_WORKFLOW" \
   "candidate records must bind the exact BuildKit output descriptors"
+assert_grep '.bootstrap_archive_sha256 == $bootstrapArchive' "$IMAGE_WORKFLOW" \
+  "candidate retries and promotion must enforce the exact bootstrap archive"
+assert_grep 'bootstrap archive differs from the immutable release record' "$ROOT/bin/agent-os-source-bundle.sh" \
+  "release source preparation must regenerate and verify the exact bootstrap archive"
 assert_grep 'actual_image_digest' "$IMAGE_WORKFLOW" \
   "release publication must compare the actual multi-platform image digest"
 assert_grep 'actual_sbom_sha256' "$IMAGE_WORKFLOW" \
@@ -246,6 +270,8 @@ assert_grep 'oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6' "
   "release publication must pin the OCI transfer implementation"
 assert_grep 'published-tag-index.json' "$IMAGE_WORKFLOW" \
   "release publication must verify every published tag resolves to the recorded digest"
+assert_grep 'published-platform-subjects' "$IMAGE_WORKFLOW" \
+  "release promotion must reverify the per-platform attestation bijection"
 assert_grep 'File.fnmatch?(pattern, ref, File::FNM_PATHNAME)' "$IMAGE_WORKFLOW" \
   "tag ruleset coverage must use GitHub's documented pathname matcher"
 assert_no_grep 'import fnmatch' "$IMAGE_WORKFLOW" \
@@ -303,8 +329,10 @@ assert_grep 'linux/amd64,linux/arm64' "$ROOT/.github/workflows/agent-os-image.ym
   "release workflow must build the two supported container architectures"
 [ "$(grep -c '^          push: false$' "$IMAGE_WORKFLOW")" -eq 1 ] || \
   fail "the read-only validation job must build without publishing"
-[ "$(grep -c '^          push: true$' "$IMAGE_WORKFLOW")" -eq 2 ] || \
-  fail "only the protected candidate and main publication builds may push images"
+[ "$(grep -c '^          push: true$' "$IMAGE_WORKFLOW")" -eq 1 ] || \
+  fail "only the protected main publication build may use mutable-tag push mode"
+assert_grep 'push-by-digest=true' "$IMAGE_WORKFLOW" \
+  "the release candidate must publish without a mutable image tag"
 assert_grep 'id: build' "$ROOT/.github/workflows/agent-os-image.yml" \
   "release workflow must expose its build result"
 assert_grep 'steps.build.outputs.digest' "$ROOT/.github/workflows/agent-os-image.yml" \
@@ -321,6 +349,10 @@ assert_grep 'docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051' "$
   "release metadata action must be pinned to the reviewed full SHA"
 assert_grep 'docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8' "$ROOT/.github/workflows/agent-os-image.yml" \
   "release build action must be pinned to the reviewed full SHA"
+assert_grep 'AGENT_OS_SOURCE_UPDATE_POLICY=immutable' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "candidate and release runtimes must disable moving-main self-updates"
+assert_grep 'TRUSTED_SOURCE_REF=$SOURCE_COMMIT' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "candidate runtime provenance must fetch its immutable commit"
 if grep -E 'uses: (actions/checkout|docker/[^@]+|oras-project/setup-oras)@v[0-9]+' "$ROOT/.github/workflows/agent-os-image.yml" >/dev/null; then
   fail "release workflow must not use mutable major action tags"
 fi

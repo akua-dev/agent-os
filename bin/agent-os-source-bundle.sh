@@ -15,8 +15,8 @@ SOURCE_ARCHIVE="$OUTPUT_DIR/agent-os-source.tar"
 BOOTSTRAP_ARCHIVE="$OUTPUT_DIR/agent-os-bootstrap.tar"
 ATTESTATION="$OUTPUT_DIR/agent-os-source.attestation"
 TEMP="$OUTPUT_DIR/.agent-os-source.$$"
-GIT_BIN=$(command -v git)
-case "$GIT_BIN" in /*) ;; *) echo "error: trusted Git executable is unavailable" >&2; exit 2 ;; esac
+GIT_BIN=/usr/bin/git
+[ -x "$GIT_BIN" ] || { echo "error: trusted Git executable is unavailable" >&2; exit 2; }
 
 git_isolated() {
   env -i HOME=/nonexistent PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C \
@@ -35,7 +35,7 @@ canonical_github_origin() {
 }
 
 validate_source_git_config() {
-  local key value origin worktree_keys
+  local key value origin worktree_config worktree_config_enabled worktree_keys
   while IFS= read -r key; do
     [ -n "$key" ] || continue
     value=$(git_isolated -C "$ROOT" config --local --no-includes --get-all "$key" || true)
@@ -61,11 +61,17 @@ validate_source_git_config() {
       *) echo "error: source repository Git config key is not allowlisted: $key" >&2; exit 2 ;;
     esac || { echo "error: source repository Git config value is invalid: $key" >&2; exit 2; }
   done < <(git_isolated -C "$ROOT" config --local --no-includes --name-only --list)
-  worktree_keys=$(git_isolated -C "$ROOT" config --worktree --no-includes --name-only --list 2>/dev/null || true)
-  [ -z "$worktree_keys" ] || {
-    echo "error: source repository worktree Git config is not allowed" >&2
-    exit 2
-  }
+  worktree_config_enabled=$(git_isolated -C "$ROOT" config --local --type=bool --get extensions.worktreeconfig || true)
+  if [ "$worktree_config_enabled" = true ]; then
+    worktree_config=$(git_isolated -C "$ROOT" rev-parse --path-format=absolute --git-path config.worktree)
+    if [ -f "$worktree_config" ]; then
+      worktree_keys=$(git_isolated config --file "$worktree_config" --no-includes --name-only --list)
+      [ -z "$worktree_keys" ] || {
+        echo "error: source repository worktree Git config is not allowed" >&2
+        exit 2
+      }
+    fi
+  fi
   origin=$(git_isolated -C "$ROOT" config --local --no-includes --get remote.origin.url || true)
   [ "$(canonical_github_origin "$origin" 2>/dev/null || true)" = "$SOURCE_ORIGIN" ] || {
     echo "error: repository origin is not the exact trusted HTTPS origin" >&2
@@ -172,13 +178,11 @@ elif [ "$SOURCE_MODE" = release ]; then
   }
 fi
 
-if [ "$SOURCE_MODE" = release ]; then
-  git_isolated --git-dir="$TEMP/bootstrap.git" update-ref -d refs/agent-os/release-record
-  git_isolated --git-dir="$TEMP/bootstrap.git" update-ref -d "refs/tags/$RELEASE_TAG"
-  printf '%s\n' "$SOURCE_COMMIT" > "$TEMP/bootstrap.git/shallow"
-  git_isolated --git-dir="$TEMP/bootstrap.git" reflog expire --expire=now --all
-  git_isolated --git-dir="$TEMP/bootstrap.git" gc --prune=now
-fi
+git_isolated init --bare "$TEMP/sanitized.git" >/dev/null
+git_isolated -c protocol.file.allow=always --git-dir="$TEMP/sanitized.git" fetch --depth=1 --no-tags \
+  "file://$TEMP/bootstrap.git" "$SOURCE_COMMIT:refs/heads/main"
+rm -rf "$TEMP/bootstrap.git"
+mv "$TEMP/sanitized.git" "$TEMP/bootstrap.git"
 
 git_isolated --git-dir="$TEMP/bootstrap.git" symbolic-ref HEAD refs/heads/main
 git_isolated --git-dir="$TEMP/bootstrap.git" remote add origin "$SOURCE_ORIGIN"
@@ -198,6 +202,10 @@ fi
   find bootstrap.git -print | LC_ALL=C sort | COPYFILE_DISABLE=1 tar -cf "$BOOTSTRAP_ARCHIVE.tmp.$$" -T -)
 SOURCE_SHA=$(sha256_file "$SOURCE_ARCHIVE.tmp.$$")
 BOOTSTRAP_SHA=$(sha256_file "$BOOTSTRAP_ARCHIVE.tmp.$$")
+if [ "$SOURCE_MODE" = release ] && [ "$BOOTSTRAP_SHA" != "$(jq -r .bootstrap_archive_sha256 "$TEMP/release.json")" ]; then
+  echo "error: bootstrap archive differs from the immutable release record" >&2
+  exit 2
+fi
 {
   printf 'mode=%s\ncommit=%s\ntree=%s\nbranch=%s\norigin=%s\nref=%s\n' \
     "$SOURCE_MODE" "$SOURCE_COMMIT" "$SOURCE_TREE" "$SOURCE_BRANCH" "$SOURCE_ORIGIN" "$SOURCE_REF"

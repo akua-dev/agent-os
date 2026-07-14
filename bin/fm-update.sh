@@ -47,6 +47,18 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
 fi
 [ $# -eq 0 ] || { usage; exit 1; }
 
+case "${AGENT_OS_SOURCE_UPDATE_POLICY:-fast-forward}" in
+  fast-forward) ;;
+  immutable)
+    echo "error: self-update is disabled for immutable image source" >&2
+    exit 2
+    ;;
+  *)
+    echo "error: invalid Agent OS source update policy" >&2
+    exit 2
+    ;;
+esac
+
 # --- main firstmate repo ---------------------------------------------------
 
 reread_firstmate="no"

@@ -291,6 +291,25 @@ test_unsafe_secondmate_home_skipped_before_git_update() {
   pass "T11 unsafe secondmate home is not fast-forwarded"
 }
 
+test_immutable_image_source_refuses_self_update() {
+  local w out status before
+  w=$(new_world t12)
+  bump_origin "$w" instr
+  before=$(git -C "$w/main" rev-parse HEAD)
+
+  set +e
+  out=$(AGENT_OS_SOURCE_UPDATE_POLICY=immutable FM_ROOT_OVERRIDE="$w/main" FM_HOME="$w/home" "$UPDATE" 2>&1)
+  status=$?
+  set -e
+
+  [ "$status" -eq 2 ] || fail "immutable image update exited $status, expected 2"
+  assert_contains "$out" "self-update is disabled for immutable image source" \
+    "immutable image source blocks moving-main self-update"
+  [ "$(git -C "$w/main" rev-parse HEAD)" = "$before" ] \
+    || fail "immutable image source moved during refused self-update"
+  pass "T12 immutable image source refuses self-update"
+}
+
 test_updates_main_and_secondmate
 test_reread_gate_is_instruction_only
 test_dirty_secondmate_skipped
@@ -300,5 +319,6 @@ test_registry_backstop_dedup_and_self_exclusion
 test_firstmate_wrong_branch_skipped
 test_firstmate_detached_head_skipped
 test_unsafe_secondmate_home_skipped_before_git_update
+test_immutable_image_source_refuses_self_update
 
 echo "# all fm-update tests passed"

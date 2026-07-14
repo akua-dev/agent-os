@@ -211,43 +211,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve existing release candidate record
+      - name: Reject legacy candidate coordinates
         if: github.ref == 'refs/heads/main'
-        id: candidate_state
         run: |
           set -eu
-          candidate_ref="$IMAGE:candidate-record-$GITHUB_SHA"
-          if oras manifest fetch --descriptor "$candidate_ref" > "$RUNNER_TEMP/candidate-descriptor.json" 2> "$RUNNER_TEMP/candidate-descriptor.err"; then
-            candidate_record_digest=$(jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))' "$RUNNER_TEMP/candidate-descriptor.json")
-            mkdir "$RUNNER_TEMP/existing-candidate"
-            oras pull --output "$RUNNER_TEMP/existing-candidate" "$IMAGE@$candidate_record_digest"
-            cp "$RUNNER_TEMP/existing-candidate/candidate-record.json" "$RUNNER_TEMP/candidate-record.json"
-            printf 'exists=true\ncandidate_record_digest=%s\n' "$candidate_record_digest" >> "$GITHUB_OUTPUT"
-          elif grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/candidate-descriptor.err"; then
-            image_ref="$IMAGE:release-candidate-$GITHUB_SHA"
-            if oras manifest fetch --descriptor "$image_ref" > "$RUNNER_TEMP/candidate-image-descriptor.json" 2> "$RUNNER_TEMP/candidate-image-descriptor.err"; then
-              image_digest=$(jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))' "$RUNNER_TEMP/candidate-image-descriptor.json")
-              printf 'exists=false\nimage_exists=true\nimage_digest=%s\n' "$image_digest" >> "$GITHUB_OUTPUT"
-            elif grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/candidate-image-descriptor.err"; then
-              printf 'exists=false\nimage_exists=false\n' >> "$GITHUB_OUTPUT"
-            else
-              cat "$RUNNER_TEMP/candidate-image-descriptor.err" >&2
-              exit 1
-            fi
+          legacy_ref="$IMAGE:release-candidate-$GITHUB_SHA"
+          if oras manifest fetch --descriptor "$legacy_ref" > "$RUNNER_TEMP/legacy-candidate.json" 2> "$RUNNER_TEMP/legacy-candidate.err"; then
+            echo "::error::pre-existing release candidate lacks an independently trusted record"
+            exit 1
+          elif grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/legacy-candidate.err"; then
+            :
           else
-            cat "$RUNNER_TEMP/candidate-descriptor.err" >&2
+            cat "$RUNNER_TEMP/legacy-candidate.err" >&2
             exit 1
           fi
 
       - name: Build release candidate once
-        if: github.ref == 'refs/heads/main' && steps.candidate_state.outputs.exists == 'false' && steps.candidate_state.outputs.image_exists == 'false'
+        if: github.ref == 'refs/heads/main'
         id: candidate_build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ env.IMAGE }}:release-candidate-${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: mode=max
@@ -265,38 +251,37 @@ jobs:
         id: candidate_record
         env:
           CANDIDATE_BUILD_DIGEST: ${{ steps.candidate_build.outputs.digest }}
-          CANDIDATE_EXISTS: ${{ steps.candidate_state.outputs.exists }}
-          EXISTING_CANDIDATE_IMAGE_DIGEST: ${{ steps.candidate_state.outputs.image_digest }}
         run: |
           set -eu
-          candidate_ref="$IMAGE:candidate-record-$GITHUB_SHA"
-          artifact_set_sha() {
-            predicate=$1
-            output=$2
-            : > "$output"
-            jq -r '.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .digest' "$RUNNER_TEMP/candidate-index.json" | while IFS= read -r manifest_digest; do
-              docker buildx imagetools inspect --raw "$IMAGE@$manifest_digest" > "$RUNNER_TEMP/candidate-attestation.json"
-              jq -r --arg predicate "$predicate" '.layers[] | select(.annotations["in-toto.io/predicate-type"] == $predicate) | .digest' "$RUNNER_TEMP/candidate-attestation.json" >> "$output"
-            done
-            LC_ALL=C sort -u -o "$output" "$output"
-            [ "$(wc -l < "$output" | tr -d ' ')" -eq 2 ]
-            sha256sum "$output" | awk '{print $1}'
-          }
-          verify_candidate_provenance() {
+          verify_candidate_attestations() {
+            printf '%s' "$platform_manifests" | jq -r '.[].digest' | LC_ALL=C sort > "$RUNNER_TEMP/candidate-platform-digests"
+            : > "$RUNNER_TEMP/candidate-platform-subjects"
+            : > "$RUNNER_TEMP/candidate-sbom-digests"
+            : > "$RUNNER_TEMP/candidate-provenance-digests"
             jq -r '.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .digest' \
               "$RUNNER_TEMP/candidate-index.json" > "$RUNNER_TEMP/candidate-attestation-manifests"
             [ "$(wc -l < "$RUNNER_TEMP/candidate-attestation-manifests" | tr -d ' ')" -eq 2 ]
             while IFS= read -r manifest_digest; do
               manifest_file="$RUNNER_TEMP/candidate-attestation-${manifest_digest#sha256:}.json"
+              sbom_file="$RUNNER_TEMP/candidate-sbom-${manifest_digest#sha256:}.json"
               provenance_file="$RUNNER_TEMP/candidate-provenance-${manifest_digest#sha256:}.json"
               docker buildx imagetools inspect --raw "$IMAGE@$manifest_digest" > "$manifest_file"
               subject_digest=$(jq -er --arg manifest "$manifest_digest" '
                 .manifests[] | select(.digest == $manifest)
                 | .annotations["vnd.docker.reference.digest"] | select(test("^sha256:[0-9a-f]{64}$"))' \
                 "$RUNNER_TEMP/candidate-index.json")
-              printf '%s' "$platform_manifests" | jq -e --arg subject "$subject_digest" 'any(.[]; .digest == $subject)' >/dev/null
+              printf '%s\n' "$subject_digest" >> "$RUNNER_TEMP/candidate-platform-subjects"
+              sbom_digest=$(jq -er '[.layers[] | select(.annotations["in-toto.io/predicate-type"] == "https://spdx.dev/Document")] | select(length == 1) | .[0].digest' "$manifest_file")
               provenance_digest=$(jq -er '[.layers[] | select(.annotations["in-toto.io/predicate-type"] == "https://slsa.dev/provenance/v0.2")] | select(length == 1) | .[0].digest' "$manifest_file")
+              oras blob fetch --output "$sbom_file" "$IMAGE@$sbom_digest"
               oras blob fetch --output "$provenance_file" "$IMAGE@$provenance_digest"
+              jq -e --arg subject "${subject_digest#sha256:}" '
+                .predicateType == "https://spdx.dev/Document" and
+                (.subject | length == 1) and .subject[0].digest.sha256 == $subject' \
+                "$sbom_file" >/dev/null || {
+                echo "::error::release candidate SBOM does not bind its exact platform manifest"
+                exit 1
+              }
               jq -e --arg subject "${subject_digest#sha256:}" \
                 --arg commit '${{ steps.candidate_source.outputs.commit }}' \
                 --arg tree '${{ steps.candidate_source.outputs.tree }}' \
@@ -319,49 +304,43 @@ jobs:
                 echo "::error::release candidate image provenance conflicts with the exact protected-main source"
                 exit 1
               }
+              printf '%s\n' "$sbom_digest" >> "$RUNNER_TEMP/candidate-sbom-digests"
+              printf '%s\n' "$provenance_digest" >> "$RUNNER_TEMP/candidate-provenance-digests"
             done < "$RUNNER_TEMP/candidate-attestation-manifests"
+            LC_ALL=C sort -o "$RUNNER_TEMP/candidate-platform-subjects" "$RUNNER_TEMP/candidate-platform-subjects"
+            cmp "$RUNNER_TEMP/candidate-platform-digests" "$RUNNER_TEMP/candidate-platform-subjects" || {
+              echo "::error::release candidate attestations do not map one-to-one onto both platforms"
+              exit 1
+            }
+            LC_ALL=C sort -o "$RUNNER_TEMP/candidate-sbom-digests" "$RUNNER_TEMP/candidate-sbom-digests"
+            LC_ALL=C sort -o "$RUNNER_TEMP/candidate-provenance-digests" "$RUNNER_TEMP/candidate-provenance-digests"
           }
-          if [ "$CANDIDATE_EXISTS" = true ]; then
-            actual_image_digest=$(jq -er '.image_digest' "$RUNNER_TEMP/candidate-record.json")
-          elif [ -n "$EXISTING_CANDIDATE_IMAGE_DIGEST" ]; then
-            actual_image_digest=$EXISTING_CANDIDATE_IMAGE_DIGEST
-          else
-            actual_image_digest=$CANDIDATE_BUILD_DIGEST
-          fi
+          actual_image_digest=$CANDIDATE_BUILD_DIGEST
           [[ "$actual_image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           docker buildx imagetools inspect --raw "$IMAGE@$actual_image_digest" > "$RUNNER_TEMP/candidate-index.json"
           [ "sha256:$(sha256sum "$RUNNER_TEMP/candidate-index.json" | awk '{print $1}')" = "$actual_image_digest" ]
           platform_manifests=$(jq -cS '[.manifests[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")) | {platform:(.platform.os + "/" + .platform.architecture),digest,mediaType,size}] | sort_by(.platform)' "$RUNNER_TEMP/candidate-index.json")
-          [ "$(printf '%s' "$platform_manifests" | jq 'length')" -eq 2 ]
-          verify_candidate_provenance
+          printf '%s' "$platform_manifests" | jq -e '[.[].platform] == ["linux/amd64","linux/arm64"]' >/dev/null
+          verify_candidate_attestations
           platform_manifests_sha256=$(printf '%s' "$platform_manifests" | sha256sum | awk '{print $1}')
           buildkit_outputs=$(jq -cS '[.manifests[] | {digest,mediaType,size,platform,annotations}] | sort_by(.digest)' "$RUNNER_TEMP/candidate-index.json")
           buildkit_outputs_sha256=$(printf '%s' "$buildkit_outputs" | sha256sum | awk '{print $1}')
-          actual_sbom_sha256=$(artifact_set_sha https://spdx.dev/Document "$RUNNER_TEMP/candidate-sbom-digests")
-          actual_provenance_sha256=$(artifact_set_sha https://slsa.dev/provenance/v0.2 "$RUNNER_TEMP/candidate-provenance-digests")
-          if [ "$CANDIDATE_EXISTS" = false ]; then
-            jq -cnS \
-              --arg commit '${{ steps.candidate_source.outputs.commit }}' \
-              --arg tree '${{ steps.candidate_source.outputs.tree }}' \
-              --arg sourceArchive '${{ steps.candidate_source.outputs.source_sha256 }}' \
-              --arg bootstrapArchive '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' \
-              --arg package "$(sha256sum tools/agent-os/packages/firstmate/package.k | awk '{print $1}')" \
-              --arg schema "$(sha256sum tools/agent-os/packages/firstmate/inputs.example.yaml | awk '{print $1}')" \
-              --arg quickstart "$(sha256sum docs/kubernetes.md | awk '{print $1}')" \
-              --arg repository "$IMAGE" --arg image "$actual_image_digest" \
-              --argjson platforms "$platform_manifests" --arg platformsSha "$platform_manifests_sha256" \
-              --arg sbom "$actual_sbom_sha256" --arg provenance "$actual_provenance_sha256" \
-              --arg buildkitOutputs "$buildkit_outputs_sha256" \
-              '{schema_version:1,source_mode:"candidate",commit:$commit,tree:$tree,source_archive_sha256:$sourceArchive,bootstrap_archive_sha256:$bootstrapArchive,package_sha256:$package,schema_sha256:$schema,quickstart_sha256:$quickstart,image_repository:$repository,image_digest:$image,platform_manifests:$platforms,platform_manifests_sha256:$platformsSha,sbom_sha256:$sbom,provenance_sha256:$provenance,buildkit_outputs_sha256:$buildkitOutputs}' \
-              > "$RUNNER_TEMP/candidate-record.json"
-            oras push --artifact-type application/vnd.akua.agent-os.release-candidate.v1 \
-              --format json "$candidate_ref" \
-              "$RUNNER_TEMP/candidate-record.json:application/vnd.akua.agent-os.release-candidate.v1+json" \
-              > "$RUNNER_TEMP/candidate-push.json"
-            candidate_record_digest=$(jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))' "$RUNNER_TEMP/candidate-push.json")
-          else
-            candidate_record_digest='${{ steps.candidate_state.outputs.candidate_record_digest }}'
-          fi
+          actual_sbom_sha256=$(sha256sum "$RUNNER_TEMP/candidate-sbom-digests" | awk '{print $1}')
+          actual_provenance_sha256=$(sha256sum "$RUNNER_TEMP/candidate-provenance-digests" | awk '{print $1}')
+          jq -cnS \
+            --arg commit '${{ steps.candidate_source.outputs.commit }}' \
+            --arg tree '${{ steps.candidate_source.outputs.tree }}' \
+            --arg sourceArchive '${{ steps.candidate_source.outputs.source_sha256 }}' \
+            --arg bootstrapArchive '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' \
+            --arg package "$(sha256sum tools/agent-os/packages/firstmate/package.k | awk '{print $1}')" \
+            --arg schema "$(sha256sum tools/agent-os/packages/firstmate/inputs.example.yaml | awk '{print $1}')" \
+            --arg quickstart "$(sha256sum docs/kubernetes.md | awk '{print $1}')" \
+            --arg repository "$IMAGE" --arg image "$actual_image_digest" \
+            --argjson platforms "$platform_manifests" --arg platformsSha "$platform_manifests_sha256" \
+            --arg sbom "$actual_sbom_sha256" --arg provenance "$actual_provenance_sha256" \
+            --arg buildkitOutputs "$buildkit_outputs_sha256" \
+            '{schema_version:1,source_mode:"candidate",commit:$commit,tree:$tree,source_archive_sha256:$sourceArchive,bootstrap_archive_sha256:$bootstrapArchive,package_sha256:$package,schema_sha256:$schema,quickstart_sha256:$quickstart,image_repository:$repository,image_digest:$image,platform_manifests:$platforms,platform_manifests_sha256:$platformsSha,sbom_sha256:$sbom,provenance_sha256:$provenance,buildkit_outputs_sha256:$buildkitOutputs}' \
+            > "$RUNNER_TEMP/candidate-record.json"
           jq -e \
             --arg commit '${{ steps.candidate_source.outputs.commit }}' --arg tree '${{ steps.candidate_source.outputs.tree }}' \
             --arg sourceArchive '${{ steps.candidate_source.outputs.source_sha256 }}' \
@@ -372,18 +351,41 @@ jobs:
             --arg repository "$IMAGE" --arg image "$actual_image_digest" \
             --argjson platforms "$platform_manifests" --arg platformsSha "$platform_manifests_sha256" \
             --arg sbom "$actual_sbom_sha256" --arg provenance "$actual_provenance_sha256" \
-            --arg buildkitOutputs "$buildkit_outputs_sha256" --arg existing "$CANDIDATE_EXISTS" \
-            '.schema_version == 1 and .source_mode == "candidate" and .commit == $commit and .tree == $tree and .source_archive_sha256 == $sourceArchive and (($existing == "false" and .bootstrap_archive_sha256 == $bootstrapArchive) or ($existing == "true" and (.bootstrap_archive_sha256 | test("^[0-9a-f]{64}$")))) and .package_sha256 == $package and .schema_sha256 == $schema and .quickstart_sha256 == $quickstart and .image_repository == $repository and .image_digest == $image and .platform_manifests == $platforms and .platform_manifests_sha256 == $platformsSha and .sbom_sha256 == $sbom and .provenance_sha256 == $provenance and .buildkit_outputs_sha256 == $buildkitOutputs' \
+            --arg buildkitOutputs "$buildkit_outputs_sha256" \
+            '.schema_version == 1 and .source_mode == "candidate" and .commit == $commit and .tree == $tree and .source_archive_sha256 == $sourceArchive and .bootstrap_archive_sha256 == $bootstrapArchive and .package_sha256 == $package and .schema_sha256 == $schema and .quickstart_sha256 == $quickstart and .image_repository == $repository and .image_digest == $image and .platform_manifests == $platforms and .platform_manifests_sha256 == $platformsSha and .sbom_sha256 == $sbom and .provenance_sha256 == $provenance and .buildkit_outputs_sha256 == $buildkitOutputs' \
             "$RUNNER_TEMP/candidate-record.json" >/dev/null || {
             echo "::error::candidate record coordinate already contains different artifacts"
             exit 1
           }
-          oras manifest fetch --descriptor "$candidate_ref" > "$RUNNER_TEMP/candidate-readback-descriptor.json"
-          [ "$(jq -r .digest "$RUNNER_TEMP/candidate-readback-descriptor.json")" = "$candidate_record_digest" ]
-          rm -rf "$RUNNER_TEMP/candidate-readback"
-          mkdir "$RUNNER_TEMP/candidate-readback"
-          oras pull --output "$RUNNER_TEMP/candidate-readback" "$IMAGE@$candidate_record_digest"
-          cmp "$RUNNER_TEMP/candidate-record.json" "$RUNNER_TEMP/candidate-readback/candidate-record.json"
+          printf '{}\n' > "$RUNNER_TEMP/candidate-config.json"
+          oras blob push --media-type application/vnd.oci.empty.v1+json --descriptor \
+            "$IMAGE" "$RUNNER_TEMP/candidate-config.json" > "$RUNNER_TEMP/candidate-config-descriptor.json"
+          oras blob push --media-type application/vnd.akua.agent-os.release-candidate.v1+json --descriptor \
+            "$IMAGE" "$RUNNER_TEMP/candidate-record.json" > "$RUNNER_TEMP/candidate-record-descriptor.json"
+          config_descriptor=$(jq -cS '{mediaType,digest,size}' "$RUNNER_TEMP/candidate-config-descriptor.json")
+          record_descriptor=$(jq -cS '{mediaType,digest,size,annotations:{"org.opencontainers.image.title":"candidate-record.json"}}' "$RUNNER_TEMP/candidate-record-descriptor.json")
+          jq -cnS --argjson config "$config_descriptor" --argjson record "$record_descriptor" \
+            '{schemaVersion:2,mediaType:"application/vnd.oci.image.manifest.v1+json",artifactType:"application/vnd.akua.agent-os.release-candidate.v1",config:$config,layers:[$record]}' \
+            > "$RUNNER_TEMP/candidate-manifest.json"
+          candidate_record_digest="sha256:$(sha256sum "$RUNNER_TEMP/candidate-manifest.json" | awk '{print $1}')"
+          if oras manifest fetch "$IMAGE@$candidate_record_digest" > "$RUNNER_TEMP/candidate-existing-manifest.json" 2> "$RUNNER_TEMP/candidate-existing-manifest.err"; then
+            cmp "$RUNNER_TEMP/candidate-manifest.json" "$RUNNER_TEMP/candidate-existing-manifest.json" || {
+              echo "::error::candidate record coordinate already contains different artifacts"
+              exit 1
+            }
+          elif grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/candidate-existing-manifest.err"; then
+            oras manifest push --descriptor "$IMAGE@$candidate_record_digest" \
+              "$RUNNER_TEMP/candidate-manifest.json" > "$RUNNER_TEMP/candidate-push.json"
+            [ "$(jq -r .digest "$RUNNER_TEMP/candidate-push.json")" = "$candidate_record_digest" ]
+          else
+            cat "$RUNNER_TEMP/candidate-existing-manifest.err" >&2
+            exit 1
+          fi
+          oras manifest fetch "$IMAGE@$candidate_record_digest" > "$RUNNER_TEMP/candidate-readback-manifest.json"
+          cmp "$RUNNER_TEMP/candidate-manifest.json" "$RUNNER_TEMP/candidate-readback-manifest.json"
+          record_blob_digest=$(jq -er '.layers | select(length == 1) | .[0].digest' "$RUNNER_TEMP/candidate-readback-manifest.json")
+          oras blob fetch --output "$RUNNER_TEMP/candidate-record-readback.json" "$IMAGE@$record_blob_digest"
+          cmp "$RUNNER_TEMP/candidate-record.json" "$RUNNER_TEMP/candidate-record-readback.json"
           printf 'candidate_record_digest=%s\nimage_digest=%s\n' "$candidate_record_digest" "$actual_image_digest" >> "$GITHUB_OUTPUT"
 
       - name: Retain candidate record for release preparation
@@ -391,7 +393,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: agent-os-candidate-record-${{ github.sha }}
-          path: ${{ runner.temp }}/candidate-record.json
+          path: |
+            ${{ runner.temp }}/candidate-record.json
+            ${{ runner.temp }}/candidate-manifest.json
           if-no-files-found: error
           retention-days: 90
 
@@ -437,20 +441,21 @@ jobs:
 
       - name: Promote exact verified release candidate
         if: startsWith(github.ref, 'refs/tags/')
-        env:
-          RELEASE_COMMIT: ${{ steps.release_source.outputs.commit }}
         run: |
           set -eu
           release_tag=${GITHUB_REF#refs/tags/}
-          candidate_ref="$IMAGE:candidate-record-$RELEASE_COMMIT"
-          oras manifest fetch --descriptor "$candidate_ref" > "$RUNNER_TEMP/release-candidate-descriptor.json"
           candidate_record_digest=$(jq -er '.candidate_record_digest' "$RUNNER_TEMP/release-record.json")
-          [ "$(jq -r .digest "$RUNNER_TEMP/release-candidate-descriptor.json")" = "$candidate_record_digest" ]
-          mkdir "$RUNNER_TEMP/release-candidate"
-          oras pull --output "$RUNNER_TEMP/release-candidate" "$IMAGE@$candidate_record_digest"
+          oras manifest fetch "$IMAGE@$candidate_record_digest" > "$RUNNER_TEMP/release-candidate-manifest.json"
+          [ "sha256:$(sha256sum "$RUNNER_TEMP/release-candidate-manifest.json" | awk '{print $1}')" = "$candidate_record_digest" ]
+          candidate_record_blob=$(jq -er '
+            select(.schemaVersion == 2 and .artifactType == "application/vnd.akua.agent-os.release-candidate.v1")
+            | .layers | select(length == 1) | .[0]
+            | select(.mediaType == "application/vnd.akua.agent-os.release-candidate.v1+json") | .digest' \
+            "$RUNNER_TEMP/release-candidate-manifest.json")
+          oras blob fetch --output "$RUNNER_TEMP/release-candidate-record.json" "$IMAGE@$candidate_record_blob"
           jq -cS '{schema_version,source_mode,commit,tree,source_archive_sha256,bootstrap_archive_sha256,package_sha256,schema_sha256,quickstart_sha256,image_repository,image_digest,platform_manifests,platform_manifests_sha256,sbom_sha256,provenance_sha256,buildkit_outputs_sha256}' \
             "$RUNNER_TEMP/release-record.json" > "$RUNNER_TEMP/expected-candidate-record.json"
-          jq -cS . "$RUNNER_TEMP/release-candidate/candidate-record.json" > "$RUNNER_TEMP/actual-candidate-record.json"
+          jq -cS . "$RUNNER_TEMP/release-candidate-record.json" > "$RUNNER_TEMP/actual-candidate-record.json"
           cmp "$RUNNER_TEMP/expected-candidate-record.json" "$RUNNER_TEMP/actual-candidate-record.json"
           RELEASE_DIGEST=$(jq -er '.image_digest' "$RUNNER_TEMP/release-record.json")
           docker buildx imagetools inspect --raw "$IMAGE@$RELEASE_DIGEST" > "$RUNNER_TEMP/published-index.json"
@@ -460,20 +465,45 @@ jobs:
           [ "$(printf '%s' "$actual_platforms" | sha256sum | awk '{print $1}')" = "$(jq -r .platform_manifests_sha256 "$RUNNER_TEMP/release-record.json")" ]
           actual_buildkit_outputs=$(jq -cS '[.manifests[] | {digest,mediaType,size,platform,annotations}] | sort_by(.digest)' "$RUNNER_TEMP/published-index.json")
           [ "$(printf '%s' "$actual_buildkit_outputs" | sha256sum | awk '{print $1}')" = "$(jq -r .buildkit_outputs_sha256 "$RUNNER_TEMP/release-record.json")" ]
-          published_artifact_set_sha() {
-            predicate=$1
-            output=$2
-            : > "$output"
-            jq -r '.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .digest' "$RUNNER_TEMP/published-index.json" | while IFS= read -r manifest_digest; do
-              docker buildx imagetools inspect --raw "$IMAGE@$manifest_digest" > "$RUNNER_TEMP/published-manifest.json"
-              jq -r --arg predicate "$predicate" '.layers[] | select(.annotations["in-toto.io/predicate-type"] == $predicate) | .digest' "$RUNNER_TEMP/published-manifest.json" >> "$output"
-            done
-            LC_ALL=C sort -u -o "$output" "$output"
-            [ "$(wc -l < "$output" | tr -d ' ')" -eq 2 ]
-            sha256sum "$output" | awk '{print $1}'
+          verify_published_attestations() {
+            printf '%s' "$actual_platforms" | jq -r '.[].digest' | LC_ALL=C sort > "$RUNNER_TEMP/published-platform-digests"
+            : > "$RUNNER_TEMP/published-platform-subjects"
+            : > "$RUNNER_TEMP/published-sbom-digests"
+            : > "$RUNNER_TEMP/published-provenance-digests"
+            jq -r '.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .digest' \
+              "$RUNNER_TEMP/published-index.json" > "$RUNNER_TEMP/published-attestation-manifests"
+            [ "$(wc -l < "$RUNNER_TEMP/published-attestation-manifests" | tr -d ' ')" -eq 2 ]
+            while IFS= read -r manifest_digest; do
+              manifest_file="$RUNNER_TEMP/published-attestation-${manifest_digest#sha256:}.json"
+              sbom_file="$RUNNER_TEMP/published-sbom-${manifest_digest#sha256:}.json"
+              provenance_file="$RUNNER_TEMP/published-provenance-${manifest_digest#sha256:}.json"
+              docker buildx imagetools inspect --raw "$IMAGE@$manifest_digest" > "$manifest_file"
+              subject_digest=$(jq -er --arg manifest "$manifest_digest" '
+                .manifests[] | select(.digest == $manifest)
+                | .annotations["vnd.docker.reference.digest"] | select(test("^sha256:[0-9a-f]{64}$"))' \
+                "$RUNNER_TEMP/published-index.json")
+              printf '%s\n' "$subject_digest" >> "$RUNNER_TEMP/published-platform-subjects"
+              sbom_digest=$(jq -er '[.layers[] | select(.annotations["in-toto.io/predicate-type"] == "https://spdx.dev/Document")] | select(length == 1) | .[0].digest' "$manifest_file")
+              provenance_digest=$(jq -er '[.layers[] | select(.annotations["in-toto.io/predicate-type"] == "https://slsa.dev/provenance/v0.2")] | select(length == 1) | .[0].digest' "$manifest_file")
+              oras blob fetch --output "$sbom_file" "$IMAGE@$sbom_digest"
+              oras blob fetch --output "$provenance_file" "$IMAGE@$provenance_digest"
+              jq -e --arg subject "${subject_digest#sha256:}" '
+                .predicateType == "https://spdx.dev/Document" and
+                (.subject | length == 1) and .subject[0].digest.sha256 == $subject' "$sbom_file" >/dev/null
+              jq -e --arg subject "${subject_digest#sha256:}" '
+                .predicateType == "https://slsa.dev/provenance/v0.2" and
+                (.subject | length == 1) and .subject[0].digest.sha256 == $subject' "$provenance_file" >/dev/null
+              printf '%s\n' "$sbom_digest" >> "$RUNNER_TEMP/published-sbom-digests"
+              printf '%s\n' "$provenance_digest" >> "$RUNNER_TEMP/published-provenance-digests"
+            done < "$RUNNER_TEMP/published-attestation-manifests"
+            LC_ALL=C sort -o "$RUNNER_TEMP/published-platform-subjects" "$RUNNER_TEMP/published-platform-subjects"
+            cmp "$RUNNER_TEMP/published-platform-digests" "$RUNNER_TEMP/published-platform-subjects"
+            LC_ALL=C sort -o "$RUNNER_TEMP/published-sbom-digests" "$RUNNER_TEMP/published-sbom-digests"
+            LC_ALL=C sort -o "$RUNNER_TEMP/published-provenance-digests" "$RUNNER_TEMP/published-provenance-digests"
           }
-          actual_sbom_sha256=$(published_artifact_set_sha https://spdx.dev/Document "$RUNNER_TEMP/published-sbom-digests")
-          actual_provenance_sha256=$(published_artifact_set_sha https://slsa.dev/provenance/v0.2 "$RUNNER_TEMP/published-provenance-digests")
+          verify_published_attestations
+          actual_sbom_sha256=$(sha256sum "$RUNNER_TEMP/published-sbom-digests" | awk '{print $1}')
+          actual_provenance_sha256=$(sha256sum "$RUNNER_TEMP/published-provenance-digests" | awk '{print $1}')
           [ "$actual_sbom_sha256" = "$(jq -r .sbom_sha256 "$RUNNER_TEMP/release-record.json")" ]
           [ "$actual_provenance_sha256" = "$(jq -r .provenance_sha256 "$RUNNER_TEMP/release-record.json")" ]
           if oras manifest fetch --descriptor "$IMAGE:$release_tag" > "$RUNNER_TEMP/release-tag-descriptor.json" 2> "$RUNNER_TEMP/release-tag.err"; then
