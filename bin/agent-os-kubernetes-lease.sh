@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
 
+yaml_string() {
+  local value=$1
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+  printf '"%s"' "$value"
+}
+
 rfc3339_epoch() {
   local value=${1%%.*}
   value=${value%Z}Z
@@ -66,7 +76,7 @@ stop_lock_renewal() {
 }
 
 release_lock() {
-  local record identity holder uid rv after
+  local record identity holder uid rv after after_holder after_uid
   stop_lock_renewal
   [ -n "$LOCK_UID" ] || return 0
   if ! record=$(lock_record); then
@@ -90,8 +100,12 @@ release_lock() {
   fi
   after=$(lock_record) || return 1
   if [ -n "$after" ]; then
-    echo "error: lifecycle Lease '$LOCK' still exists after release" >&2
-    return 1
+    after_holder=$(printf '%s' "$after" | cut -f5)
+    after_uid=$(printf '%s' "$after" | cut -f9)
+    if [ "$after_uid" = "$uid" ] && [ "$after_holder" = "$OPERATION_ID" ]; then
+      echo "error: lifecycle Lease '$LOCK' still exists after release" >&2
+      return 1
+    fi
   fi
   LOCK_UID=
   LOCK_RV=

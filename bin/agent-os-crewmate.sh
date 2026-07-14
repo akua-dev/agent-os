@@ -138,15 +138,17 @@ render_pod() {
 }
 
 render_lock() {
-  local acquired_at=$1 renewed_at=$2 uid=${3:-} rv=${4:-}
+  local acquired_at=$1 renewed_at=$2 uid=${3:-} rv=${4:-} uid_value='' rv_value=''
+  [ -z "$uid" ] || uid_value=$(yaml_string "$uid")
+  [ -z "$rv" ] || rv_value=$(yaml_string "$rv")
   cat <<YAML
 apiVersion: coordination.k8s.io/v1
 kind: Lease
 metadata:
   name: $LOCK
   namespace: $NAMESPACE
-${uid:+  uid: $uid}
-${rv:+  resourceVersion: $rv}
+${uid:+  uid: $uid_value}
+${rv:+  resourceVersion: $rv_value}
   labels:
     app.kubernetes.io/managed-by: agent-os
     agent-os.dev/crewmate: $ID
@@ -204,7 +206,7 @@ cleanup_new_owned_pod() {
 }
 
 create_and_wait() {
-  local pvc_before pvc_current pvc_uid pvc_rv pod pod_uid pod_rv
+  local pvc_before pvc_current pvc_identity pvc_uid pvc_current_uid pvc_rv pod pod_uid pod_rv
   pvc_before=$(require_owned_pvc_or_absent)
   if [ -z "$pvc_before" ]; then
     if ! render_pvc | kube create -f - >/dev/null; then
@@ -261,6 +263,21 @@ create_and_wait() {
     cleanup_new_owned_pod "$pod_uid"
     echo "error: crewmate Pod did not become ready with the authorized AI Secret" >&2
     exit 1
+  fi
+  pvc_current=$(pvc_record)
+  pvc_identity=$(printf '%s' "$pvc_current" | cut -f1-4)
+  pvc_current_uid=$(printf '%s' "$pvc_current" | cut -f9)
+  if [ "$pvc_identity" != "$EXPECTED_PVC" ] || [ "$pvc_current_uid" != "$pvc_uid" ]; then
+    if ! cleanup_new_owned_pod "$pod_uid"; then
+      echo "partial state: operation Pod cleanup did not complete; PVCs retained" >&2
+    fi
+    if [ "$pvc_identity" = "$EXPECTED_PVC" ]; then
+      if ! invalidate_checkpoint_evidence; then
+        echo "partial state: replacement PVC checkpoint invalidation did not complete; PVCs retained" >&2
+      fi
+    fi
+    echo "error: mounted PVC identity changed after readiness; captured uid=$pvc_uid observed uid=${pvc_current_uid:-absent}; persistent claims retained" >&2
+    exit 3
   fi
 }
 

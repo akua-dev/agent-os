@@ -167,15 +167,17 @@ lock_record() {
 }
 
 render_lock() {
-  local acquired_at=$1 renewed_at=$2 uid=${3:-} rv=${4:-}
+  local acquired_at=$1 renewed_at=$2 uid=${3:-} rv=${4:-} uid_value='' rv_value=''
+  [ -z "$uid" ] || uid_value=$(yaml_string "$uid")
+  [ -z "$rv" ] || rv_value=$(yaml_string "$rv")
   cat <<YAML
 apiVersion: coordination.k8s.io/v1
 kind: Lease
 metadata:
   name: $LOCK
   namespace: $LOCK_NAMESPACE
-${uid:+  uid: $uid}
-${rv:+  resourceVersion: $rv}
+${uid:+  uid: $uid_value}
+${rv:+  resourceVersion: $rv_value}
   labels:
     app.kubernetes.io/managed-by: agent-os
     agent-os.dev/lifecycle: primary
@@ -292,7 +294,7 @@ resource_api_path() {
 }
 
 delete_owned_resource() {
-  local scope=$1 kind=$2 name=$3 timeout=$4 record expected uid rv path
+  local scope=$1 kind=$2 name=$3 timeout=$4 record expected uid rv path output started elapsed class
   record=$(live_resource_record "$scope" "$kind" "$name")
   [ -n "$record" ] || return 0
   expected="$name"$'\t'"agent-os"$'\t'"$INSTALLATION_ID"
@@ -304,15 +306,26 @@ delete_owned_resource() {
   rv=$(printf '%s' "$record" | cut -f5)
   [ -n "$uid" ] && [ -n "$rv" ] || { echo "error: $kind '$name' lacks deletion preconditions" >&2; exit 2; }
   path=$(resource_api_path "$scope" "$kind" "$name")
-  if ! printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s","resourceVersion":"%s"}}\n' "$uid" "$rv" | \
-    "$KUBECTL" --context "$CONTEXT" delete --raw "$path" -f - >/dev/null; then
-    bounded_delete_failure "$kind/$name"
+  started=$(date -u '+%s')
+  if ! output=$(printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s","resourceVersion":"%s"}}\n' "$uid" "$rv" | \
+    "$KUBECTL" --context "$CONTEXT" delete --raw "$path" -f - 2>&1 >/dev/null); then
+    elapsed=$(($(date -u '+%s') - started))
+    class=$(delete_failure_class "$output")
+    bounded_delete_failure "$kind/$name" request "$class" "$timeout" "$elapsed" "$uid"
     return $?
   fi
   if [ "$scope" = cluster ]; then
-    "$KUBECTL" --context "$CONTEXT" wait --for=delete "$kind/$name" --timeout="${timeout}s" || bounded_delete_failure "$kind/$name"
+    if ! output=$("$KUBECTL" --context "$CONTEXT" wait --for=delete "$kind/$name" --timeout="${timeout}s" 2>&1 >/dev/null); then
+      elapsed=$(($(date -u '+%s') - started))
+      class=$(delete_failure_class "$output")
+      bounded_delete_failure "$kind/$name" wait "$class" "$timeout" "$elapsed" "$uid"
+    fi
   else
-    "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" wait --for=delete "$kind/$name" --timeout="${timeout}s" || bounded_delete_failure "$kind/$name"
+    if ! output=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" wait --for=delete "$kind/$name" --timeout="${timeout}s" 2>&1 >/dev/null); then
+      elapsed=$(($(date -u '+%s') - started))
+      class=$(delete_failure_class "$output")
+      bounded_delete_failure "$kind/$name" wait "$class" "$timeout" "$elapsed" "$uid"
+    fi
   fi
 }
 
@@ -367,6 +380,8 @@ preflight_rendered_resources() {
       *) require_namespaced_resource_owned_or_absent "$kind" "$name" ;;
     esac
   done < <(find "$OUT" -type f -name '*.yaml' -print)
+  require_namespaced_resource_owned_or_absent Role agent-os-firstmate-runtime
+  require_namespaced_resource_owned_or_absent RoleBinding agent-os-firstmate-runtime
 }
 
 delete_namespace_rbac() {
@@ -470,6 +485,14 @@ partial_install_is_applicable() {
     expected="$name"$'\t'"agent-os"$'\t'"$INSTALLATION_ID"
     [ -z "$identity" ] || [ "$identity" = "$expected" ] || return 1
   done < <(find "$OUT" -type f -name '*.yaml' -print)
+  for kind in Role RoleBinding; do
+    if ! identity=$(live_resource_identity "$kind" agent-os-firstmate-runtime 2>/dev/null); then
+      return 1
+    fi
+    expected="agent-os-firstmate-runtime"$'\t'"agent-os"$'\t'"$INSTALLATION_ID"
+    [ -z "$identity" ] || [ "$identity" = "$expected" ] || return 1
+  done
+  return 0
 }
 
 partial_recovery_action() {
@@ -551,9 +574,11 @@ report_partial_apply() {
 }
 
 cas_patch_file() {
-  local file=$1 uid=$2 rv=$3 patch_file
+  local file=$1 uid=$2 rv=$3 patch_file uid_value rv_value
   patch_file=$(mktemp "$OUT/cas.XXXXXX")
-  awk -v uid="$uid" -v rv="$rv" '
+  uid_value=$(yaml_string "$uid")
+  rv_value=$(yaml_string "$rv")
+  awk -v uid="$uid_value" -v rv="$rv_value" '
     !inserted && $1 == "metadata:" {
       print
       print "  uid: " uid
@@ -676,9 +701,9 @@ report_retained_observation() {
   local kind=$1 name=$2 scope=$3 record managed installation uid operation ready finalizers identity expected details
   if ! record=$(resource_observation "$scope" "$kind" "$name"); then
     echo "retained-unverified: $kind/$name could not be inspected; no further deletion attempted" >&2
-    return
+    return 0
   fi
-  [ -n "$record" ] || return
+  [ -n "$record" ] || return 0
   managed=$(printf '%s' "$record" | cut -f2)
   installation=$(printf '%s' "$record" | cut -f3)
   uid=$(printf '%s' "$record" | cut -f4)
@@ -703,8 +728,8 @@ report_retained_observation() {
 }
 
 report_retained_resources() {
-  local failed_target=$1 file kind name scope
-  echo "failed-target: $failed_target timeout=180s" >&2
+  local failed_target=$1 phase=$2 class=$3 timeout=$4 elapsed=$5 uid=$6 file kind name scope
+  echo "failed-target: $failed_target uid=$uid delete-${phase}-failure=$class timeout=${timeout}s elapsed=${elapsed}s" >&2
   kind=${failed_target%%/*}
   name=${failed_target#*/}
   scope=namespaced
@@ -731,14 +756,37 @@ report_retained_resources() {
   echo "cluster cleanup if required: $(cleanup_command)" >&2
 }
 
+delete_failure_class() {
+  local output
+  output=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$output" in
+    *forbidden*) printf 'Forbidden' ;;
+    *conflict*) printf 'Conflict' ;;
+    *notfound*|*'not found'*) printf 'NotFound' ;;
+    *'timed out'*|*timeout*) printf 'timeout' ;;
+    *) printf 'transport' ;;
+  esac
+}
+
 bounded_delete_failure() {
-  local target=$1
+  local target=$1 phase=${2:-wait} class=${3:-timeout} timeout=${4:-180}
+  local elapsed=${5:-$timeout} uid=${6:-unknown} prefix kind name scope
+  [ "$COMMAND" = uninstall ] && prefix=incomplete || prefix=error
+  echo "$prefix: delete-${phase}-failure=$class target=$target uid=$uid timeout=${timeout}s elapsed=${elapsed}s" >&2
   if [ "$COMMAND" = uninstall ]; then
-    echo "incomplete: timed out deleting $target after 180s" >&2
-    report_retained_resources "$target"
+    report_retained_resources "$target" "$phase" "$class" "$timeout" "$elapsed" "$uid"
     return 3
   fi
-  echo "error: timed out deleting $target after 180s" >&2
+  kind=${target%%/*}
+  name=${target#*/}
+  scope=namespaced
+  case "$kind" in
+    ClusterRoleBinding|Namespace) scope=cluster ;;
+  esac
+  report_retained_observation "$kind" "$name" "$scope"
+  if [ "$COMMAND" = cleanup-cluster-rbac ]; then
+    echo "safe retry: $(cleanup_command)" >&2
+  fi
   return 1
 }
 
@@ -755,11 +803,14 @@ delete_rendered_kind() {
 }
 
 delete_rendered_namespaced_resources() {
-  local kind
+  local kind output started elapsed class
   delete_rendered_kind StatefulSet
-  if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" wait \
-    --for=delete pod/agent-os-firstmate-0 --timeout=180s; then
-    bounded_delete_failure Pod/agent-os-firstmate-0
+  started=$(date -u '+%s')
+  if ! output=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" wait \
+    --for=delete pod/agent-os-firstmate-0 --timeout=180s 2>&1 >/dev/null); then
+    elapsed=$(($(date -u '+%s') - started))
+    class=$(delete_failure_class "$output")
+    bounded_delete_failure Pod/agent-os-firstmate-0 wait "$class" 180 "$elapsed" unknown
   fi
   for kind in Service RoleBinding Role ServiceAccount; do
     delete_rendered_kind "$kind"
@@ -922,19 +973,67 @@ case "$COMMAND" in
     preflight_rendered_resources 1
     previous=$(workload_state)
     require_workload_owned "$previous"
+    if ! command -v jq >/dev/null 2>&1; then
+      echo "error: jq is required to resolve StatefulSet revision history safely" >&2
+      exit 2
+    fi
     rollback_record=$(live_resource_record namespaced StatefulSet agent-os-firstmate)
+    rollback_uid=$(printf '%s' "$rollback_record" | cut -f4)
+    rollback_rv=$(printf '%s' "$rollback_record" | cut -f5)
     if [ "$(printf '%s' "$rollback_record" | cut -f1-3)" != \
       "agent-os-firstmate"$'\t'"agent-os"$'\t'"$INSTALLATION_ID" ] || \
-      [ -z "$(printf '%s' "$rollback_record" | cut -f4)" ] || [ -z "$(printf '%s' "$rollback_record" | cut -f5)" ]; then
+      [ -z "$rollback_uid" ] || [ -z "$rollback_rv" ]; then
       echo "error: rollback requires exact StatefulSet UID and resourceVersion evidence" >&2
       exit 2
     fi
-    rollback_current=$(live_resource_record namespaced StatefulSet agent-os-firstmate)
-    if [ "$rollback_current" != "$rollback_record" ]; then
-      echo "error: StatefulSet changed before rollback mutation" >&2
+    rollback_state=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get statefulset agent-os-firstmate -o json)
+    rollback_revisions=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get controllerrevisions.apps -o json)
+    rollback_references=$(printf '%s' "$rollback_state" | jq -er \
+      --arg uid "$rollback_uid" --arg rv "$rollback_rv" --arg installation "$INSTALLATION_ID" '
+        select(.metadata.name == "agent-os-firstmate")
+        | select(.metadata.uid == $uid and .metadata.resourceVersion == $rv)
+        | select(.metadata.labels["app.kubernetes.io/managed-by"] == "agent-os")
+        | select(.metadata.annotations["agent-os.dev/installation-id"] == $installation)
+        | [.status.currentRevision, .status.updateRevision]
+        | select(all(.[]; type == "string" and length > 0))
+        | @tsv
+      ') || { echo "error: StatefulSet changed before rollback revision resolution" >&2; exit 3; }
+    rollback_current_revision=$(printf '%s' "$rollback_references" | cut -f1)
+    rollback_update_revision=$(printf '%s' "$rollback_references" | cut -f2)
+    rollback_patch=$(printf '%s' "$rollback_revisions" | jq -ce \
+      --arg current "$rollback_current_revision" --arg update "$rollback_update_revision" \
+      --arg uid "$rollback_uid" --arg rv "$rollback_rv" '
+        def owned:
+          any(.metadata.ownerReferences[]?;
+            .apiVersion == "apps/v1" and .kind == "StatefulSet" and
+            .name == "agent-os-firstmate" and .uid == $uid and .controller == true);
+        [.items[] | select(owned)] as $owned
+        | ($owned | map(select(.metadata.name == $current))) as $current_items
+        | ($owned | map(select(.metadata.name == $update))) as $update_items
+        | select($current_items | length == 1)
+        | select($update_items | length == 1)
+        | $current_items[0] as $current_revision
+        | $update_items[0] as $update_revision
+        | select($update_revision.revision | type == "number")
+        | (if $current != $update then
+             $current_revision
+           else
+             ($owned | map(select((.revision | type) == "number" and .revision < $update_revision.revision)) | sort_by(.revision) | last)
+           end) as $target
+        | select($target != null and ($target.data | type) == "object")
+        | $target.data * {metadata:{uid:$uid,resourceVersion:$rv}}
+      ') || { echo "error: no exact-owned previous ControllerRevision is available for rollback" >&2; exit 2; }
+    if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" patch StatefulSet agent-os-firstmate \
+      --type=strategic -p "$rollback_patch" >/dev/null; then
+      echo "error: StatefulSet rollback CAS conflicted; no rollout-undo fallback attempted" >&2
       exit 3
     fi
-    "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" rollout undo statefulset/agent-os-firstmate
+    rollback_current=$(live_resource_record namespaced StatefulSet agent-os-firstmate)
+    if [ "$(printf '%s' "$rollback_current" | cut -f1-4)" != \
+      "$(printf '%s' "$rollback_record" | cut -f1-4)" ]; then
+      echo "error: StatefulSet UID or ownership changed during rollback" >&2
+      exit 3
+    fi
     "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" rollout status statefulset/agent-os-firstmate --timeout=180s
     ;;
   status)
@@ -974,6 +1073,7 @@ case "$COMMAND" in
     fi
     render
     acquire_primary_lock
+    preflight_rendered_resources 1
     cleanup_cluster_rbac
     ;;
   *) usage ;;
