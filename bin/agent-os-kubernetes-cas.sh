@@ -78,11 +78,44 @@ agent_os_resource_uri() {
 }
 
 agent_os_delete_preconditioned() {
-  local scope=$1 resource=$2 name=$3 token=$4 uid resource_version uri
+  local scope=$1 resource=$2 name=$3 token=$4 uid resource_version uri timeout
   [ -n "$token" ] || return 0
+  timeout=${AGENT_OS_DELETE_TIMEOUT_SECONDS:-120}
+  case "$timeout" in
+    ''|*[!0-9]*)
+      echo "error: AGENT_OS_DELETE_TIMEOUT_SECONDS must be a non-negative integer" >&2
+      return 2
+      ;;
+  esac
   uid=${token%%|*}
   resource_version=${token#*|}
   uri=$(agent_os_resource_uri "$scope" "$resource" "$name")
   printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s","resourceVersion":"%s"}}\n' \
     "$uid" "$resource_version" | "$KUBECTL" "${KUBECTL_ARGS[@]}" delete --raw="$uri" -f -
+  agent_os_wait_for_uid_gone "$scope" "$resource" "$name" "$uid" "$timeout"
+}
+
+agent_os_current_uid() {
+  local scope=$1 resource=$2 name=$3
+  if [ "$scope" = namespaced ]; then
+    "$KUBECTL" "${KUBECTL_ARGS[@]}" -n "$NAMESPACE" get "$resource" "$name" --ignore-not-found \
+      -o 'jsonpath={.metadata.uid}'
+  else
+    "$KUBECTL" "${KUBECTL_ARGS[@]}" get "$resource" "$name" --ignore-not-found \
+      -o 'jsonpath={.metadata.uid}'
+  fi
+}
+
+agent_os_wait_for_uid_gone() {
+  local scope=$1 resource=$2 name=$3 uid=$4 timeout=$5 deadline current_uid
+  deadline=$((SECONDS + timeout))
+  while :; do
+    current_uid=$(agent_os_current_uid "$scope" "$resource" "$name")
+    [ "$current_uid" = "$uid" ] || return 0
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      echo "error: timed out waiting for $resource/$name UID $uid to disappear" >&2
+      return 1
+    fi
+    sleep 1
+  done
 }

@@ -123,6 +123,18 @@ assert_grep 'current_main=$(git rev-parse refs/remotes/origin/main)' \
   "publication must resolve the current protected-main commit"
 assert_grep 'if [ "$CI_HEAD_SHA" != "$current_main" ]; then' "$ROOT/.github/workflows/agent-os-image.yml" \
   "publication must reject an out-of-order stale CI run"
+assert_grep 'outputs: type=oci,dest=${{ runner.temp }}/agent-os-image.tar' \
+  "$ROOT/.github/workflows/agent-os-image.yml" \
+  "publication must stage a verified multi-architecture OCI archive"
+assert_grep 'skopeo copy --all --preserve-digests' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "publication must copy only the staged OCI archive after the freshness gate"
+assert_no_grep 'push: true' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "publication must not combine a long build with its registry mutation"
+build_line=$(grep -n 'name: Build verified OCI archive' "$ROOT/.github/workflows/agent-os-image.yml" | cut -d: -f1)
+freshness_line=$(grep -n 'name: Reject stale protected-main runs' "$ROOT/.github/workflows/agent-os-image.yml" | cut -d: -f1)
+publish_line=$(grep -n 'skopeo copy --all --preserve-digests' "$ROOT/.github/workflows/agent-os-image.yml" | head -1 | cut -d: -f1)
+[ "$build_line" -lt "$freshness_line" ] && [ "$freshness_line" -lt "$publish_line" ] \
+  || fail "protected-main freshness must be checked after build and immediately before publication"
 assert_no_grep 'tags: ["v*"]' "$ROOT/.github/workflows/agent-os-image.yml" \
   "arbitrary tag pushes must not trigger publication"
 for action in \
