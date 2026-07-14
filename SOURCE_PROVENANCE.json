@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "package": {
+    "name": "Agent OS (Firstmate)",
+    "repository": "https://github.com/akua-dev/agent-os",
+    "license": "MIT",
+    "source_archive": "git archive --format=tar <full-commit>",
+    "self_referential_commit_fields": false
+  },
+  "inputs": [
+    {
+      "name": "package-precursor",
+      "repository": "https://github.com/akua-dev/agent-os",
+      "commit": "07c48eeeee162bdd40b5a43537c21b989a65b260",
+      "integration": "base",
+      "license": "MIT"
+    },
+    {
+      "name": "agent-os-firstmate-sync",
+      "repository": "https://github.com/akua-dev/agent-os",
+      "commit": "a318580a88c08c0aa2e270ae8ea0f0f02b5ea640",
+      "integration": "merge",
+      "license": "MIT"
+    },
+    {
+      "name": "firstmate-upstream",
+      "repository": "https://github.com/kunchenguid/firstmate",
+      "commit": "8c0d9eb878bc8c2ec4c11bf71dd819f626875bf6",
+      "integration": "merge",
+      "license": "MIT"
+    },
+    {
+      "name": "firstmate-pr-442",
+      "repository": "https://github.com/kunchenguid/firstmate/pull/442",
+      "commit": "9b4d65da33b7a14a2ad77c2048186f1e6d7a56e1",
+      "integration": "merge",
+      "license": "MIT"
+    },
+    {
+      "name": "firstmate-pr-521",
+      "repository": "https://github.com/kunchenguid/firstmate/pull/521",
+      "commit": "86cc8769d1c34251cae821059b79fbdc1e5fc5e4",
+      "integration": "merge",
+      "license": "MIT"
+    },
+    {
+      "name": "zellij-superseder",
+      "repository": "https://github.com/robinbraemer/firstmate",
+      "commit": "d47b44c8ed5b966f425ddd5e6a0dcbc1b9714e9a",
+      "integration": "merge",
+      "license": "MIT",
+      "acquisition": "committed object from the author's local repository; preserved by this integration ancestry"
+    }
+  ],
+  "merge_order": [
+    "a318580a88c08c0aa2e270ae8ea0f0f02b5ea640",
+    "8c0d9eb878bc8c2ec4c11bf71dd819f626875bf6",
+    "9b4d65da33b7a14a2ad77c2048186f1e6d7a56e1",
+    "86cc8769d1c34251cae821059b79fbdc1e5fc5e4",
+    "d47b44c8ed5b966f425ddd5e6a0dcbc1b9714e9a"
+  ],
+  "exclusions": {
+    "commits": [
+      {
+        "name": "firstmate-pr-528",
+        "commit": "e204ec1671fa698a3d8a0eb9a0ac8c8bd87f47fa",
+        "reason": "test-only; not an ancestor, dependency, or blocker"
+      },
+      {
+        "name": "firstmate-pr-346",
+        "commit": "787211f52fa536c916d1b2cc7c20a7b6d73d2c42",
+        "reason": "closed and superseded"
+      },
+      {
+        "name": "firstmate-pr-355",
+        "commit": "6914e14071d18af33d336e512f2573c62b74ce7f",
+        "reason": "closed and superseded"
+      }
+    ],
+    "paths": [
+      ".env",
+      "config",
+      "data",
+      "state",
+      "projects",
+      "worktrees",
+      ".worktrees",
+      ".no-mistakes",
+      ".repos",
+      "node_modules"
+    ],
+    "classes": [
+      "credential-bearing and untracked harness homes",
+      "dirty local branches and stashes",
+      "private Cortex material",
+      "Herdr source and private or commercial artifacts",
+      "package caches and operational fleet state"
+    ]
+  },
+  "third_party_boundaries": [
+    {
+      "name": "Herdr",
+      "license": "AGPL-3.0-or-later",
+      "relationship": "separate unmodified executable",
+      "notice": "THIRD_PARTY_SOURCES.md"
+    },
+    {
+      "name": "Akua",
+      "license": "Apache-2.0",
+      "relationship": "separate unmodified executable",
+      "notice": "THIRD_PARTY_NOTICES.md"
+    },
+    {
+      "name": "K9s",
+      "license": "Apache-2.0",
+      "relationship": "separate unmodified executable",
+      "notice": "THIRD_PARTY_NOTICES.md"
+    }
+  ]
+}

@@ -21,6 +21,13 @@ The package requires one complete 64-hex image digest because a mutable or malfo
 The source tree contains an intentionally non-installable placeholder until the first public image release is published.
 Replace it only with the digest recorded by that release workflow.
 
+## Source and image provenance
+
+`SOURCE_PROVENANCE.json` records the exact repositories, full input commits, normal merge order, licenses, and explicit exclusions for the portable MIT source package.
+`bin/agent-os-source-context.sh <empty-directory> <full-commit>` assembles a clean build context from Git-tracked files only, preserving symlinks and executable bits without copying untracked credentials or operational state.
+The image workflow records the selected commit, Git tree, stable `git archive --format=tar` SHA-256, and OCI source/revision/version labels while BuildKit emits the multi-architecture SBOM and provenance attestations.
+A branch or PR reference is mutable and is not a release source pin; merge and publication remain separate approvals.
+
 ## Generic quickstart
 
 Start from a tagged Agent OS source checkout that matches the image release.

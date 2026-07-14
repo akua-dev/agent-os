@@ -72,6 +72,15 @@ COPY image/debian.sources /etc/apt/sources.list.d/debian.sources
 
 RUN echo "9767ac71230276e282fdb39a087c889a277835b47751a0c0e5a9da0e8352e289  /etc/apt/sources.list.d/debian.sources" | sha256sum -c -
 
+ARG SOURCE_REPOSITORY=https://github.com/akua-dev/agent-os
+ARG SOURCE_REVISION
+ARG SOURCE_VERSION=dev
+
+LABEL org.opencontainers.image.source=$SOURCE_REPOSITORY \
+      org.opencontainers.image.revision=$SOURCE_REVISION \
+      org.opencontainers.image.version=$SOURCE_VERSION \
+      org.opencontainers.image.licenses=MIT
+
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     bash \
@@ -233,7 +242,9 @@ COPY --from=source-bootstrap /opt/agent-os-source.origin /opt/agent-os-source.or
 COPY --from=source-bootstrap /opt/agent-os-source.mode /opt/agent-os-source.mode
 COPY --from=source-bootstrap /opt/agent-os-source.ref /opt/agent-os-source.ref
 
-RUN install -D -m 0644 /opt/agent-os/THIRD_PARTY_NOTICES.md /usr/share/doc/agent-os/THIRD_PARTY_NOTICES.md \
+RUN install -D -m 0644 /opt/agent-os/LICENSE /usr/share/doc/agent-os/LICENSE \
+  && install -D -m 0644 /opt/agent-os/SOURCE_PROVENANCE.json /usr/share/doc/agent-os/SOURCE_PROVENANCE.json \
+  && install -D -m 0644 /opt/agent-os/THIRD_PARTY_NOTICES.md /usr/share/doc/agent-os/THIRD_PARTY_NOTICES.md \
   && install -D -m 0644 /opt/agent-os/THIRD_PARTY_SOURCES.md /usr/share/doc/agent-os/THIRD_PARTY_SOURCES.md
 
 RUN cd /opt/agent-os/tools/agent-os \
