@@ -757,7 +757,7 @@ Adjust the other sections only when the task genuinely deviates from the standar
 firstmate is its own repo behind the no-mistakes gate, so improvements to `AGENTS.md`, `bin/`, `.agents/skills/`, and public `skills/` reach `main` and then wait for each running firstmate to pull them.
 Only `AGENTS.md`, `bin/`, and `.agents/skills/` are a running firstmate instruction surface; public `skills/` is tracked for installers and is not loaded by firstmate.
 When the captain invokes `/updatefirstmate` or asks to update firstmate, load the `/updatefirstmate` skill.
-It performs only fast-forward self-updates of firstmate and registered secondmate homes, re-reads `AGENTS.md` when needed, nudges updated live secondmates, and never touches anything under `projects/`.
+That skill owns the source-policy split: mutable checkouts update by guarded fast-forward, while immutable candidate/release images refuse in-place source updates and move only through an image-digest upgrade.
 
 ## 13. Agent-only reference skills
 

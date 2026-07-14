@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Self-update a running firstmate and its secondmates to the latest origin.
+# Update a running firstmate and its secondmates according to source policy.
 #
-# Mechanical half of the /updatefirstmate skill. Fast-forwards the running
-# firstmate repo's default branch from origin, then fast-forwards every
+# Mechanical half of the /updatefirstmate skill. Mutable sources fast-forward
+# the running firstmate repo's default branch from origin, then fast-forward every
 # registered secondmate home (each a treehouse worktree of this same repo, or
 # a standalone clone) the same way. FAST-FORWARD ONLY, exactly like
 # fm-fleet-sync.sh: never force, never create a merge commit, never stash;
@@ -14,6 +14,8 @@
 # fetched on their own. Secondmate homes are leased at a detached HEAD on the
 # default branch, so a fast-forward there advances HEAD only and never touches
 # any other worktree's checkout or the shared `main` branch.
+# Candidate and release image sources carry persisted immutable provenance;
+# this script refuses those sources before any fetch or checkout mutation.
 #
 # The fast-forward mechanics live in bin/fm-ff-lib.sh (base_mode "origin" here);
 # the same library drives the local-HEAD secondmate sync used by fm-spawn.sh and

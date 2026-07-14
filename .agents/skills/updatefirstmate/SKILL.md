@@ -1,6 +1,8 @@
 ---
 name: updatefirstmate
-description: Self-update a running firstmate and its secondmates to the latest from origin. Use when the captain invokes /updatefirstmate (e.g. "/updatefirstmate", "update firstmate", "pull the latest firstmate"). Fast-forwards this firstmate repo's default branch and every secondmate home from origin (fast-forward only, never forced, never disruptive), then re-reads AGENTS.md and nudges each updated secondmate to do the same, so the whole tree runs the latest bin/ and instructions.
+description: >-
+  Update a mutable-source firstmate and its secondmates to the latest from origin, or report that an immutable candidate/release image must be upgraded by digest.
+  Use when the captain invokes /updatefirstmate (e.g. "/updatefirstmate", "update firstmate", "pull the latest firstmate").
 user-invocable: true
 metadata:
   internal: true
@@ -8,15 +10,21 @@ metadata:
 
 # updatefirstmate
 
-Self-update firstmate in place.
-Firstmate is its own repo, behind the same no-mistakes gate as any project, so new tracked material (`AGENTS.md`, `bin/`, `.agents/skills/`, and public `skills/`) reaches `main` and then sits there until each running firstmate pulls it.
+Update firstmate according to its persisted source policy.
+Firstmate is its own repo, behind the same no-mistakes gate as any project, so new tracked material (`AGENTS.md`, `bin/`, `.agents/skills/`, and public `skills/`) reaches `main` and then waits for a mutable installation to pull it or an immutable installation to upgrade to an image that contains it.
 Only `AGENTS.md`, `bin/`, and `.agents/skills/` are a running firstmate instruction surface; public `skills/` is installer-facing and is not loaded by firstmate.
-This skill performs that pull for the running main firstmate and every secondmate, without disturbing any in-flight work.
+For a mutable-source installation, this skill performs that pull for the running main firstmate and every secondmate without disturbing any in-flight work.
 
 The update is **fast-forward only** - the same sanctioned self-write as the fleet sync firstmate already runs.
 It never forces, never creates a merge commit, never stashes, and advances a target only on a clean fast-forward; anything dirty, diverged, offline, or on the wrong branch is skipped and reported.
 A tracked-files fast-forward leaves the gitignored operational dirs (data/, state/, config/, projects/, .no-mistakes/) untouched, so a secondmate's in-flight work is never disrupted.
 This touches only the firstmate repo and its own worktrees, never anything under `projects/`.
+
+Candidate and release images use a different, immutable source policy.
+Their persisted runtime-source provenance pins the exact source commit and archive digest selected by the image, including the policy recorded on secondmate homes.
+When `bin/fm-update.sh` detects that policy, it exits with `error: self-update is disabled for immutable image source` before fetching or changing any checkout.
+Do not remove, rewrite, or bypass the provenance marker to force an origin pull.
+Update that installation by selecting a new published image digest and running the Kubernetes package upgrade documented in `docs/kubernetes.md`; image startup then verifies the new exact source and converges eligible secondmate homes to it.
 
 ## What it does
 
@@ -24,10 +32,11 @@ This touches only the firstmate repo and its own worktrees, never anything under
    ```sh
    bin/fm-update.sh
    ```
-   It fast-forwards this firstmate repo's default branch from origin, then fast-forwards every registered secondmate home (each a treehouse worktree of this same repo, leased at a detached HEAD on the default branch) the same way.
+   On mutable source, it fast-forwards this firstmate repo's default branch from origin, then fast-forwards every registered secondmate home (each a treehouse worktree of this same repo, leased at a detached HEAD on the default branch) the same way.
    It prints one status line per target (`updated <old>..<new>` / `already current` / `skipped: <reason>`), followed by two action lines that tell you exactly what to do next:
    - `reread-firstmate: yes|no`
    - `nudge-secondmates: fm-<id>...|none`
+   On immutable image source, it prints the refusal above and exits non-zero; stop the in-place update flow and report that the installation needs an image-digest upgrade.
 
 2. **Re-read AGENTS.md if your own instructions changed.**
    When the updater printed `reread-firstmate: yes`, the tracked instruction surface (`AGENTS.md`, `bin/`, or `.agents/skills/`) just advanced under you.
@@ -53,8 +62,10 @@ This touches only the firstmate repo and its own worktrees, never anything under
 - **Fast-forward only.**
   A target that has diverged, is dirty, is offline, or is on a non-default branch is skipped and reported, never forced or stashed.
   Nothing with unlanded work is ever discarded - this is prime directive #3.
+- **Immutable image source stays pinned.**
+  Candidate and release runtimes never fetch or fast-forward through this command; changing their source requires an image-digest upgrade.
 - **Only the firstmate repo and its worktrees** are touched, never `projects/`.
   It is the same sanctioned self-write as the fleet sync.
 - **Secondmates are never disrupted.**
-  A secondmate gets a tracked-files fast-forward (safe while it is mid-task, since its work lives in gitignored operational dirs and separate project worktrees) plus a gentle re-read nudge.
+  On mutable source, a secondmate gets a tracked-files fast-forward (safe while it is mid-task, since its work lives in gitignored operational dirs and separate project worktrees) plus a gentle re-read nudge.
   It is never torn down, interrupted, or forced.
