@@ -119,7 +119,8 @@ fi
 # task collides across concurrent requests). Best-effort: the inbox stash above
 # is the primary artifact and the relay lookup remains a fallback, so a registry
 # write failure must never fail the poll or touch its one-line stdout wake
-# payload. fmx_context_registry_set is a no-op when the platform is unknown.
+# payload. Per fm-x-lib.sh, fmx_context_registry_set is a no-op only when both
+# platform and budget are unknown.
 POLL_CTX=$(fmx_extract_reply_context "$BODY_FILE" 2>/dev/null) || POLL_CTX=
 if [ -n "$POLL_CTX" ]; then
   POLL_PLATFORM=$(printf '%s' "$POLL_CTX" | jq -r '.platform // ""' 2>/dev/null) || POLL_PLATFORM=

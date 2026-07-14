@@ -42,16 +42,14 @@ This is how small teams build and operate entire companies with agents — the p
 firstmate is not a model, not a harness, not a skill, not an MCP server, and not a CLI.
 firstmate is an agent distro for running a crew of agents.
 An agent distro is a portable directory of instructions, skills, tooling, policies, and state conventions that turns a general-purpose agent into a specialized one.
-There is no app to install: the cloned repo is the distro - `AGENTS.md`, bundled firstmate skills, and helper scripts that any terminal coding agent can follow.
+For local terminal use, there is no separate app to install: the cloned repo is the distro - `AGENTS.md`, bundled firstmate skills, and helper scripts that any terminal coding agent can follow.
 Launching a supported harness inside it instantiates your first mate - and makes you the captain.
 
-This Agent OS fork also packages the distro for Kubernetes: one persistent
-first mate can allocate isolated, persistent crewmate containers using ordinary
-`kubectl`, while Herdr keeps every agent terminal visible. Follow the
-[Agent OS Kubernetes quickstart](docs/kubernetes.md) to render the one public
-package for any conformant cluster. OrbStack is a local test profile of that
-same package, not a separate installer. `SOURCE_PROVENANCE.json` records the
-exact source histories, licenses, merge order, and exclusions for this distro.
+This Agent OS fork also packages the distro for Kubernetes.
+One persistent first mate can allocate isolated, persistent crewmate containers using ordinary `kubectl`, while Herdr keeps every agent terminal visible.
+Follow the [Agent OS Kubernetes quickstart](docs/kubernetes.md) to render the one public package for any conformant cluster.
+OrbStack is a local test profile of that same package, not a separate installer.
+`SOURCE_PROVENANCE.json` records the exact source inputs, licenses, merge order, and exclusions for this distro.
 
 Agent OS works on Kubernetes and is better with Akua.
 The portable core can be built and tested on local OrbStack without an Akua account, API key, managed control plane, or Akua-hosted worker, and is intended for any conformant Kubernetes cluster.
@@ -78,7 +76,7 @@ Full detail on every feature lives in [docs/architecture.md](docs/architecture.m
 
 - A verified agent harness: Claude Code, Grok, Pi, Codex, or OpenCode.
 - Git and the GitHub CLI, authenticated through `gh auth login`.
-- tmux, for the reference session backend.
+- The selected runtime backend's tools; tmux is the default and reference backend, while [`docs/configuration.md`](docs/configuration.md#toolchain) owns the requirements for every backend.
 
 The first mate detects and offers to install everything else.
 
@@ -200,7 +198,7 @@ Firstmate's skills live in two separate places with different audiences:
 
 ## Documentation
 
-- [docs/kubernetes.md](docs/kubernetes.md) - run the Agent OS controller and isolated crewmates on local OrbStack Kubernetes.
+- [docs/kubernetes.md](docs/kubernetes.md) - install a persistent Firstmate and isolated crewmates on Kubernetes, with OrbStack as the local test profile.
 - [docs/acceptance.md](docs/acceptance.md) - requirement-to-evidence ledger for the full distributed Agent OS proof.
 - [docs/architecture.md](docs/architecture.md) - how the crew, supervision, worktrees, secondmates, and project modes work.
 - [docs/configuration.md](docs/configuration.md) - environment variables, `FM_HOME`, runtime backend selection, optional X mode, the files you set, and harness support.
