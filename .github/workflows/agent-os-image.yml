@@ -342,7 +342,60 @@ jobs:
             --format json --depth 1 "$IMAGE@$reservation_digest" > "$RUNNER_TEMP/candidate-reservation-referrers.json"
           referrer_count=$(jq -er '.referrers | length' "$RUNNER_TEMP/candidate-reservation-referrers.json")
           if [ "$referrer_count" -eq 0 ]; then
+            artifact_owner=$CLAIM_OWNER
             ensure_build_owner
+            artifact_name="agent-os-candidate-record-$GITHUB_SHA"
+            gh api --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$artifact_name&per_page=100" \
+              > "$RUNNER_TEMP/candidate-trusted-artifacts.json"
+            trusted_artifact_count=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$artifact_owner" \
+              '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | length' \
+              "$RUNNER_TEMP/candidate-trusted-artifacts.json")
+            [ "$trusted_artifact_count" -le 1 ] || {
+              echo "::error::candidate reservation has conflicting trusted artifacts"
+              exit 1
+            }
+            if [ "$trusted_artifact_count" -eq 1 ]; then
+              trusted_artifact_id=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$artifact_owner" \
+                '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | .[0].id' \
+                "$RUNNER_TEMP/candidate-trusted-artifacts.json")
+              mkdir "$RUNNER_TEMP/candidate-trusted-artifact"
+              gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$trusted_artifact_id/zip" \
+                > "$RUNNER_TEMP/candidate-trusted-artifact.zip"
+              unzip -q "$RUNNER_TEMP/candidate-trusted-artifact.zip" -d "$RUNNER_TEMP/candidate-trusted-artifact"
+              candidate_record_digest="sha256:$(sha256sum "$RUNNER_TEMP/candidate-trusted-artifact/candidate-manifest.json" | awk '{print $1}')"
+              jq -e --arg reservation "$reservation_digest" '
+                .schemaVersion == 2 and
+                .artifactType == "application/vnd.akua.agent-os.release-candidate.v1" and
+                .subject.digest == $reservation and
+                ([.layers[] | select(.mediaType == "application/vnd.akua.agent-os.release-candidate.v1+json")] | length == 1) and
+                ([.layers[] | select(.mediaType == "application/vnd.akua.agent-os.bootstrap.v1+tar" and .annotations["org.opencontainers.image.title"] == "agent-os-bootstrap.tar")] | length == 1)' \
+                "$RUNNER_TEMP/candidate-trusted-artifact/candidate-manifest.json" >/dev/null
+              record_blob=$(jq -er '[.layers[] | select(.mediaType == "application/vnd.akua.agent-os.release-candidate.v1+json")] | .[0].digest' \
+                "$RUNNER_TEMP/candidate-trusted-artifact/candidate-manifest.json")
+              bootstrap_blob=$(jq -er '[.layers[] | select(.mediaType == "application/vnd.akua.agent-os.bootstrap.v1+tar")] | .[0].digest' \
+                "$RUNNER_TEMP/candidate-trusted-artifact/candidate-manifest.json")
+              [ "$record_blob" = "sha256:$(sha256sum "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json" | awk '{print $1}')" ]
+              [ "$bootstrap_blob" = "sha256:$(sha256sum "$RUNNER_TEMP/candidate-trusted-artifact/agent-os-bootstrap.tar" | awk '{print $1}')" ]
+              jq -e \
+                --arg commit '${{ steps.candidate_source.outputs.commit }}' \
+                --arg tree '${{ steps.candidate_source.outputs.tree }}' \
+                --arg source '${{ steps.candidate_source.outputs.source_sha256 }}' \
+                --arg bootstrap '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' \
+                --arg repository "$IMAGE" '
+                .schema_version == 1 and .source_mode == "candidate" and
+                .commit == $commit and .tree == $tree and
+                .source_archive_sha256 == $source and .bootstrap_archive_sha256 == $bootstrap and
+                .image_repository == $repository and
+                (.image_digest | test("^sha256:[0-9a-f]{64}$"))' \
+                "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json" >/dev/null
+              cp "$RUNNER_TEMP/candidate-trusted-artifact/agent-os-bootstrap.tar" image/agent-os-bootstrap.tar
+              image_digest=$(jq -er .image_digest "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
+              bootstrap_sha=$(jq -er .bootstrap_archive_sha256 "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
+              printf 'build=false\ncandidate_record_digest=%s\nimage_digest=%s\nbootstrap_sha256=%s\n' \
+                "$candidate_record_digest" "$image_digest" "$bootstrap_sha" >> "$GITHUB_OUTPUT"
+              echo "::notice::candidate reservation recovered from durable trusted artifact"
+              exit 0
+            fi
             printf 'build=true\nbootstrap_sha256=%s\n' '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -416,7 +469,7 @@ jobs:
             AGENT_OS_SOURCE_MODE=${{ steps.candidate_source.outputs.mode }}
             AGENT_OS_SOURCE_REF=${{ steps.candidate_source.outputs.ref }}
 
-      - name: Create or verify immutable release candidate record
+      - name: Prepare immutable release candidate record
         if: github.ref == 'refs/heads/main'
         id: candidate_record
         env:
@@ -548,6 +601,31 @@ jobs:
             '{schemaVersion:2,mediaType:"application/vnd.oci.image.manifest.v1+json",artifactType:"application/vnd.akua.agent-os.release-candidate.v1",subject:$subject,config:$config,layers:[$record,$bootstrap]}' \
             > "$RUNNER_TEMP/candidate-manifest.json"
           candidate_record_digest="sha256:$(sha256sum "$RUNNER_TEMP/candidate-manifest.json" | awk '{print $1}')"
+          if [ -d "$RUNNER_TEMP/candidate-trusted-artifact" ]; then
+            cmp "$RUNNER_TEMP/candidate-record.json" "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json"
+            cmp "$RUNNER_TEMP/candidate-manifest.json" "$RUNNER_TEMP/candidate-trusted-artifact/candidate-manifest.json"
+            cmp image/agent-os-bootstrap.tar "$RUNNER_TEMP/candidate-trusted-artifact/agent-os-bootstrap.tar"
+          fi
+          cp image/agent-os-bootstrap.tar "$RUNNER_TEMP/agent-os-bootstrap.tar"
+          printf 'candidate_record_digest=%s\nimage_digest=%s\n' "$candidate_record_digest" "$actual_image_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Stage trusted candidate record evidence
+        if: github.ref == 'refs/heads/main' && steps.candidate_reservation.outputs.build == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: agent-os-candidate-record-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/candidate-record.json
+            ${{ runner.temp }}/candidate-manifest.json
+            ${{ runner.temp }}/agent-os-bootstrap.tar
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish immutable release candidate record
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -eu
+          candidate_record_digest='${{ steps.candidate_record.outputs.candidate_record_digest }}'
           if oras manifest fetch "$IMAGE@$candidate_record_digest" > "$RUNNER_TEMP/candidate-existing-manifest.json" 2> "$RUNNER_TEMP/candidate-existing-manifest.err"; then
             cmp "$RUNNER_TEMP/candidate-manifest.json" "$RUNNER_TEMP/candidate-existing-manifest.json" || {
               echo "::error::candidate record coordinate already contains different artifacts"
@@ -573,20 +651,6 @@ jobs:
             echo "::error::candidate reservation does not resolve to exactly one verified record"
             exit 1
           }
-          cp image/agent-os-bootstrap.tar "$RUNNER_TEMP/agent-os-bootstrap.tar"
-          printf 'candidate_record_digest=%s\nimage_digest=%s\n' "$candidate_record_digest" "$actual_image_digest" >> "$GITHUB_OUTPUT"
-
-      - name: Retain candidate record for release preparation
-        if: github.ref == 'refs/heads/main' && steps.candidate_reservation.outputs.build == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: agent-os-candidate-record-${{ github.sha }}
-          path: |
-            ${{ runner.temp }}/candidate-record.json
-            ${{ runner.temp }}/candidate-manifest.json
-            ${{ runner.temp }}/agent-os-bootstrap.tar
-          if-no-files-found: error
-          retention-days: 90
 
       - name: Prepare protected-main source
         if: github.ref == 'refs/heads/main'

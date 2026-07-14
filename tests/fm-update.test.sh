@@ -326,7 +326,7 @@ test_secondmate_persisted_policy_refuses_sanitized_self_update() {
   standalone="$w/standalone"
   git clone -q "$w/main" "$standalone"
   printf 'standalone\n' > "$standalone/.fm-secondmate-home"
-  mkdir -p "$w/linked/state" "$standalone/state"
+  mkdir -p "$w/linked/state" "$w/linked/config" "$standalone/state" "$standalone/config"
   touch "$w/linked/state/.last-watcher-beat" "$standalone/state/.last-watcher-beat"
   commit=$(git -C "$w/main" rev-parse HEAD)
   sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -335,6 +335,10 @@ test_secondmate_persisted_policy_refuses_sanitized_self_update() {
     > "$linked_gitdir/agent-os-runtime-source"
   printf 'mode=release\ncommit=%s\nsource_sha256=%s\n' "$commit" "$sha" \
     > "$standalone/.git/agent-os-runtime-source"
+  printf 'mode=release\ncommit=%s\nsource_sha256=%s\n' "$commit" "$sha" \
+    > "$w/linked/config/agent-os-source-policy"
+  printf 'mode=release\ncommit=%s\nsource_sha256=%s\n' "$commit" "$sha" \
+    > "$standalone/config/agent-os-source-policy"
 
   for target in "$w/linked" "$standalone"; do
     set +e
@@ -346,6 +350,18 @@ test_secondmate_persisted_policy_refuses_sanitized_self_update() {
     assert_contains "$out" "self-update is disabled for immutable image source" \
       "secondmate immutable provenance blocks sanitized self-update"
   done
+  before=$(git -C "$w/linked" rev-parse HEAD)
+  rm "$linked_gitdir/agent-os-runtime-source"
+  set +e
+  out=$(env -i PATH="$PATH" HOME="$HOME" FM_ROOT_OVERRIDE="$w/linked" FM_HOME="$w/linked" \
+    "$UPDATE" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -eq 2 ] || fail "missing secondmate Git policy exited $status, expected 2"
+  assert_contains "$out" "immutable source provenance is incomplete" \
+    "missing secondmate Git policy fails closed"
+  [ "$(git -C "$w/linked" rev-parse HEAD)" = "$before" ] || \
+    fail "secondmate moved after immutable Git policy removal"
   pass "T14 linked and standalone secondmates persist immutable update policy"
 }
 

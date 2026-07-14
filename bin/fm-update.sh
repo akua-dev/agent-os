@@ -68,6 +68,29 @@ resolve_policy_git_dir() {
 POLICY_GIT_DIR=
 resolve_policy_git_dir "$FM_ROOT" || true
 policy_file=${POLICY_GIT_DIR:+$POLICY_GIT_DIR/agent-os-runtime-source}
+home_policy_file="$FM_ROOT/config/agent-os-source-policy"
+secondmate_home=false
+if [ -e "$FM_ROOT/.fm-secondmate-home" ]; then
+  [ -f "$FM_ROOT/.fm-secondmate-home" ] && [ ! -L "$FM_ROOT/.fm-secondmate-home" ] || {
+    echo "error: invalid secondmate home provenance" >&2
+    exit 2
+  }
+  secondmate_home=true
+fi
+if [ "$secondmate_home" = true ] && { [ -e "$policy_file" ] || [ -e "$home_policy_file" ]; }; then
+  [ -f "$policy_file" ] && [ ! -L "$policy_file" ] && \
+    [ -f "$home_policy_file" ] && [ ! -L "$home_policy_file" ] || {
+    echo "error: immutable source provenance is incomplete" >&2
+    exit 2
+  }
+  cmp "$policy_file" "$home_policy_file" >/dev/null || {
+    echo "error: immutable source provenance does not match the secondmate home policy" >&2
+    exit 2
+  }
+elif [ "$secondmate_home" = false ] && [ -e "$home_policy_file" ]; then
+  echo "error: immutable source provenance exists outside a secondmate home" >&2
+  exit 2
+fi
 if [ -f "$policy_file" ]; then
   policy_mode=$(sed -n 's/^mode=//p' "$policy_file")
   policy_commit=$(sed -n 's/^commit=//p' "$policy_file")

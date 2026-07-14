@@ -51,6 +51,15 @@ A_AGAIN=$(materialize "$TMP/a.git" "$A_SHA") || fail "release A rollback selecti
 [ "$(cat "$HOME_DIR/data/captain-state")" = persistent ] || fail "persistent home state changed"
 pass "content-addressed sources support A to B to A without changing home state"
 
+PATH_SENTINEL="$TMP/path-sed-executed"
+mkdir "$TMP/fake-bin"
+printf '#!/usr/bin/env bash\ntouch %q\nexec /usr/bin/sed "$@"\n' "$PATH_SENTINEL" > "$TMP/fake-bin/sed"
+chmod +x "$TMP/fake-bin/sed"
+PATH="$TMP/fake-bin:$PATH" materialize "$TMP/a.git" "$A_SHA" >/dev/null || \
+  fail "source validation failed under an untrusted ambient PATH"
+[ ! -e "$PATH_SENTINEL" ] || fail "source validation executed a persistent PATH override"
+pass "runtime provenance utilities use a fixed system PATH"
+
 FSWATCH_SENTINEL="$TMP/fsmonitor-executed"
 FSWATCH="$TMP/fsmonitor"
 printf '#!/usr/bin/env bash\ntouch %q\n' "$FSWATCH_SENTINEL" > "$FSWATCH"

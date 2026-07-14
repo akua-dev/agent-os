@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
 
 FM_HOME=${FM_HOME:?FM_HOME is required}
 IMAGE_SOURCE=${AGENT_OS_IMAGE_SOURCE:?AGENT_OS_IMAGE_SOURCE is required}

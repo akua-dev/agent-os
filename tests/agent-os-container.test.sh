@@ -269,6 +269,12 @@ assert_grep '.workflow_run.head_sha == $sha' "$IMAGE_WORKFLOW" \
   "candidate recovery must bind the trusted record to the exact protected-main commit"
 assert_grep 'recovering incomplete candidate reservation' "$IMAGE_WORKFLOW" \
   "candidate retries must recover an incomplete reservation under its trusted coordinator"
+assert_grep 'candidate reservation recovered from durable trusted artifact' "$IMAGE_WORKFLOW" \
+  "zero-referrer retries must recover durable trusted candidate evidence"
+stage_line=$(grep -n 'name: Stage trusted candidate record evidence' "$IMAGE_WORKFLOW" | cut -d: -f1)
+publish_line=$(grep -n 'name: Publish immutable release candidate record' "$IMAGE_WORKFLOW" | cut -d: -f1)
+[ -n "$stage_line" ] && [ -n "$publish_line" ] && [ "$stage_line" -lt "$publish_line" ] || \
+  fail "trusted candidate evidence must be durable before referrer publication"
 assert_grep 'org.opencontainers.image.title":"agent-os-bootstrap.tar"' "$IMAGE_WORKFLOW" \
   "candidate records must retain the exact bootstrap artifact"
 assert_grep 'candidate record coordinate already contains different artifacts' "$IMAGE_WORKFLOW" \

@@ -74,6 +74,9 @@ for id in linked standalone; do
   [ "$(cat "$TMP/$id/data/state")" = "persistent-$id" ] || fail "$id persistent state changed"
   gitdir=$(git -C "$TMP/$id" rev-parse --absolute-git-dir)
   [ -f "$gitdir/agent-os-runtime-source" ] || fail "$id immutable policy was not persisted"
+  [ -f "$TMP/$id/config/agent-os-source-policy" ] || fail "$id home policy was not persisted"
+  cmp "$gitdir/agent-os-runtime-source" "$TMP/$id/config/agent-os-source-policy" || \
+    fail "$id Git and home policies differ"
 done
 
 run_sync "$TMP/primary-a" "$A_COMMIT" "$A_TREE" "$A_SHA" >/dev/null || \
@@ -83,6 +86,67 @@ for id in linked standalone; do
   [ "$(cat "$TMP/$id/data/state")" = "persistent-$id" ] || fail "$id persistent state changed on rollback"
 done
 pass "linked and standalone secondmates select exact A to B to A sources"
+
+gitdir=$(git -C "$TMP/standalone" rev-parse --absolute-git-dir)
+printf 'mode=release\ncommit=%s\nsource_sha256=%s\n' "$B_COMMIT" "$B_SHA" \
+  > "$TMP/standalone/config/agent-os-source-policy"
+if run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null 2>&1; then
+  fail "mismatched secondmate immutable policies were accepted"
+fi
+[ "$(git -C "$TMP/standalone" rev-parse HEAD)" = "$A_COMMIT" ] || \
+  fail "mismatched secondmate immutable policy allowed source mutation"
+cp "$gitdir/agent-os-runtime-source" "$TMP/standalone/config/agent-os-source-policy"
+pass "secondmate selection rejects mismatched immutable policies"
+
+git clone -q "$LEASE" "$TMP/redirected"
+git -C "$TMP/redirected" checkout -q --detach "$A_COMMIT"
+printf 'owner\n' > "$TMP/redirected/.fm-secondmate-home"
+mkdir -p "$TMP/redirected/data" "$TMP/redirected/state" "$TMP/redirected/config" "$TMP/redirected/projects"
+{
+  printf 'window=firstmate:fm-redirected\n'
+  printf 'kind=secondmate\n'
+  printf 'home=%s/redirected\n' "$TMP"
+} > "$FM_HOME_DIR/state/redirected.meta"
+if run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null 2>&1; then
+  fail "mismatched secondmate ownership marker was accepted"
+fi
+[ "$(git -C "$TMP/redirected" rev-parse HEAD)" = "$A_COMMIT" ] || \
+  fail "mismatched secondmate home was mutated"
+rm "$FM_HOME_DIR/state/redirected.meta"
+pass "secondmate selection requires exact registered marker ownership"
+
+git clone -q "$LEASE" "$TMP/linked-alias"
+git -C "$TMP/linked-alias" checkout -q --detach "$A_COMMIT"
+printf 'linked\n' > "$TMP/linked-alias/.fm-secondmate-home"
+mkdir -p "$TMP/linked-alias/data" "$TMP/linked-alias/state" "$TMP/linked-alias/config" \
+  "$TMP/linked-alias/projects"
+printf -- '- linked - standby (home: %s/linked-alias; state: idle)\n' "$TMP" \
+  > "$FM_HOME_DIR/data/secondmates.md"
+if run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null 2>&1; then
+  fail "duplicate secondmate identity homes were accepted"
+fi
+[ "$(git -C "$TMP/linked-alias" rev-parse HEAD)" = "$A_COMMIT" ] || \
+  fail "duplicate secondmate identity home was mutated"
+: > "$FM_HOME_DIR/data/secondmates.md"
+pass "secondmate selection rejects one identity mapped to multiple homes"
+
+git clone -q "$LEASE" "$TMP/linked/projects/nested"
+git -C "$TMP/linked/projects/nested" checkout -q --detach "$A_COMMIT"
+printf 'nested\n' > "$TMP/linked/projects/nested/.fm-secondmate-home"
+mkdir -p "$TMP/linked/projects/nested/data" "$TMP/linked/projects/nested/state" \
+  "$TMP/linked/projects/nested/config" "$TMP/linked/projects/nested/projects"
+{
+  printf 'window=firstmate:fm-nested\n'
+  printf 'kind=secondmate\n'
+  printf 'home=%s/linked/projects/nested\n' "$TMP"
+} > "$FM_HOME_DIR/state/nested.meta"
+if run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null 2>&1; then
+  fail "overlapping secondmate homes were accepted"
+fi
+[ "$(git -C "$TMP/linked/projects/nested" rev-parse HEAD)" = "$A_COMMIT" ] || \
+  fail "overlapping secondmate home was mutated"
+rm "$FM_HOME_DIR/state/nested.meta"
+pass "secondmate selection rejects canonical home overlap"
 
 printf 'tampered\n' >> "$TMP/standalone/AGENTS.md"
 if run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null 2>&1; then

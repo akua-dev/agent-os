@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
 
 FM_HOME=${FM_HOME:?FM_HOME is required}
 FM_ROOT=${FM_ROOT_OVERRIDE:?FM_ROOT_OVERRIDE is required}
@@ -10,6 +12,10 @@ SOURCE_BRANCH=${AGENT_OS_SOURCE_BRANCH:?AGENT_OS_SOURCE_BRANCH is required}
 SOURCE_ORIGIN=${AGENT_OS_SOURCE_ORIGIN:?AGENT_OS_SOURCE_ORIGIN is required}
 SOURCE_MODE=${AGENT_OS_SOURCE_MODE:?AGENT_OS_SOURCE_MODE is required}
 GIT_BIN=/usr/bin/git
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SUB_HOME_MARKER=.fm-secondmate-home
+# shellcheck source=bin/fm-ff-lib.sh
+. "$SCRIPT_DIR/fm-ff-lib.sh"
 
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 2
 [[ "$SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]] || exit 2
@@ -89,26 +95,29 @@ validate_config() {
   done
 }
 
+ids=()
 homes=()
-seen=$'\n'
 add_home() {
-  local home=$1
-  [ -n "$home" ] || return 0
+  local id=$1 home=$2
+  [ -n "$id" ] && [ -n "$home" ] || return 0
+  case "$id" in *[!A-Za-z0-9._-]*|.|..) echo "error: secondmate id is invalid" >&2; exit 2 ;; esac
   case "$home" in /*) ;; *) echo "error: secondmate home is not absolute" >&2; exit 2 ;; esac
-  case "$seen" in *$'\n'"$home"$'\n'*) return 0 ;; esac
-  seen+="$home"$'\n'
+  ids+=("$id")
   homes+=("$home")
 }
 
 for meta in "$FM_HOME"/state/*.meta; do
   [ -f "$meta" ] || continue
   [ "$(sed -n 's/^kind=//p' "$meta")" = secondmate ] || continue
-  add_home "$(sed -n 's/^home=//p' "$meta")"
+  id=${meta##*/}
+  id=${id%.meta}
+  add_home "$id" "$(sed -n 's/^home=//p' "$meta")"
 done
 if [ -f "$FM_HOME/data/secondmates.md" ]; then
   while IFS= read -r line; do
     case "$line" in '- '*) ;; *) continue ;; esac
-    add_home "$(printf '%s\n' "$line" | sed -n 's/.*(home:[[:space:]]*\([^;]*\);.*/\1/p' | sed 's/[[:space:]]*$//')"
+    id=$(printf '%s\n' "$line" | sed -n 's/^- \([^ ][^ ]*\) - .*/\1/p')
+    add_home "$id" "$(printf '%s\n' "$line" | sed -n 's/.*(home:[[:space:]]*\([^;]*\);.*/\1/p' | sed 's/[[:space:]]*$//')"
   done < "$FM_HOME/data/secondmates.md"
 fi
 
@@ -116,13 +125,42 @@ fi
 [ "$(trusted_git -C "$FM_ROOT" rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE" ] || exit 2
 [ -z "$(trusted_git -C "$FM_ROOT" status --porcelain --untracked-files=all)" ] || exit 2
 
+validated_ids=()
+validated_homes=()
 git_dirs=()
-for home in "${homes[@]}"; do
-  [ "$(cd "$home" 2>/dev/null && pwd -P)" != "$(cd "$FM_ROOT" && pwd -P)" ] || continue
-  [ -f "$home/.fm-secondmate-home" ] && [ ! -L "$home/.fm-secondmate-home" ] || {
-    echo "error: secondmate home lacks exact provenance marker: $home" >&2
+seen_homes=$'\n'
+for index in "${!homes[@]}"; do
+  id=${ids[$index]}
+  home=${homes[$index]}
+  validate_secondmate_home "$id" "$home" || {
+    echo "error: invalid secondmate home for $id: $VALIDATION_ERROR" >&2
     exit 2
   }
+  home=$VALIDATED_HOME
+  duplicate=false
+  for prior in "${!validated_homes[@]}"; do
+    prior_home=${validated_homes[$prior]}
+    prior_id=${validated_ids[$prior]}
+    if [ "$home" = "$prior_home" ]; then
+      [ "$id" = "$prior_id" ] || {
+        echo "error: secondmate home is registered to multiple identities: $home" >&2
+        exit 2
+      }
+      duplicate=true
+      break
+    fi
+    if [ "$id" = "$prior_id" ]; then
+      echo "error: secondmate identity is registered to multiple homes: $id" >&2
+      exit 2
+    fi
+    if path_is_ancestor_of "$home" "$prior_home" || path_is_ancestor_of "$prior_home" "$home"; then
+      echo "error: secondmate homes overlap: $home and $prior_home" >&2
+      exit 2
+    fi
+  done
+  [ "$duplicate" = false ] || continue
+  case "$seen_homes" in *$'\n'"$home"$'\n'*) continue ;; esac
+  seen_homes+="$home"$'\n'
   resolve_git_metadata "$home" || { echo "error: secondmate Git metadata is invalid: $home" >&2; exit 2; }
   validate_config "$RESOLVED_COMMON_DIR/config" || {
     echo "error: secondmate Git configuration is invalid: $home" >&2
@@ -132,25 +170,62 @@ for home in "${homes[@]}"; do
     echo "error: secondmate source is not clean: $home" >&2
     exit 2
   }
+  git_policy="$RESOLVED_GIT_DIR/agent-os-runtime-source"
+  home_policy="$home/config/agent-os-source-policy"
+  for policy in "$git_policy" "$home_policy"; do
+    if [ -e "$policy" ]; then
+      [ -f "$policy" ] && [ ! -L "$policy" ] || {
+        echo "error: secondmate immutable policy is invalid: $home" >&2
+        exit 2
+      }
+      policy_mode=$(sed -n 's/^mode=//p' "$policy")
+      policy_commit=$(sed -n 's/^commit=//p' "$policy")
+      policy_sha=$(sed -n 's/^source_sha256=//p' "$policy")
+      case "$policy_mode" in candidate|release) ;; *) echo "error: secondmate immutable policy is invalid: $home" >&2; exit 2 ;; esac
+      [[ "$policy_commit" =~ ^[0-9a-f]{40}$ ]] && [[ "$policy_sha" =~ ^[0-9a-f]{64}$ ]] || {
+        echo "error: secondmate immutable policy is invalid: $home" >&2
+        exit 2
+      }
+      [ "$(wc -l < "$policy" | tr -d ' ')" -eq 3 ] || {
+        echo "error: secondmate immutable policy is invalid: $home" >&2
+        exit 2
+      }
+    fi
+  done
+  if [ -e "$home_policy" ] && [ ! -e "$git_policy" ]; then
+    echo "error: secondmate immutable policy is incomplete: $home" >&2
+    exit 2
+  fi
+  if [ -e "$git_policy" ] && [ -e "$home_policy" ]; then
+    cmp "$git_policy" "$home_policy" || {
+      echo "error: secondmate immutable policies do not match: $home" >&2
+      exit 2
+    }
+  fi
+  validated_ids+=("$id")
+  validated_homes+=("$home")
   git_dirs+=("$RESOLVED_GIT_DIR")
 done
 
 marker="mode=$SOURCE_MODE
 commit=$SOURCE_COMMIT
 source_sha256=$SOURCE_SHA"
-index=0
-for home in "${homes[@]}"; do
-  [ "$(cd "$home" 2>/dev/null && pwd -P)" != "$(cd "$FM_ROOT" && pwd -P)" ] || continue
+for index in "${!validated_homes[@]}"; do
+  home=${validated_homes[$index]}
   git_dir=${git_dirs[$index]}
-  index=$((index + 1))
   trusted_git -c protocol.file.allow=always -C "$home" fetch --no-tags "$FM_ROOT" "$SOURCE_COMMIT"
   [ "$(trusted_git -C "$home" rev-parse FETCH_HEAD)" = "$SOURCE_COMMIT" ] || exit 2
   [ "$(trusted_git -C "$home" rev-parse 'FETCH_HEAD^{tree}')" = "$SOURCE_TREE" ] || exit 2
   trusted_git -C "$home" checkout --detach "$SOURCE_COMMIT"
   trusted_git -C "$home" remote set-url origin "$SOURCE_ORIGIN"
+  mkdir -p "$home/config"
+  home_marker_tmp="$home/config/.agent-os-source-policy.$$"
+  printf '%s\n' "$marker" > "$home_marker_tmp"
+  mv "$home_marker_tmp" "$home/config/agent-os-source-policy"
   marker_tmp="$git_dir/agent-os-runtime-source.$$"
   printf '%s\n' "$marker" > "$marker_tmp"
   mv "$marker_tmp" "$git_dir/agent-os-runtime-source"
+  cmp "$home/config/agent-os-source-policy" "$git_dir/agent-os-runtime-source" || exit 2
   [ "$(trusted_git -C "$home" rev-parse HEAD)" = "$SOURCE_COMMIT" ] || exit 2
   [ "$(trusted_git -C "$home" rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE" ] || exit 2
   [ -z "$(trusted_git -C "$home" status --porcelain --untracked-files=all)" ] || exit 2
