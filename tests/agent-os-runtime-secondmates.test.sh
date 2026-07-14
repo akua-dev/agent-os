@@ -81,7 +81,7 @@ make_primary() {
 }
 
 write_treehouse_state() {
-  local meta id home
+  local meta id home slot=0
   : > "$TEST_ROOT/treehouse-worktrees.jsonl"
   for meta in "$FM_HOME_DIR"/state/*.meta; do
     [ -f "$meta" ] || continue
@@ -89,10 +89,11 @@ write_treehouse_state() {
     id=${meta##*/}
     id=${id%.meta}
     home=$(sed -n 's/^home=//p' "$meta")
-    jq -cn --arg id "$id" --arg home "$home" \
-      '{name:$id,path:$home,created_at:"2026-01-01T00:00:00Z",destroying:false,
+    jq -cn --arg id "$id" --arg home "$home" --arg name "$slot" \
+      '{name:$name,path:$home,created_at:"2026-01-01T00:00:00Z",destroying:false,
         owner_pid:0,owner_started_at:0,leased:true,lease_holder:$id,
         leased_at:"2026-01-01T00:00:00Z"}' >> "$TEST_ROOT/treehouse-worktrees.jsonl"
+    slot=$((slot + 1))
   done
   jq -s '{worktrees:.}' "$TEST_ROOT/treehouse-worktrees.jsonl" \
     > "$TREEHOUSE_POOL/treehouse-state.json"
@@ -361,10 +362,11 @@ expect_rejection_without_mutation "ambiguous planted Treehouse holder evidence"
 
 git -C "$LEASE" worktree add -q --detach "$TMP/leased-decoy" "$A_COMMIT"
 write_treehouse_state
-jq '(.worktrees[] | select(.lease_holder == "linked") | .name) = "leased-decoy"' \
+jq --arg path "$TMP/leased-decoy" \
+  '(.worktrees[] | select(.lease_holder == "linked") | .path) = $path' \
   "$TREEHOUSE_POOL/treehouse-state.json" > "$TEST_ROOT/state-next.json"
 mv "$TEST_ROOT/state-next.json" "$TREEHOUSE_POOL/treehouse-state.json"
-expect_rejection_without_mutation "Treehouse lease bound to another same-common worktree"
+expect_rejection_without_mutation "Treehouse leased path bound to another same-common worktree"
 [ "$(git -C "$TMP/leased-decoy" rev-parse HEAD)" = "$A_COMMIT" ] || \
   fail "same-common decoy worktree was mutated"
 git -C "$LEASE" worktree remove "$TMP/leased-decoy"
@@ -404,12 +406,23 @@ for barrier_phase in fetch policy checkout remote marker; do
     kill "$runtime_pid" 2>/dev/null || true
     fail "runtime TOCTOU $barrier_phase barrier was not reached"
   }
-  if [ "$barrier_phase" = fetch ] && \
-    AGENT_OS_TEST_BARRIERS='' AGENT_OS_TEST_BARRIER_PHASE='' \
+  if [ "$barrier_phase" = fetch ]; then
+    if [ -x /usr/bin/flock ]; then
+      exec {probe_fd}<>"$TREEHOUSE_POOL/treehouse-state.lock"
+      /usr/bin/flock -n -E 75 -x "$probe_fd"
+      probe_status=$?
+      exec {probe_fd}>&-
+      if [ "$probe_status" -ne 75 ]; then
+        touch "$AGENT_OS_TEST_BARRIER_RELEASE"
+        wait "$runtime_pid" 2>/dev/null || true
+        fail "secondmate ownership lock did not exclude a bounded contender"
+      fi
+    elif AGENT_OS_TEST_BARRIERS='' AGENT_OS_TEST_BARRIER_PHASE='' \
       run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null 2>&1; then
-    touch "$AGENT_OS_TEST_BARRIER_RELEASE"
-    wait "$runtime_pid" 2>/dev/null || true
-    fail "secondmate ownership lock admitted a concurrent runtime mutation"
+      touch "$AGENT_OS_TEST_BARRIER_RELEASE"
+      wait "$runtime_pid" 2>/dev/null || true
+      fail "secondmate ownership lock admitted a concurrent runtime mutation"
+    fi
   fi
   printf 'gitdir: %s/toctou-foreign/.git\n' "$TMP" > "$TMP/linked/.git"
   printf '%s\n' "$TMP/toctou-foreign/.git" > "$linked_gitdir/commondir"

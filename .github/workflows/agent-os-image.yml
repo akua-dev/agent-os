@@ -472,16 +472,25 @@ jobs:
                 "$BUILD_ATTEMPT_STATE" "$record_count" "$build_count" >> "$chain_state"
             done < "$CLAIM_CHAIN_FILE"
             decision=$(bin/agent-os-candidate-state.sh "$chain_state")
-            IFS=$'\t' read -r candidate_action artifact_owner <<EOF
+            IFS=$'\t' read -r candidate_action artifact_owner paired_build_owner <<EOF
 $decision
 EOF
             case "$candidate_action" in
               build)
                 artifact_owner=$CLAIM_OWNER
+                build_artifact_owner=$artifact_owner
                 BUILD_ATTEMPT_STATE=absent
                 ;;
-              reuse-record|reuse-record-pair|reuse-build)
+              reuse-record|reuse-build)
                 [[ "$artifact_owner" =~ ^[0-9]+$ ]]
+                [ -z "$paired_build_owner" ]
+                build_artifact_owner=$artifact_owner
+                BUILD_ATTEMPT_STATE=attempted
+                ;;
+              reuse-record-pair)
+                [[ "$artifact_owner" =~ ^[0-9]+$ ]]
+                [[ "$paired_build_owner" =~ ^[0-9]+$ ]]
+                build_artifact_owner=$paired_build_owner
                 BUILD_ATTEMPT_STATE=attempted
                 ;;
               *)
@@ -496,7 +505,7 @@ EOF
               echo "::error::candidate reservation has conflicting trusted artifacts"
               exit 1
             }
-            build_artifact_count=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$artifact_owner" \
+            build_artifact_count=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$build_artifact_owner" \
               '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | length' \
               "$RUNNER_TEMP/candidate-build-artifacts.json")
             [ "$build_artifact_count" -le 1 ] || {
@@ -544,7 +553,7 @@ EOF
               bootstrap_sha=$(jq -er .bootstrap_archive_sha256 "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
               if [ "$candidate_action" = reuse-record-pair ]; then
                 [ "$build_artifact_count" -eq 1 ] || exit 1
-                load_exact_build_artifact "$artifact_owner"
+                load_exact_build_artifact "$build_artifact_owner"
                 [ "$EXACT_BUILD_IMAGE_DIGEST" = "$image_digest" ] || {
                   echo "::error::paired candidate build and record evidence disagree"
                   exit 1

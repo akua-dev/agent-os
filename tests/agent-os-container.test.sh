@@ -284,6 +284,12 @@ assert_grep 'bin/agent-os-candidate-state.sh "$chain_state"' "$IMAGE_WORKFLOW" \
   "candidate rebuild authorization must classify the full claim chain"
 assert_grep 'done < "$CLAIM_CHAIN_FILE"' "$IMAGE_WORKFLOW" \
   "candidate retries must inspect every validated reservation owner"
+assert_grep 'read -r candidate_action artifact_owner paired_build_owner' "$IMAGE_WORKFLOW" \
+  "candidate recovery must preserve distinct record and build evidence owners"
+assert_grep 'load_exact_build_artifact "$build_artifact_owner"' "$IMAGE_WORKFLOW" \
+  "candidate recovery must load exact build evidence from the attempt owner"
+assert_grep '[ "$EXACT_BUILD_IMAGE_DIGEST" = "$image_digest" ]' "$IMAGE_WORKFLOW" \
+  "candidate recovery must digest-match split-owner evidence"
 assert_no_grep 'if load_build_attempt' "$IMAGE_WORKFLOW" \
   "candidate attempt validation must never run in a conditional errexit context"
 attempt_line=$(grep -n 'name: Claim owner-bound candidate build attempt' "$IMAGE_WORKFLOW" | cut -d: -f1)

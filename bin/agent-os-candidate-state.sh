@@ -9,8 +9,9 @@ state_file=${1:?candidate claim-chain state file is required}
 
 attempted_count=0
 build_owner=
-build_record_count=
-build_artifact_count=
+record_owner=
+record_total=0
+build_total=0
 seen_owners='|'
 seen_claims='|'
 entries=0
@@ -33,8 +34,6 @@ while IFS=$'\t' read -r owner claim attempt record_count artifact_count extra ||
     attempted)
       attempted_count=$((attempted_count + 1))
       build_owner=$owner
-      build_record_count=$record_count
-      build_artifact_count=$artifact_count
       ;;
     *)
       echo "error: candidate attempt state is not exact: $attempt" >&2
@@ -49,10 +48,20 @@ while IFS=$'\t' read -r owner claim attempt record_count artifact_count extra ||
     echo "error: candidate evidence is ambiguous" >&2
     exit 2
   }
-  if { [ "$record_count" -ne 0 ] || [ "$artifact_count" -ne 0 ]; } && \
-    [ "$attempt" != attempted ]; then
-    echo "error: candidate evidence is not bound to its build attempt" >&2
-    exit 2
+  if [ "$artifact_count" -eq 1 ]; then
+    [ "$attempt" = attempted ] || {
+      echo "error: candidate build evidence is not bound to its build attempt" >&2
+      exit 2
+    }
+    build_total=$((build_total + 1))
+  fi
+  if [ "$record_count" -eq 1 ]; then
+    [ "$attempted_count" -eq 1 ] || {
+      echo "error: candidate record evidence precedes its build attempt" >&2
+      exit 2
+    }
+    record_total=$((record_total + 1))
+    record_owner=$owner
   fi
 done < "$state_file"
 
@@ -64,13 +73,23 @@ done < "$state_file"
   echo "error: candidate claim chain contains multiple build attempts" >&2
   exit 2
 }
+[ "$record_total" -le 1 ] && [ "$build_total" -le 1 ] || {
+  echo "error: candidate claim chain contains conflicting durable evidence" >&2
+  exit 2
+}
 if [ "$attempted_count" -eq 0 ]; then
   printf 'build\n'
   exit 0
 fi
-case "$build_record_count:$build_artifact_count" in
-  1:1) printf 'reuse-record-pair\t%s\n' "$build_owner" ;;
-  1:0) printf 'reuse-record\t%s\n' "$build_owner" ;;
+case "$record_total:$build_total" in
+  1:1) printf 'reuse-record-pair\t%s\t%s\n' "$record_owner" "$build_owner" ;;
+  1:0)
+    [ "$record_owner" = "$build_owner" ] || {
+      echo "error: recovered candidate record lacks exact build evidence" >&2
+      exit 2
+    }
+    printf 'reuse-record\t%s\n' "$record_owner"
+    ;;
   0:1) printf 'reuse-build\t%s\n' "$build_owner" ;;
   0:0)
     echo "error: candidate build attempt has no durable exact evidence; refusing rebuild" >&2
