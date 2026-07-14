@@ -32,6 +32,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Verify publication source
         env:
           GH_TOKEN: ${{ github.token }}
@@ -49,6 +50,7 @@ jobs:
             git merge-base --is-ancestor "$record_commit" refs/remotes/origin/main
             gh api "repos/$GITHUB_REPOSITORY/branches/main/protection" >/dev/null
             git show "$record_commit:image/releases/$tag.json" > "$RUNNER_TEMP/release-record.json"
+            git merge-base --is-ancestor "$(jq -r .commit "$RUNNER_TEMP/release-record.json")" refs/remotes/origin/main
             ruleset_id=$(jq -r .tag_ruleset_id "$RUNNER_TEMP/release-record.json")
             gh api "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id" > "$RUNNER_TEMP/tag-ruleset.json"
             ruleset_sha=$(jq -cS . "$RUNNER_TEMP/tag-ruleset.json" | sha256sum | awk '{print $1}')
@@ -56,6 +58,29 @@ jobs:
               echo "::error::release tag ruleset differs from immutable record"
               exit 1
             }
+            jq -e '
+              .enforcement == "active" and .target == "tag" and
+              (.bypass_actors | length == 0) and
+              ([.rules[].type] | index("deletion") != null and index("non_fast_forward") != null)' \
+              "$RUNNER_TEMP/tag-ruleset.json" >/dev/null || {
+              echo "::error::release tag ruleset is not active, immutable, tag-targeted, and bypass-free"
+              exit 1
+            }
+            python3 - "$GITHUB_REF" "$RUNNER_TEMP/tag-ruleset.json" <<'PY'
+          import fnmatch
+          import json
+          import sys
+
+          ref, path = sys.argv[1:]
+          with open(path, encoding="utf-8") as stream:
+              ruleset = json.load(stream)
+          names = ruleset.get("conditions", {}).get("ref_name", {})
+          include = names.get("include", [])
+          exclude = names.get("exclude", [])
+          matches = lambda pattern: pattern == "~ALL" or fnmatch.fnmatchcase(ref, pattern)
+          if not include or not any(matches(pattern) for pattern in include) or any(matches(pattern) for pattern in exclude):
+              raise SystemExit("release tag is not covered exclusively by the recorded tag ruleset")
+          PY
           else
             echo "::error::unsupported publication ref $GITHUB_REF"
             exit 1
@@ -112,9 +137,120 @@ jobs:
             AGENT_OS_SOURCE_MODE=${{ steps.source.outputs.mode }}
             AGENT_OS_SOURCE_REF=${{ steps.source.outputs.ref }}
 
+  release_artifacts:
+    if: github.event_name == 'push'
+    name: Verify immutable release artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image_digest: ${{ steps.verify.outputs.image_digest }}
+      sbom_sha256: ${{ steps.verify.outputs.sbom_sha256 }}
+      provenance_sha256: ${{ steps.verify.outputs.provenance_sha256 }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare immutable release source
+        if: startsWith(github.ref, 'refs/tags/')
+        id: source
+        run: |
+          set -eu
+          record_commit=$(git for-each-ref --format='%(contents)' "$GITHUB_REF" | sed -n 's/^release-record-commit=\([0-9a-f]\{40\}\)$/\1/p')
+          AGENT_OS_SOURCE_MODE=release AGENT_OS_SOURCE_RELEASE_TAG="${GITHUB_REF#refs/tags/}" \
+            AGENT_OS_RELEASE_RECORD_COMMIT="$record_commit" bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/source-metadata"
+          git show "$record_commit:image/releases/${GITHUB_REF#refs/tags/}.json" > "$RUNNER_TEMP/release-record.json"
+          [ "$(sha256sum "$RUNNER_TEMP/release-record.json" | awk '{print $1}')" = \
+            "$(sed -n 's/^release_record_sha256=//p' "$RUNNER_TEMP/source-metadata")" ]
+          cat "$RUNNER_TEMP/source-metadata" >> "$GITHUB_OUTPUT"
+
+      - if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+
+      - if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Compute immutable release metadata
+        if: startsWith(github.ref, 'refs/tags/')
+        id: metadata
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=tag
+
+      - name: Build release artifact without publication authority
+        if: startsWith(github.ref, 'refs/tags/')
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          outputs: type=oci,dest=/tmp/agent-os-release.oci.tar
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+          build-args: |
+            AGENT_OS_SOURCE_COMMIT=${{ steps.source.outputs.commit }}
+            AGENT_OS_SOURCE_TREE=${{ steps.source.outputs.tree }}
+            AGENT_OS_SOURCE_BRANCH=${{ steps.source.outputs.branch }}
+            AGENT_OS_SOURCE_ORIGIN=${{ steps.source.outputs.origin }}
+            AGENT_OS_SOURCE_MODE=${{ steps.source.outputs.mode }}
+            AGENT_OS_SOURCE_REF=${{ steps.source.outputs.ref }}
+
+      - name: Verify record-bound release artifact
+        if: startsWith(github.ref, 'refs/tags/')
+        id: verify
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -eu
+          mkdir "$RUNNER_TEMP/release-oci"
+          tar -xf /tmp/agent-os-release.oci.tar -C "$RUNNER_TEMP/release-oci"
+          root_digest=$(jq -er '.manifests | select(length == 1) | .[0].digest' "$RUNNER_TEMP/release-oci/index.json")
+          [ "$root_digest" = "$BUILD_DIGEST" ]
+          root_blob="$RUNNER_TEMP/release-oci/blobs/sha256/${root_digest#sha256:}"
+          [ "sha256:$(sha256sum "$root_blob" | awk '{print $1}')" = "$root_digest" ]
+          artifact_set_sha() {
+            predicate=$1
+            output=$2
+            : > "$output"
+            jq -r '.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .digest' "$root_blob" | while IFS= read -r manifest_digest; do
+              manifest="$RUNNER_TEMP/release-oci/blobs/sha256/${manifest_digest#sha256:}"
+              [ "sha256:$(sha256sum "$manifest" | awk '{print $1}')" = "$manifest_digest" ]
+              jq -r --arg predicate "$predicate" '.layers[] | select(.annotations["in-toto.io/predicate-type"] == $predicate) | .digest' "$manifest" >> "$output"
+            done
+            LC_ALL=C sort -u -o "$output" "$output"
+            [ "$(wc -l < "$output" | tr -d ' ')" -eq 2 ]
+            sha256sum "$output" | awk '{print $1}'
+          }
+          actual_image_digest=$root_digest
+          actual_sbom_sha256=$(artifact_set_sha https://spdx.dev/Document "$RUNNER_TEMP/sbom-digests")
+          actual_provenance_sha256=$(artifact_set_sha https://slsa.dev/provenance/v0.2 "$RUNNER_TEMP/provenance-digests")
+          [ "$actual_image_digest" = "$(jq -r .image_digest "$RUNNER_TEMP/release-record.json")" ]
+          [ "$actual_sbom_sha256" = "$(jq -r .sbom_sha256 "$RUNNER_TEMP/release-record.json")" ]
+          [ "$actual_provenance_sha256" = "$(jq -r .provenance_sha256 "$RUNNER_TEMP/release-record.json")" ]
+          printf 'image_digest=%s\nsbom_sha256=%s\nprovenance_sha256=%s\n' \
+            "$actual_image_digest" "$actual_sbom_sha256" "$actual_provenance_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Retain exact verified release artifact
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: agent-os-release-oci
+          path: /tmp/agent-os-release.oci.tar
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
   publish:
     if: github.event_name == 'push'
-    needs: [behavior, provenance, validate]
+    needs: [behavior, provenance, validate, release_artifacts]
     name: Publish linux/amd64 and linux/arm64
     runs-on: ubuntu-latest
     permissions:
@@ -124,6 +260,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Prepare exact source bundle
         id: source
@@ -142,6 +279,11 @@ jobs:
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
 
+      - if: startsWith(github.ref, 'refs/tags/')
+        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6
+        with:
+          version: 1.3.0
+
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
@@ -159,7 +301,15 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=tag
 
+      - name: Download exact verified release artifact
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: agent-os-release-oci
+          path: ${{ runner.temp }}/agent-os-release
+
       - name: Build and publish
+        if: github.ref == 'refs/heads/main'
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
@@ -180,10 +330,68 @@ jobs:
             AGENT_OS_SOURCE_MODE=${{ steps.source.outputs.mode }}
             AGENT_OS_SOURCE_REF=${{ steps.source.outputs.ref }}
 
-      - name: Record published image digest
+      - name: Publish exact verified release artifact
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_DIGEST: ${{ needs.release_artifacts.outputs.image_digest }}
+          RELEASE_TAGS: ${{ steps.metadata.outputs.tags }}
         run: |
+          set -eu
+          mkdir "$RUNNER_TEMP/release-oci"
+          tar -xf "$RUNNER_TEMP/agent-os-release/agent-os-release.oci.tar" -C "$RUNNER_TEMP/release-oci"
+          root_digest=$(jq -er '.manifests | select(length == 1) | .[0].digest' "$RUNNER_TEMP/release-oci/index.json")
+          [ "$root_digest" = "$RELEASE_DIGEST" ]
+          tag_names=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            [[ "$tag" == "$IMAGE:"* ]] || exit 1
+            tag_name=${tag#"$IMAGE:"}
+            [[ -n "$tag_name" && "$tag_name" != *','* ]] || exit 1
+            tag_names+=("$tag_name")
+          done <<< "$RELEASE_TAGS"
+          [ "${#tag_names[@]}" -ge 2 ]
+          destination=$(IFS=,; printf '%s:%s' "$IMAGE" "${tag_names[*]}")
+          oras cp --from-oci-layout \
+            "$RUNNER_TEMP/agent-os-release/agent-os-release.oci.tar@$RELEASE_DIGEST" "$destination"
+
+      - name: Verify and record published artifacts
+        env:
+          BUILD_DIGEST: ${{ startsWith(github.ref, 'refs/tags/') && needs.release_artifacts.outputs.image_digest || steps.build.outputs.digest }}
+          RELEASE_TAGS: ${{ steps.metadata.outputs.tags }}
+        run: |
+          set -eu
+          if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            record_commit=$(git for-each-ref --format='%(contents)' "$GITHUB_REF" | sed -n 's/^release-record-commit=\([0-9a-f]\{40\}\)$/\1/p')
+            git show "$record_commit:image/releases/${GITHUB_REF#refs/tags/}.json" > "$RUNNER_TEMP/release-record.json"
+            [ "$BUILD_DIGEST" = "${{ needs.release_artifacts.outputs.image_digest }}" ]
+            [ "$BUILD_DIGEST" = "$(jq -r .image_digest "$RUNNER_TEMP/release-record.json")" ]
+            while IFS= read -r tag; do
+              [ -n "$tag" ] || continue
+              docker buildx imagetools inspect --raw "$tag" > "$RUNNER_TEMP/published-tag-index.json"
+              [ "sha256:$(sha256sum "$RUNNER_TEMP/published-tag-index.json" | awk '{print $1}')" = "$BUILD_DIGEST" ]
+            done <<< "$RELEASE_TAGS"
+            docker buildx imagetools inspect --raw "$IMAGE@$BUILD_DIGEST" > "$RUNNER_TEMP/published-index.json"
+            published_artifact_set_sha() {
+              predicate=$1
+              output=$2
+              : > "$output"
+              jq -r '.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .digest' "$RUNNER_TEMP/published-index.json" | while IFS= read -r manifest_digest; do
+                docker buildx imagetools inspect --raw "$IMAGE@$manifest_digest" > "$RUNNER_TEMP/published-manifest.json"
+                jq -r --arg predicate "$predicate" '.layers[] | select(.annotations["in-toto.io/predicate-type"] == $predicate) | .digest' "$RUNNER_TEMP/published-manifest.json" >> "$output"
+              done
+              LC_ALL=C sort -u -o "$output" "$output"
+              [ "$(wc -l < "$output" | tr -d ' ')" -eq 2 ]
+              sha256sum "$output" | awk '{print $1}'
+            }
+            actual_sbom_sha256=$(published_artifact_set_sha https://spdx.dev/Document "$RUNNER_TEMP/published-sbom-digests")
+            actual_provenance_sha256=$(published_artifact_set_sha https://slsa.dev/provenance/v0.2 "$RUNNER_TEMP/published-provenance-digests")
+            [ "$actual_sbom_sha256" = "${{ needs.release_artifacts.outputs.sbom_sha256 }}" ]
+            [ "$actual_provenance_sha256" = "${{ needs.release_artifacts.outputs.provenance_sha256 }}" ]
+            [ "$actual_sbom_sha256" = "$(jq -r .sbom_sha256 "$RUNNER_TEMP/release-record.json")" ]
+            [ "$actual_provenance_sha256" = "$(jq -r .provenance_sha256 "$RUNNER_TEMP/release-record.json")" ]
+          fi
           {
             echo '### Agent OS image'
             echo
-            echo "Digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "Digest: \`$BUILD_DIGEST\`"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -228,6 +228,7 @@ acquire_lifecycle_locks() {
   configure_control_lock
   LOCK=$CONTROL_LOCK
   LOCK_NAMESPACE=$CONTROL_NAMESPACE
+  LOCK_INSTALLATION_ID=$CONTROL_LOCK_INSTALLATION_ID
   EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"primary"$'\t'"$CONTROL_LOCK_INSTALLATION_ID"
   LOCK_SCOPE=control
   LOCK_PERSISTENT=1
@@ -238,6 +239,7 @@ acquire_lifecycle_locks() {
   CONTROL_LOCK_VALID_UNTIL=$LOCK_VALID_UNTIL
   LOCK=agent-os-firstmate-lifecycle
   LOCK_NAMESPACE=$NAMESPACE
+  LOCK_INSTALLATION_ID=$INSTALLATION_ID
   EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"primary"$'\t'"$INSTALLATION_ID"
   LOCK_SCOPE=fleet
   LOCK_PERSISTENT=0
@@ -272,6 +274,7 @@ release_lifecycle_locks() {
   if [ -n "${CONTROL_LOCK_UID:-}" ]; then
     LOCK=$CONTROL_LOCK
     LOCK_NAMESPACE=$CONTROL_NAMESPACE
+    LOCK_INSTALLATION_ID=$CONTROL_LOCK_INSTALLATION_ID
     EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"primary"$'\t'"$CONTROL_LOCK_INSTALLATION_ID"
     LOCK_SCOPE=control
     LOCK_PERSISTENT=1

@@ -245,13 +245,16 @@ LOCK_VALID_UNTIL=
 LOCK_PERSISTENT=0
 acquire_lock
 
-SECRET_RECORD=$(secret_record)
-[ "$(printf '%s' "$SECRET_RECORD" | cut -f1)" = "$SECRET" ] && \
-  [ -n "$(printf '%s' "$SECRET_RECORD" | cut -f2)" ] && [ -n "$(printf '%s' "$SECRET_RECORD" | cut -f3)" ] && \
-  [ "$(printf '%s' "$SECRET_RECORD" | cut -f4-)" = authorization ] || {
-  echo "error: Akua authorization Secret reference is missing or unverifiable" >&2
-  exit 2
-}
+SECRET_RECORD=
+if [ "$COMMAND" = grant ]; then
+  SECRET_RECORD=$(secret_record)
+  [ "$(printf '%s' "$SECRET_RECORD" | cut -f1)" = "$SECRET" ] && \
+    [ -n "$(printf '%s' "$SECRET_RECORD" | cut -f2)" ] && [ -n "$(printf '%s' "$SECRET_RECORD" | cut -f3)" ] && \
+    [ "$(printf '%s' "$SECRET_RECORD" | cut -f4-)" = authorization ] || {
+    echo "error: Akua authorization Secret reference is missing or unverifiable" >&2
+    exit 2
+  }
+fi
 
 STATE=$(statefulset_json)
 STATE_UID=$(printf '%s' "$STATE" | jq -er --arg installation "$INSTALLATION_ID" '
@@ -274,10 +277,12 @@ sed "s/__AKUA_AUTH_SECRET__/$SECRET/g" "$TEMPLATE" | awk -v uid="$uid_value" -v 
   $1 == "metadata:" && !inserted { print; print "  uid: " uid; print "  resourceVersion: " rv; inserted=1; next }
   { print }
 ' > "$PATCH_FILE"
-[ "$(secret_record)" = "$SECRET_RECORD" ] || {
-  echo "error: Akua authorization Secret identity changed before StatefulSet CAS" >&2
-  exit 3
-}
+if [ "$COMMAND" = grant ]; then
+  [ "$(secret_record)" = "$SECRET_RECORD" ] || {
+    echo "error: Akua authorization Secret identity changed before StatefulSet CAS" >&2
+    exit 3
+  }
+fi
 if ! target_kube patch statefulset agent-os-firstmate --type=strategic --patch-file "$PATCH_FILE" >/dev/null; then
   [ "$COMMAND" != grant ] || fail_grant_closed "grant CAS failed ambiguously"
   echo "error: revoke CAS failed" >&2

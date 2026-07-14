@@ -26,20 +26,36 @@ trusted_git() {
   env -u GIT_CONFIG -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT \
     -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
     -u GIT_SSH -u GIT_SSH_COMMAND GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-    GIT_TERMINAL_PROMPT=0 command git -c credential.helper= -c core.hooksPath=/dev/null \
+    GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c core.hooksPath=/dev/null \
     -c http.proxy= -c https.proxy= "$@"
 }
 
 validate_git_config() {
-  local config="$FM_ROOT/.git/config" origin
+  local config="$FM_ROOT/.git/config" key value
   [ -f "$config" ] || { echo "error: canonical FM_ROOT Git config is unavailable" >&2; exit 2; }
-  if trusted_git config --file "$config" --no-includes --name-only --get-regexp \
-    '^(url\.|include\.|includeIf\.|core\.hooksPath$|credential\.|http\.proxy$|https\.proxy$|remote\..*\.proxy$|alias\.)' >/dev/null 2>&1; then
-    echo "error: canonical FM_ROOT Git config contains untrusted execution or transport settings" >&2
-    exit 2
-  fi
-  origin=$(trusted_git config --file "$config" --no-includes --get remote.origin.url || true)
-  [ "$origin" = "$SOURCE_ORIGIN" ] && [ "$origin" = https://github.com/akua-dev/agent-os.git ] || {
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    value=$(trusted_git config --file "$config" --no-includes --get-all "$key" || true)
+    [ -n "$value" ] && [ "$value" = "$(printf '%s\n' "$value" | head -n 1)" ] || {
+      echo "error: canonical FM_ROOT Git config key is duplicated or empty" >&2
+      exit 2
+    }
+    case "$key" in
+      core.repositoryformatversion) [ "$value" = 0 ] ;;
+      core.filemode) [ "$value" = true ] || [ "$value" = false ] ;;
+      core.bare) [ "$value" = false ] ;;
+      core.logallrefupdates) [ "$value" = true ] ;;
+      remote.origin.url) [ "$value" = "$SOURCE_ORIGIN" ] && [ "$value" = https://github.com/akua-dev/agent-os.git ] ;;
+      remote.origin.fetch)
+        [ "$value" = '+refs/heads/*:refs/remotes/origin/*' ] || \
+          [ "$value" = "+refs/heads/$SOURCE_BRANCH:refs/remotes/origin/$SOURCE_BRANCH" ]
+        ;;
+      branch."$SOURCE_BRANCH".remote) [ "$value" = origin ] ;;
+      branch."$SOURCE_BRANCH".merge) [ "$value" = "refs/heads/$SOURCE_BRANCH" ] ;;
+      *) echo "error: canonical FM_ROOT Git config key is not allowlisted: $key" >&2; exit 2 ;;
+    esac || { echo "error: canonical FM_ROOT Git config value is invalid: $key" >&2; exit 2; }
+  done < <(trusted_git config --file "$config" --no-includes --name-only --list)
+  [ "$(trusted_git config --file "$config" --no-includes --get remote.origin.url || true)" = "$SOURCE_ORIGIN" ] || {
     echo "error: canonical FM_ROOT origin provenance changed" >&2
     exit 2
   }

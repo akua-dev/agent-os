@@ -39,6 +39,7 @@ CONTROL_LOCK_RV=
 CONTROL_LOCK_RENEW_PID=
 CONTROL_LOCK_VALID_UNTIL=
 REMOVE_CONTROL_ACCESS=0
+STATEFULSET_CAS_ATTEMPTED=0
 LOCK_DURATION_SECONDS=${AGENT_OS_LOCK_DURATION_SECONDS:-300}
 LOCK_CLOCK_SKEW_SECONDS=${AGENT_OS_LOCK_CLOCK_SKEW_SECONDS:-5}
 LOCK_ACQUIRE_SECONDS=${AGENT_OS_LOCK_ACQUIRE_SECONDS:-30}
@@ -387,8 +388,34 @@ runtime_binding_json() {
   esac
 }
 
+verify_runtime_role_rules() {
+  local json
+  json=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get role agent-os-firstmate-runtime -o json) || return 3
+  printf '%s' "$json" | jq -e --arg installation "$INSTALLATION_ID" '
+    .metadata.name == "agent-os-firstmate-runtime" and
+    .metadata.labels["app.kubernetes.io/managed-by"] == "agent-os" and
+    .metadata.annotations["agent-os.dev/installation-id"] == $installation and
+    .rules == [
+      {"apiGroups":[""],"resources":["pods","persistentvolumeclaims"],"verbs":["get","list","watch","create","delete","patch"]},
+      {"apiGroups":[""],"resources":["pods/log","pods/exec"],"verbs":["get","list","watch","create","delete"]},
+      {"apiGroups":["apps"],"resources":["statefulsets"],"verbs":["get","list","watch"]},
+      {"apiGroups":["coordination.k8s.io"],"resources":["leases"],"verbs":["get","create","update","delete"]}
+    ]' >/dev/null
+}
+
+verify_control_role_rules() {
+  local json
+  json=$("$KUBECTL" --context "$CONTEXT" -n "$CONTROL_NAMESPACE" get role "$CONTROL_LOCK" -o json) || return 3
+  printf '%s' "$json" | jq -e --arg installation "$INSTALLATION_ID" --arg name "$CONTROL_LOCK" '
+    .metadata.name == $name and
+    .metadata.labels["app.kubernetes.io/managed-by"] == "agent-os" and
+    .metadata.annotations["agent-os.dev/installation-id"] == $installation and
+    .rules == [{apiGroups:["coordination.k8s.io"],resources:["leases"],resourceNames:[$name],verbs:["get","update"]}]' >/dev/null
+}
+
 verify_control_authority() {
   local account=$1 json
+  verify_control_role_rules || return 3
   json=$(control_binding_json) || return 3
   printf '%s' "$json" | jq -e --arg installation "$INSTALLATION_ID" --arg namespace "$NAMESPACE" \
     --arg name "$CONTROL_LOCK" --arg account "$account" '
@@ -420,6 +447,8 @@ transfer_runtime_authority() {
     binding=agent-os-firstmate-runtime
     kind=rolebinding
     scope=(-n "$NAMESPACE")
+    verify_runtime_role_rules || { echo "error: rollback runtime Role rules are unverifiable" >&2; return 3; }
+    verify_control_role_rules || { echo "error: rollback control Role rules are unverifiable" >&2; return 3; }
   else
     binding="agent-os-firstmate-$NAMESPACE"
     kind=clusterrolebinding
@@ -441,6 +470,7 @@ transfer_runtime_authority() {
   if [ "$current" = "$to" ]; then
     if [ "$mode" = namespace ]; then
       transfer_control_authority "$from" "$to" || return 3
+      verify_runtime_role_rules || return 3
       verify_control_authority "$to" || return 3
     fi
     return 0
@@ -459,6 +489,7 @@ transfer_runtime_authority() {
   }
   if [ "$mode" = namespace ]; then
     transfer_control_authority "$from" "$to" || return 3
+    verify_runtime_role_rules || return 3
     verify_control_authority "$to"
   fi
 }
@@ -469,6 +500,7 @@ control_binding_json() {
 
 transfer_control_authority() {
   local from=$1 to=$2 json current uid rv patch verified
+  verify_control_role_rules || return 3
   json=$(control_binding_json) || return 3
   printf '%s' "$json" | jq -e --arg name "$CONTROL_LOCK" \
     '.roleRef == {apiGroup:"rbac.authorization.k8s.io",kind:"Role",name:$name}' >/dev/null || return 3
@@ -606,6 +638,21 @@ inventory_revision_service_accounts() {
     record=$(live_resource_record namespaced ServiceAccount "$account") || return 3
     [ -n "$(printf '%s' "$record" | cut -f4)" ] && [ -n "$(printf '%s' "$record" | cut -f5)" ] || return 3
   done <<< "$accounts"
+  printf '%s' "$accounts"
+}
+
+inventory_owned_service_accounts() {
+  local resources accounts
+  resources=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" \
+    --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get serviceaccounts -o json) || return 3
+  accounts=$(printf '%s' "$resources" | jq -er --arg installation "$INSTALLATION_ID" '
+    [.items[]
+      | select(.metadata.name | test("^agent-os-firstmate(-[a-z0-9]{12})?$"))
+      | select(.metadata.labels["app.kubernetes.io/managed-by"] == "agent-os")
+      | select(.metadata.annotations["agent-os.dev/installation-id"] == $installation)] as $owned
+    | select(all($owned[]; (.metadata.uid | type == "string" and length > 0) and
+                           (.metadata.resourceVersion | type == "string" and length > 0)))
+    | [$owned[].metadata.name] | unique | join("\n")') || return 3
   printf '%s' "$accounts"
 }
 
@@ -1184,6 +1231,7 @@ mutate_rendered_resource() {
   record=$(live_resource_record "$scope" "$kind" "$name")
   expected="$name"$'\t'"agent-os"$'\t'"$INSTALLATION_ID"
   if [ -z "$record" ]; then
+    [ "$kind" != StatefulSet ] || STATEFULSET_CAS_ATTEMPTED=1
     if ! "$KUBECTL" --context "$CONTEXT" create -f "$file" >/dev/null; then
       current=$(live_resource_record "$scope" "$kind" "$name" 2>/dev/null || true)
       if [ "$(printf '%s' "$current" | cut -f1-3)" != "$expected" ] || \
@@ -1207,6 +1255,7 @@ mutate_rendered_resource() {
       }
     fi
     patch_file=$(cas_patch_file "$file" "$uid" "$rv")
+    [ "$kind" != StatefulSet ] || STATEFULSET_CAS_ATTEMPTED=1
     if [ "$scope" = cluster ]; then
       if ! "$KUBECTL" --context "$CONTEXT" patch "$kind" "$name" --type=merge --patch-file "$patch_file" >/dev/null; then
         report_partial_apply patch
@@ -1247,22 +1296,14 @@ apply_rendered() {
 }
 
 verify_desired_rbac() {
-  local role_json binding_json
+  local binding_json
   if [ "$DESIRED_RBAC" = namespace ]; then
     if ! command -v jq >/dev/null 2>&1; then
       echo "error: jq is required to verify namespace RBAC exactly" >&2
       exit 2
     fi
-    role_json=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get role agent-os-firstmate-runtime -o json)
     binding_json=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get rolebinding agent-os-firstmate-runtime -o json)
-    if ! printf '%s' "$role_json" | jq -e '
-      .metadata.name == "agent-os-firstmate-runtime" and
-      .rules == [
-        {"apiGroups":[""],"resources":["pods","persistentvolumeclaims"],"verbs":["get","list","watch","create","delete","patch"]},
-        {"apiGroups":[""],"resources":["pods/log","pods/exec"],"verbs":["get","list","watch","create","delete"]},
-        {"apiGroups":["apps"],"resources":["statefulsets"],"verbs":["get","list","watch"]},
-        {"apiGroups":["coordination.k8s.io"],"resources":["leases"],"verbs":["get","create","update","delete"]}
-      ]' >/dev/null ||
+    if ! verify_runtime_role_rules ||
       ! printf '%s' "$binding_json" | jq -e --arg namespace "$NAMESPACE" --arg serviceAccount "$SERVICE_ACCOUNT_NAME" '
         .roleRef == {"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"agent-os-firstmate-runtime"} and
         .subjects == [{"kind":"ServiceAccount","name":$serviceAccount,"namespace":$namespace}]' >/dev/null; then
@@ -1593,7 +1634,18 @@ case "$COMMAND" in
       patch_workload_annotations '{"agent-os.dev/cluster-rbac-cleanup":"required"}'
     fi
     ensure_control_lock_access
-    apply_rendered
+    if ! apply_rendered; then
+      if [ "$STATEFULSET_CAS_ATTEMPTED" -eq 1 ]; then
+        reconcile_failed_akua_upgrade "$PRESERVED_AKUA_SECRET_RECORD" || {
+          echo "incomplete: post-CAS upgrade failure and fail-closed authorization reconciliation is unverified" >&2
+          report_partial_observation StatefulSet agent-os-firstmate namespaced
+          report_partial_observation Pod agent-os-firstmate-0 namespaced
+          exit 3
+        }
+        echo "safe recovery: run the serialized authorization revoke before retrying upgrade" >&2
+      fi
+      exit 3
+    fi
     if ! verified_akua_overlay_secret "$PRESERVED_AKUA_SECRET_RECORD" >/dev/null; then
       reconcile_failed_akua_upgrade "$PRESERVED_AKUA_SECRET_RECORD" || {
         echo "incomplete: upgrade authorization changed and fail-closed reconciliation is unverified" >&2
@@ -1922,17 +1974,21 @@ case "$COMMAND" in
     require_workload_owned "$previous" optional
     previous_service_account=
     previous_workload_uid=
-    historical_service_accounts=
+    historical_service_accounts=$(inventory_owned_service_accounts) || {
+      echo "error: uninstall could not recover exact-owned ServiceAccount dependencies" >&2
+      exit 3
+    }
     retained_legacy_service_account=
     if [ -n "$previous" ]; then
       previous_service_account=$(workload_service_account)
       previous_workload_record=$(live_resource_record namespaced StatefulSet agent-os-firstmate)
       previous_workload_uid=$(printf '%s' "$previous_workload_record" | cut -f4)
       [ -n "$previous_workload_uid" ] || { echo "error: uninstall requires exact StatefulSet UID evidence" >&2; exit 3; }
-      historical_service_accounts=$(inventory_revision_service_accounts "$previous_workload_uid") || {
+      revision_service_accounts=$(inventory_revision_service_accounts "$previous_workload_uid") || {
         echo "error: uninstall could not inventory exact historical ServiceAccount dependencies" >&2
         exit 3
       }
+      historical_service_accounts=$(printf '%s\n%s\n' "$historical_service_accounts" "$revision_service_accounts" | awk 'NF && !seen[$0]++')
     fi
     legacy_identity=$(live_resource_identity ServiceAccount agent-os-firstmate)
     if [ -n "$legacy_identity" ]; then
@@ -1944,6 +2000,7 @@ case "$COMMAND" in
     fi
     previous_mode=$(printf '%s' "$previous" | cut -f2)
     previous_cleanup=$(printf '%s' "$previous" | cut -f3)
+    REMOVE_CONTROL_ACCESS=1
     delete_rendered_namespaced_resources
     if [ -n "$previous_workload_uid" ] || [ -n "$retained_legacy_service_account" ]; then
       wait_for_revision_history_absence "$previous_workload_uid"
@@ -1961,9 +2018,6 @@ case "$COMMAND" in
       delete_owned_resource namespaced ServiceAccount "$historical_service_account" 180
     done <<< "$historical_service_accounts"
     delete_namespace_rbac
-    if [ "$DESIRED_RBAC" = namespace ] || [ "$previous_mode" = namespace ]; then
-      REMOVE_CONTROL_ACCESS=1
-    fi
     if [ "$DELETE_NAMESPACE" -eq 1 ]; then
       delete_owned_empty_namespace
     fi

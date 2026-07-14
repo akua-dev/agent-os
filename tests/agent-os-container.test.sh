@@ -121,6 +121,10 @@ assert_grep 'fetch --depth=1 --no-tags' "$ROOT/bin/agent-os-source-bundle.sh" \
   "source preparation must fetch an allowlisted remote ref freshly"
 assert_grep 'GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null' "$ROOT/bin/agent-os-source-bundle.sh" \
   "source preparation must isolate trusted Git operations from ambient configuration"
+assert_grep 'GIT_TERMINAL_PROMPT=0 git ' "$ROOT/bin/agent-os-source-bundle.sh" \
+  "source preparation must invoke Git directly through env"
+assert_grep 'repository origin is not the exact trusted HTTPS origin' "$ROOT/bin/agent-os-source-bundle.sh" \
+  "source preparation must require the exact trusted HTTPS origin"
 assert_grep 'AGENT_OS_SOURCE_MODE=event AGENT_OS_SOURCE_EVENT_COMMIT' "$IMAGE_WORKFLOW" \
   "pull requests must build their exact event head without publication credentials"
 assert_no_grep 'git clone --depth=1 --branch main' "$IMAGE_WORKFLOW" \
@@ -133,8 +137,12 @@ assert_grep 'source_archive_sha256' "$ROOT/bin/agent-os-source-bundle.sh" \
   "release records must bind the exact archived source"
 assert_grep 'GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null' "$ROOT/bin/agent-os-container-entrypoint.sh" \
   "runtime provenance must isolate trusted Git operations"
-assert_grep 'canonical FM_ROOT Git config contains untrusted' "$ROOT/bin/agent-os-container-entrypoint.sh" \
-  "runtime provenance must reject persistent transport and execution overrides"
+assert_grep 'GIT_TERMINAL_PROMPT=0 git ' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "runtime provenance must invoke Git directly through env"
+assert_grep 'canonical FM_ROOT Git config key is not allowlisted' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "runtime provenance must use a strict repository-config allowlist"
+assert_no_grep 'config --file "$config" --no-includes --name-only --get-regexp' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "runtime provenance must not rely on a dangerous-key blacklist"
 assert_grep 'status --porcelain --untracked-files=all' "$ROOT/bin/agent-os-source-bundle.sh" \
   "source preparation must reject a dirty workspace"
 assert_no_grep 'bundle create.*HEAD' "$ROOT/bin/agent-os-source-bundle.sh" \
@@ -188,12 +196,32 @@ assert_grep '  validate:' "$IMAGE_WORKFLOW" \
   "pull requests must use a distinct read-only validation job"
 assert_grep '  publish:' "$IMAGE_WORKFLOW" \
   "push and tag publication must use a distinct privileged job"
-assert_grep 'needs: [behavior, provenance, validate]' "$IMAGE_WORKFLOW" \
+assert_grep 'needs: [behavior, provenance, validate, release_artifacts]' "$IMAGE_WORKFLOW" \
   "the packages-write job must require exact behavior, provenance, and image gates"
 assert_grep 'github.ref_protected' "$IMAGE_WORKFLOW" \
   "main publication must require GitHub protected-ref provenance"
 assert_grep 'release tag ruleset differs from immutable record' "$IMAGE_WORKFLOW" \
   "tag publication must require its recorded protected-tag ruleset"
+assert_grep 'git merge-base --is-ancestor "$(jq -r .commit' "$IMAGE_WORKFLOW" \
+  "tag publication must require the recorded release commit on protected main"
+assert_grep '.enforcement == "active" and .target == "tag"' "$IMAGE_WORKFLOW" \
+  "tag publication must require an active tag-targeting ruleset"
+assert_grep '.bypass_actors | length == 0' "$IMAGE_WORKFLOW" \
+  "tag publication must reject rulesets with bypass actors"
+assert_grep 'release_artifacts:' "$IMAGE_WORKFLOW" \
+  "release publication must have a read-only artifact verification gate"
+assert_grep 'actual_image_digest' "$IMAGE_WORKFLOW" \
+  "release publication must compare the actual multi-platform image digest"
+assert_grep 'actual_sbom_sha256' "$IMAGE_WORKFLOW" \
+  "release publication must compare the actual SBOM artifact set"
+assert_grep 'actual_provenance_sha256' "$IMAGE_WORKFLOW" \
+  "release publication must compare the actual provenance artifact set"
+assert_grep 'oras cp --from-oci-layout' "$IMAGE_WORKFLOW" \
+  "release publication must copy the exact read-only verified OCI artifact"
+assert_grep 'oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6' "$IMAGE_WORKFLOW" \
+  "release publication must pin the OCI transfer implementation"
+assert_grep 'published-tag-index.json' "$IMAGE_WORKFLOW" \
+  "release publication must verify every published tag resolves to the recorded digest"
 assert_grep 'Section 13' "$ROOT/docs/herdr-compliance.md" \
   "the Herdr audit must account for the network-interaction clause"
 assert_grep 'https://github.com/akua-dev/akua/tree/v0.8.25' "$ROOT/THIRD_PARTY_NOTICES.md" \
@@ -245,8 +273,8 @@ assert_grep 'ghcr.io/akua-dev/agent-os' "$ROOT/.github/workflows/agent-os-image.
   "release workflow must publish the image expected by the portable package"
 assert_grep 'linux/amd64,linux/arm64' "$ROOT/.github/workflows/agent-os-image.yml" \
   "release workflow must build the two supported container architectures"
-[ "$(grep -c '^          push: false$' "$IMAGE_WORKFLOW")" -eq 1 ] || \
-  fail "the read-only pull-request job must build without publishing"
+[ "$(grep -c '^          push: false$' "$IMAGE_WORKFLOW")" -eq 2 ] || \
+  fail "the read-only validation and release-artifact jobs must build without publishing"
 [ "$(grep -c '^          push: true$' "$IMAGE_WORKFLOW")" -eq 1 ] || \
   fail "only the protected publication job may push images"
 assert_grep 'id: build' "$ROOT/.github/workflows/agent-os-image.yml" \
@@ -265,7 +293,7 @@ assert_grep 'docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051' "$
   "release metadata action must be pinned to the reviewed full SHA"
 assert_grep 'docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8' "$ROOT/.github/workflows/agent-os-image.yml" \
   "release build action must be pinned to the reviewed full SHA"
-if grep -E 'uses: (actions/checkout|docker/[^@]+)@v[0-9]+' "$ROOT/.github/workflows/agent-os-image.yml" >/dev/null; then
+if grep -E 'uses: (actions/checkout|docker/[^@]+|oras-project/setup-oras)@v[0-9]+' "$ROOT/.github/workflows/agent-os-image.yml" >/dev/null; then
   fail "release workflow must not use mutable major action tags"
 fi
 bash -n "$ROOT/bin/agent-os-container-entrypoint.sh"

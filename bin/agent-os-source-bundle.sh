@@ -20,7 +20,7 @@ git_isolated() {
   env -u GIT_CONFIG -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT \
     -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
     -u GIT_SSH -u GIT_SSH_COMMAND GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-    GIT_TERMINAL_PROMPT=0 command git -c credential.helper= -c core.hooksPath=/dev/null \
+    GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c core.hooksPath=/dev/null \
     -c http.proxy= -c https.proxy= "$@"
 }
 
@@ -32,10 +32,10 @@ sha256_stream() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum | awk '{print $1}'; else shasum -a 256 | awk '{print $1}'; fi
 }
 
-case "$(git_isolated -C "$ROOT" remote get-url origin)" in
-  https://github.com/akua-dev/agent-os.git|ssh://git@github.com/akua-dev/agent-os.git|git@github.com:akua-dev/agent-os.git) ;;
-  *) echo "error: repository origin is not allowlisted" >&2; exit 2 ;;
-esac
+[ "$(git_isolated -C "$ROOT" remote get-url origin)" = "$SOURCE_ORIGIN" ] || {
+  echo "error: repository origin is not the exact trusted HTTPS origin" >&2
+  exit 2
+}
 [ -z "$(git_isolated -C "$ROOT" status --porcelain --untracked-files=all)" ] || {
   echo "error: exact-source image builds require a clean worktree" >&2
   exit 2

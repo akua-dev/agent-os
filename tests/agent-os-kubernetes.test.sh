@@ -9,7 +9,7 @@ assert_grep 'configure_control_lock' "$ROOT/bin/agent-os-crewmate.sh" \
   "crewmate mutations must acquire the stable installation control lock"
 assert_grep 'CONTROL_LOCK_UID' "$ROOT/bin/agent-os-crewmate.sh" \
   "crewmate mutations must retain control-lock CAS evidence"
-assert_grep 'agent-os.dev/installation-id: ${LOCK_INSTALLATION_ID:-$INSTALLATION_ID}' "$ROOT/bin/agent-os-crewmate.sh" \
+assert_grep 'LOCK_INSTALLATION_ID=$CONTROL_LOCK_INSTALLATION_ID' "$ROOT/bin/agent-os-crewmate.sh" \
   "crewmate control Leases must render their scope-specific installation identity"
 assert_grep 'configure_control_lock' "$ROOT/bin/agent-os-akua-auth.sh" \
   "authorization mutations must acquire the stable installation control lock"
@@ -35,6 +35,18 @@ assert_grep 'verify_no_runtime_authority' "$ROOT/bin/agent-os-kubernetes.sh" \
   "RBAC none must verify namespace, cluster, and control authority absence"
 assert_grep 'rollback_source_digest' "$ROOT/bin/agent-os-kubernetes.sh" \
   "rollback compensation must verify its immutable source revision digest"
+assert_grep 'if [ "$COMMAND" = grant ]; then' "$ROOT/bin/agent-os-akua-auth.sh" \
+  "authorization Secret validation must apply only to grant"
+assert_grep 'STATEFULSET_CAS_ATTEMPTED' "$ROOT/bin/agent-os-kubernetes.sh" \
+  "post-CAS upgrade failures must enter fail-closed authorization reconciliation"
+assert_grep 'inventory_owned_service_accounts' "$ROOT/bin/agent-os-kubernetes.sh" \
+  "uninstall retries must recover exact-owned historical ServiceAccounts independently"
+assert_grep 'verify_runtime_role_rules' "$ROOT/bin/agent-os-kubernetes.sh" \
+  "rollback must verify exact namespace runtime Role rules"
+assert_grep 'verify_control_role_rules' "$ROOT/bin/agent-os-kubernetes.sh" \
+  "rollback must verify exact control Role rules"
+assert_grep '    REMOVE_CONTROL_ACCESS=1' "$ROOT/bin/agent-os-kubernetes.sh" \
+  "uninstall must always remove exact-owned control RBAC"
 
 LAUNCHER="$ROOT/bin/agent-os-crewmate.sh"
 TMP=$(fm_test_tmproot agent-os-kubernetes)
@@ -141,6 +153,11 @@ fi
 if [ "${AGENT_OS_TEST_FAIL_ROLLOUT:-0}" = 1 ] && [[ " $* " = *" rollout status statefulset/agent-os-firstmate "* ]]; then
   exit 1
 fi
+if [ "${AGENT_OS_TEST_FAIL_FIRST_ROLLOUT:-0}" = 1 ] && \
+  [[ " $* " = *" rollout status statefulset/agent-os-firstmate "* ]] && \
+  [ "$(grep -Fc 'rollout status statefulset/agent-os-firstmate' "$AGENT_OS_TEST_LOG")" -eq 1 ]; then
+  exit 1
+fi
 if [ "${AGENT_OS_TEST_LOCK_STATE:-free}" = held ] && [[ " $* " = *" wait --for=delete lease/"* ]]; then
   exit 1
 fi
@@ -167,7 +184,11 @@ if [[ " $* " = *" get Role agent-os-lifecycle-"*" -o json "* ]] || \
   [[ " $* " = *" get role agent-os-lifecycle-"*" -o json "* ]]; then
   control_name=$(printf '%s\n' "$*" | sed -n 's/.* get [Rr]ole \([^ ]*\) .*/\1/p')
   if ! grep -Fq "/roles/$control_name" "$AGENT_OS_TEST_LOG"; then
-    printf '{"metadata":{"name":"%s","uid":"uid-control-role","resourceVersion":"rv-control-role","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}},"rules":[{"apiGroups":["coordination.k8s.io"],"resources":["leases"],"resourceNames":["%s"],"verbs":["get","update"]}]}\n' "$control_name" "$control_name"
+    if [ "${AGENT_OS_TEST_CONTROL_RBAC_STATE:-exact}" = bad-rules ]; then
+      printf '{"metadata":{"name":"%s","uid":"uid-control-role","resourceVersion":"rv-control-role","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}},"rules":[]}\n' "$control_name"
+    else
+      printf '{"metadata":{"name":"%s","uid":"uid-control-role","resourceVersion":"rv-control-role","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}},"rules":[{"apiGroups":["coordination.k8s.io"],"resources":["leases"],"resourceNames":["%s"],"verbs":["get","update"]}]}\n' "$control_name" "$control_name"
+    fi
   fi
   exit 0
 fi
@@ -398,6 +419,10 @@ case " $* " in
     if { [ "$kind" = Role ] || [ "$kind" = RoleBinding ]; } && [ -n "${AGENT_OS_TEST_STALE_RBAC_STATE:-}" ]; then
       resource_state=$AGENT_OS_TEST_STALE_RBAC_STATE
     fi
+    if [ "$kind" = ServiceAccount ] && [ "$name" = "${AGENT_OS_TEST_RESIDUAL_SERVICE_ACCOUNT:-}" ]; then
+      resource_state=owned
+      grep -F "/serviceaccounts/$name" "$AGENT_OS_TEST_LOG" | grep -F 'delete --raw' >/dev/null && resource_state=absent
+    fi
     if grep -E ' create -f .+\.yaml' "$AGENT_OS_TEST_LOG" | grep -v 'namespace.yaml' >/dev/null || \
       grep -F ' --patch-file ' "$AGENT_OS_TEST_LOG" >/dev/null || \
       grep -F ' apply -f ' "$AGENT_OS_TEST_LOG" >/dev/null; then
@@ -437,7 +462,8 @@ case " $* " in
     akua_env=''
     akua_mount=''
     akua_volume=''
-    if [ -n "${AGENT_OS_TEST_AKUA_OVERLAY_SECRET:-}" ]; then
+    if [ -n "${AGENT_OS_TEST_AKUA_OVERLAY_SECRET:-}" ] && \
+      ! grep -F 'agent-os.dev/akua-auth-rejected-record' "$AGENT_OS_TEST_LOG" >/dev/null; then
       akua_annotations=$(printf ',"agent-os.dev/akua-auth-secret":"%s"' "$AGENT_OS_TEST_AKUA_OVERLAY_SECRET")
       akua_env=',{"name":"AKUA_AUTH_HEADER_FILE","value":"/var/run/secrets/agent-os/akua/authorization"}'
       akua_mount=',{"name":"akua-auth","mountPath":"/var/run/secrets/agent-os/akua","readOnly":true}'
@@ -496,7 +522,11 @@ case " $* " in
     if ! grep -Fq "/$([ "$control_kind" = Role ] && printf roles || printf rolebindings)/$control_name" "$AGENT_OS_TEST_LOG"; then
       control_account=$(effective_binding_account "$control_name")
       if [ "$control_kind" = Role ]; then
-        printf '{"metadata":{"name":"%s","uid":"uid-control-role","resourceVersion":"rv-control-role","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}},"rules":[{"apiGroups":["coordination.k8s.io"],"resources":["leases"],"resourceNames":["%s"],"verbs":["get","update"]}]}\n' "$control_name" "$control_name"
+        if [ "${AGENT_OS_TEST_CONTROL_RBAC_STATE:-exact}" = bad-rules ]; then
+          printf '{"metadata":{"name":"%s","uid":"uid-control-role","resourceVersion":"rv-control-role","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}},"rules":[]}\n' "$control_name"
+        else
+          printf '{"metadata":{"name":"%s","uid":"uid-control-role","resourceVersion":"rv-control-role","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}},"rules":[{"apiGroups":["coordination.k8s.io"],"resources":["leases"],"resourceNames":["%s"],"verbs":["get","update"]}]}\n' "$control_name" "$control_name"
+        fi
       else
         printf '{"metadata":{"name":"%s","uid":"uid-control-binding","resourceVersion":"rv-control-binding","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}},"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"%s"},"subjects":[{"kind":"ServiceAccount","name":"%s","namespace":"portable-agent-os"}]}\n' "$control_name" "$control_name" "$control_account"
       fi
@@ -504,9 +534,9 @@ case " $* " in
     ;;
   *" get role agent-os-firstmate-runtime -o json "*)
     if [ "${AGENT_OS_TEST_RBAC_STATE:-exact}" = bad-rules ]; then
-      printf '%s\n' '{"metadata":{"name":"agent-os-firstmate-runtime"},"rules":[]}'
+      printf '%s\n' '{"metadata":{"name":"agent-os-firstmate-runtime","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}},"rules":[]}'
     else
-      printf '%s\n' '{"metadata":{"name":"agent-os-firstmate-runtime"},"rules":[{"apiGroups":[""],"resources":["pods","persistentvolumeclaims"],"verbs":["get","list","watch","create","delete","patch"]},{"apiGroups":[""],"resources":["pods/log","pods/exec"],"verbs":["get","list","watch","create","delete"]},{"apiGroups":["apps"],"resources":["statefulsets"],"verbs":["get","list","watch"]},{"apiGroups":["coordination.k8s.io"],"resources":["leases"],"verbs":["get","create","update","delete"]}]}'
+      printf '%s\n' '{"metadata":{"name":"agent-os-firstmate-runtime","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}},"rules":[{"apiGroups":[""],"resources":["pods","persistentvolumeclaims"],"verbs":["get","list","watch","create","delete","patch"]},{"apiGroups":[""],"resources":["pods/log","pods/exec"],"verbs":["get","list","watch","create","delete"]},{"apiGroups":["apps"],"resources":["statefulsets"],"verbs":["get","list","watch"]},{"apiGroups":["coordination.k8s.io"],"resources":["leases"],"verbs":["get","create","update","delete"]}]}'
     fi
     ;;
   *" get rolebinding agent-os-firstmate-runtime -o json "*)
@@ -581,6 +611,14 @@ case " $* " in
     fi
     ;;
   *" get serviceaccounts -o name "*) printf '%s\n' serviceaccount/default ;;
+  *" get serviceaccounts -o json "*)
+    residual=${AGENT_OS_TEST_RESIDUAL_SERVICE_ACCOUNT:-}
+    if [ -n "$residual" ]; then
+      printf '{"items":[{"metadata":{"name":"%s","uid":"uid-residual-serviceaccount","resourceVersion":"rv-residual-serviceaccount","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}}}]}\n' "$residual"
+    else
+      printf '%s\n' '{"items":[]}'
+    fi
+    ;;
   *" get configmaps -o name "*) printf '%s\n' configmap/kube-root-ca.crt ;;
   *" get leases.coordination.k8s.io -o name "*)
     [ -z "${AGENT_OS_TEST_FOREIGN_LEASE:-}" ] || printf 'lease/%s\n' "$AGENT_OS_TEST_FOREIGN_LEASE"
@@ -1641,6 +1679,19 @@ secret_reads_before_patch=$(sed -n "1,${statefulset_patch_line}p" "$CALLS" | gre
 pass "upgrade revalidates authorization immediately before CAS"
 
 : > "$CALLS"
+upgrade_reconcile_out=''
+upgrade_reconcile_rc=0
+upgrade_reconcile_out=$(AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_RESOURCE_STATE=owned \
+  AGENT_OS_TEST_WORKLOAD_STATE=namespace AGENT_OS_TEST_AKUA_OVERLAY_SECRET=akua-auth \
+  AGENT_OS_TEST_FAIL_FIRST_ROLLOUT=1 run_generic upgrade 2>&1) || upgrade_reconcile_rc=$?
+[ "$upgrade_reconcile_rc" -eq 3 ] || fail "post-CAS rollout failure must remain incomplete: $upgrade_reconcile_out"
+assert_grep 'agent-os.dev/akua-auth-rejected-record' "$CALLS" \
+  "post-CAS upgrade failure must record fail-closed authorization evidence"
+assert_grep '"AKUA_AUTH_HEADER_FILE","$patch":"delete"' "$CALLS" \
+  "post-CAS upgrade failure must remove the mounted authorization overlay"
+pass "upgrade post-CAS failures reconcile authorization fail closed"
+
+: > "$CALLS"
 AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_RESOURCE_STATE=owned \
   AGENT_OS_TEST_WORKLOAD_STATE=namespace \
   AGENT_OS_TEST_WORKLOAD_SERVICE_ACCOUNT=agent-os-firstmate-bbbbbbbbbbbb run_generic upgrade
@@ -1684,6 +1735,28 @@ grep -Fq 'akua render --no-agent-mode' "$CALLS" || \
 assert_grep 'get controllerrevisions.apps -o json' "$CALLS" \
   "rollback must resolve the exact-owned revision history"
 pass "generic rollback applies a revision-derived StatefulSet CAS update"
+
+: > "$CALLS"
+rollback_rules_out=''
+rollback_rules_rc=0
+rollback_rules_out=$(AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_RESOURCE_STATE=owned \
+  AGENT_OS_TEST_WORKLOAD_STATE=namespace AGENT_OS_TEST_RBAC_STATE=bad-rules \
+  run_generic rollback 2>&1) || rollback_rules_rc=$?
+[ "$rollback_rules_rc" -eq 3 ] || fail "rollback must reject drifted runtime Role rules: $rollback_rules_out"
+assert_no_grep '"rollback":"previous"' "$CALLS" \
+  "drifted runtime Role rules must block rollback template mutation"
+pass "rollback verifies exact runtime and control Role rules"
+
+: > "$CALLS"
+rollback_control_rules_out=''
+rollback_control_rules_rc=0
+rollback_control_rules_out=$(AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_RESOURCE_STATE=owned \
+  AGENT_OS_TEST_WORKLOAD_STATE=namespace AGENT_OS_TEST_CONTROL_RBAC_STATE=bad-rules \
+  run_generic rollback 2>&1) || rollback_control_rules_rc=$?
+[ "$rollback_control_rules_rc" -eq 3 ] || fail "rollback must reject drifted control Role rules: $rollback_control_rules_out"
+assert_no_grep '"rollback":"previous"' "$CALLS" \
+  "drifted control Role rules must block rollback template mutation"
+pass "rollback rejects drifted control Role rules"
 
 : > "$CALLS"
 checkpoint_read_race_out=''
@@ -1898,6 +1971,10 @@ if grep -E 'kubectl .* (get|delete) clusterrolebinding' "$CALLS" >/dev/null; the
 fi
 assert_contains "$uninstall_residue_out" 'cleanup-cluster-rbac --yes' \
   "cluster-admin uninstall must print the exact privileged cleanup command"
+grep -F '/apis/rbac.authorization.k8s.io/v1/namespaces/kube-system/rolebindings/agent-os-lifecycle-' "$CALLS" | \
+  grep -F 'delete --raw' >/dev/null || fail "cluster-admin uninstall must delete exact-owned control RoleBinding authority"
+grep -F '/apis/rbac.authorization.k8s.io/v1/namespaces/kube-system/roles/agent-os-lifecycle-' "$CALLS" | \
+  grep -F 'delete --raw' >/dev/null || fail "cluster-admin uninstall must delete exact-owned control Role authority"
 pass "routine uninstall reports cluster-scoped residue for separate cleanup"
 
 : > "$CALLS"
@@ -1910,6 +1987,18 @@ retry_residue_out=$(AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_WORKLOAD_S
 assert_contains "$retry_residue_out" 'cleanup-cluster-rbac --yes' \
   "history-free uninstall retry must print the privileged absence-evidence command"
 pass "uninstall retry cannot lose cluster-RBAC residue state"
+
+: > "$CALLS"
+retry_service_account=agent-os-firstmate-cccccccccccc
+retry_sa_out=''
+retry_sa_rc=0
+retry_sa_out=$(AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_WORKLOAD_STATE=absent \
+  AGENT_OS_TEST_RESOURCE_STATE=absent AGENT_OS_TEST_RESIDUAL_SERVICE_ACCOUNT="$retry_service_account" \
+  run_generic uninstall --yes 2>&1) || retry_sa_rc=$?
+[ "$retry_sa_rc" -eq 3 ] || fail "history-free uninstall retry must retain cluster cleanup status: $retry_sa_out"
+assert_grep "/serviceaccounts/$retry_service_account" "$CALLS" \
+  "uninstall retry must independently recover and delete exact-owned historical ServiceAccounts"
+pass "uninstall retry recovers historical ServiceAccounts independently"
 
 : > "$CALLS"
 AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_WORKLOAD_STATE=namespace \
