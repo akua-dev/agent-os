@@ -16,6 +16,8 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SUB_HOME_MARKER=.fm-secondmate-home
 # shellcheck source=bin/fm-ff-lib.sh
 . "$SCRIPT_DIR/fm-ff-lib.sh"
+# shellcheck source=bin/agent-os-runtime-bound.sh
+. "$SCRIPT_DIR/agent-os-runtime-bound.sh"
 
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 2
 [[ "$SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]] || exit 2
@@ -28,6 +30,68 @@ trusted_git() {
     GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
     "$GIT_BIN" -c credential.helper= -c core.hooksPath=/dev/null \
     -c http.proxy= -c https.proxy= "$@"
+}
+
+resolve_treehouse_pool() {
+  local home=$1 parent pool
+  parent=$(cd "$home/.." 2>/dev/null && pwd -P) || return 1
+  pool=$(cd "$parent/.." 2>/dev/null && pwd -P) || return 1
+  [ -f "$pool/treehouse-state.json" ] && [ ! -L "$pool/treehouse-state.json" ] || return 1
+  [ -f "$pool/treehouse-state.lock" ] && [ ! -L "$pool/treehouse-state.lock" ] || return 1
+  RESOLVED_TREEHOUSE_POOL=$pool
+}
+
+acquire_treehouse_lock() {
+  local pool=$1 flock_bin lock_file fd_root
+  flock_bin=/usr/bin/flock
+  if [ ! -x "$flock_bin" ]; then
+    flock_bin=${AGENT_OS_TEST_FLOCK_BIN:-}
+  fi
+  [ -x "$flock_bin" ] || return 1
+  lock_file=$pool/treehouse-state.lock
+  exec {TREEHOUSE_LOCK_FD}<>"$lock_file" || return 1
+  if [ -e "/proc/self/fd/$TREEHOUSE_LOCK_FD" ]; then
+    fd_root=/proc/self/fd
+    TREEHOUSE_LOCK_HANDLE=$fd_root/$TREEHOUSE_LOCK_FD
+  elif [ "$flock_bin" = "${AGENT_OS_TEST_FLOCK_BIN:-}" ]; then
+    TREEHOUSE_LOCK_HANDLE=$lock_file
+  else
+    return 1
+  fi
+  [ "$lock_file" -ef "$TREEHOUSE_LOCK_HANDLE" ] || return 1
+  "$flock_bin" -x "$TREEHOUSE_LOCK_FD" || return 1
+  [ "$lock_file" -ef "$TREEHOUSE_LOCK_HANDLE" ] || return 1
+  TREEHOUSE_LOCK_FILE=$lock_file
+  TREEHOUSE_POOL=$pool
+}
+
+validate_treehouse_lease() {
+  local id=$1 state_home=$2 home=$3 state state_json entry_count index entry_home canonical_count
+  state=$TREEHOUSE_POOL/treehouse-state.json
+  [ "$TREEHOUSE_LOCK_FILE" -ef "$TREEHOUSE_LOCK_HANDLE" ] || return 1
+  [ -r "$state" ] && [ -f "$state" ] && [ ! -L "$state" ] || return 1
+  state_json=$(cat "$state") || return 1
+  jq -e --arg home "$state_home" --arg holder "$id" '
+    (.worktrees | type == "array") and
+    (all(.worktrees[]; (.path | type == "string" and test("^[^\\t\\r\\n]+$")))) and
+    ([.worktrees[] | select(.path == $home)] | length == 1) and
+    ([.worktrees[] | select(.leased == true and .lease_holder == $holder)] | length == 1) and
+    ([.worktrees[] | select(
+      .path == $home and .leased == true and .lease_holder == $holder and
+      ((.destroying // false) == false) and ((.owner_pid // 0) == 0) and
+      ((.owner_started_at // 0) == 0) and (.name | type == "string" and length > 0) and
+      (.leased_at | type == "string" and length > 0)
+    )] | length == 1)' <<< "$state_json" >/dev/null || return 1
+  entry_count=$(jq -er '.worktrees | length' <<< "$state_json") || return 1
+  canonical_count=0
+  index=0
+  while [ "$index" -lt "$entry_count" ]; do
+    entry_home=$(jq -er --argjson index "$index" '.worktrees[$index].path' <<< "$state_json") || return 1
+    entry_home=$(cd "$entry_home" 2>/dev/null && pwd -P) || return 1
+    [ "$entry_home" != "$home" ] || canonical_count=$((canonical_count + 1))
+    index=$((index + 1))
+  done
+  [ "$canonical_count" -eq 1 ]
 }
 
 resolve_git_metadata() {
@@ -150,19 +214,19 @@ validate_policy() {
 }
 
 trusted_tree_entry() {
-  local home=$1 commit=$2 path=$3 entry
-  entry=$(trusted_git -C "$home" ls-tree "$commit" -- "$path") || return 1
+  local git_dir=$1 home=$2 commit=$3 path=$4 entry
+  entry=$(agent_os_bound_git "$git_dir" "$home" ls-tree "$commit" -- "$path") || return 1
   printf '%s' "$entry" | awk 'NR == 1 { print $1 " " $3 }'
 }
 
 worktree_entry() {
-  local home=$1 path=$2 mode hash
+  local git_dir=$1 home=$2 path=$3 mode hash
   if [ -L "$home/$path" ]; then
     mode=120000
-    hash=$(printf '%s' "$(readlink "$home/$path")" | trusted_git -C "$home" hash-object --stdin)
+    hash=$(printf '%s' "$(readlink "$home/$path")" | agent_os_bound_git "$git_dir" "$home" hash-object --stdin)
   elif [ -f "$home/$path" ]; then
     if [ -x "$home/$path" ]; then mode=100755; else mode=100644; fi
-    hash=$(trusted_git -C "$home" hash-object -- "$home/$path")
+    hash=$(agent_os_bound_git "$git_dir" "$home" hash-object -- "$home/$path")
   elif [ ! -e "$home/$path" ]; then
     printf '\n'
     return 0
@@ -173,22 +237,22 @@ worktree_entry() {
 }
 
 entry_matches_transition() {
-  local home=$1 path=$2 actual=$3 commit expected
-  shift 3
+  local git_dir=$1 home=$2 path=$3 actual=$4 commit expected
+  shift 4
   for commit in "$@"; do
-    expected=$(trusted_tree_entry "$home" "$commit" "$path") || return 1
+    expected=$(trusted_tree_entry "$git_dir" "$home" "$commit" "$path") || return 1
     [ "$actual" = "$expected" ] && return 0
   done
   return 1
 }
 
 verify_pending_checkout() {
-  local home=$1 pending=$2 current_commit pending_commit record path worktree index index_entries status_file valid
-  current_commit=$(trusted_git -C "$home" rev-parse HEAD) || return 1
+  local git_dir=$1 home=$2 pending=$3 current_commit pending_commit record path worktree index index_entries status_file valid
+  current_commit=$(agent_os_bound_git "$git_dir" "$home" rev-parse HEAD) || return 1
   pending_commit=$(sed -n 's/^commit=//p' "$pending")
-  trusted_git -C "$home" rev-parse "$pending_commit^{commit}" >/dev/null || return 1
+  agent_os_bound_git "$git_dir" "$home" rev-parse "$pending_commit^{commit}" >/dev/null || return 1
   status_file=$(mktemp "${TMPDIR:-/tmp}/agent-os-secondmate-status.XXXXXX") || return 1
-  if ! trusted_git -c status.renames=false -C "$home" status \
+  if ! agent_os_bound_git "$git_dir" "$home" -c status.renames=false status \
     --porcelain=v1 -z --untracked-files=all > "$status_file"; then
     rm -f "$status_file"
     return 1
@@ -198,15 +262,15 @@ verify_pending_checkout() {
   while IFS= read -r -d '' record; do
     path=${record:3}
     if [ -z "$path" ]; then valid=false; break; fi
-    worktree=$(worktree_entry "$home" "$path") || { valid=false; break; }
-    entry_matches_transition "$home" "$path" "$worktree" \
+    worktree=$(worktree_entry "$git_dir" "$home" "$path") || { valid=false; break; }
+    entry_matches_transition "$git_dir" "$home" "$path" "$worktree" \
       "$current_commit" "$pending_commit" "$SOURCE_COMMIT" || { valid=false; break; }
-    index_entries=$(trusted_git -C "$home" ls-files -s -- "$path") || { valid=false; break; }
+    index_entries=$(agent_os_bound_git "$git_dir" "$home" ls-files -s -- "$path") || { valid=false; break; }
     index=$(printf '%s' "$index_entries" | awk '
       NR == 1 { entry=$1 " " $2 }
       END { if (NR <= 1) print entry; else exit 1 }
     ') || { valid=false; break; }
-    entry_matches_transition "$home" "$path" "$index" \
+    entry_matches_transition "$git_dir" "$home" "$path" "$index" \
       "$current_commit" "$pending_commit" "$SOURCE_COMMIT" || { valid=false; break; }
     RECOVERY_PATHS+=("$path")
   done < "$status_file"
@@ -215,18 +279,18 @@ verify_pending_checkout() {
 }
 
 recover_pending_checkout() {
-  local home=$1 pending=$2 old_head path
-  verify_pending_checkout "$home" "$pending" || return 1
-  old_head=$(trusted_git -C "$home" rev-parse HEAD) || return 1
-  trusted_git -C "$home" restore --source="$SOURCE_COMMIT" --staged --worktree -- .
+  local git_dir=$1 home=$2 pending=$3 old_head path
+  verify_pending_checkout "$git_dir" "$home" "$pending" || return 1
+  old_head=$(agent_os_bound_git "$git_dir" "$home" rev-parse HEAD) || return 1
+  agent_os_bound_git "$git_dir" "$home" restore --source="$SOURCE_COMMIT" --staged --worktree -- .
   for path in "${RECOVERY_PATHS[@]}"; do
-    if [ -z "$(trusted_tree_entry "$home" "$SOURCE_COMMIT" "$path")" ] && \
+    if [ -z "$(trusted_tree_entry "$git_dir" "$home" "$SOURCE_COMMIT" "$path")" ] && \
       { [ -f "$home/$path" ] || [ -L "$home/$path" ]; }; then
       rm -f -- "$home/$path"
     fi
   done
-  trusted_git -C "$home" update-ref --no-deref HEAD "$SOURCE_COMMIT" "$old_head"
-  [ -z "$(trusted_git -C "$home" status --porcelain --untracked-files=all)" ]
+  agent_os_bound_git "$git_dir" "$home" update-ref --no-deref HEAD "$SOURCE_COMMIT" "$old_head"
+  [ -z "$(agent_os_bound_git "$git_dir" "$home" status --porcelain --untracked-files=all)" ]
 }
 
 ids=()
@@ -261,12 +325,19 @@ fi
 
 validated_ids=()
 validated_homes=()
+treehouse_homes=()
 git_dirs=()
+common_dirs=()
+bound_homes=()
+bound_configs=()
+bound_git_dirs=()
+bound_common_dirs=()
 pending_policies=()
 seen_homes=$'\n'
 for index in "${!homes[@]}"; do
   id=${ids[$index]}
   home=${homes[$index]}
+  treehouse_home=$home
   validate_secondmate_home "$id" "$home" || {
     echo "error: invalid secondmate home for $id: $VALIDATION_ERROR" >&2
     exit 2
@@ -296,6 +367,23 @@ for index in "${!homes[@]}"; do
   [ "$duplicate" = false ] || continue
   case "$seen_homes" in *$'\n'"$home"$'\n'*) continue ;; esac
   seen_homes+="$home"$'\n'
+  resolve_treehouse_pool "$home" || {
+    echo "error: secondmate Treehouse state is unavailable: $home" >&2
+    exit 2
+  }
+  if [ -z "${TREEHOUSE_POOL:-}" ]; then
+    acquire_treehouse_lock "$RESOLVED_TREEHOUSE_POOL" || {
+      echo "error: secondmate Treehouse ownership lock is unavailable: $home" >&2
+      exit 2
+    }
+  elif [ "$TREEHOUSE_POOL" != "$RESOLVED_TREEHOUSE_POOL" ]; then
+    echo "error: secondmate homes do not share one authoritative Treehouse pool" >&2
+    exit 2
+  fi
+  validate_treehouse_lease "$id" "$treehouse_home" "$home" || {
+    echo "error: secondmate Treehouse lease holder is not exact: $id" >&2
+    exit 2
+  }
   resolve_git_metadata "$home" || { echo "error: secondmate Git metadata is invalid: $home" >&2; exit 2; }
   validate_git_binding "$home" || {
     echo "error: secondmate Git metadata is not bound to its home: $home" >&2
@@ -314,10 +402,32 @@ for index in "${!homes[@]}"; do
       exit 2
     }
   fi
-  git_policy="$RESOLVED_GIT_DIR/agent-os-runtime-source"
-  home_policy="$home/config/agent-os-source-policy"
-  required_policy="$home/config/agent-os-source-policy.required"
-  pending_policy="$home/config/agent-os-source-policy.pending"
+  original_git_dir=$RESOLVED_GIT_DIR
+  original_common_dir=$RESOLVED_COMMON_DIR
+  agent_os_open_bound_dir "$home" || {
+    echo "error: secondmate home cannot be bound for mutation: $home" >&2
+    exit 2
+  }
+  bound_home=$AGENT_OS_BOUND_PATH
+  agent_os_open_bound_dir "$home/config" || {
+    echo "error: secondmate configuration directory cannot be bound for mutation: $home" >&2
+    exit 2
+  }
+  bound_config=$AGENT_OS_BOUND_PATH
+  agent_os_open_bound_dir "$original_git_dir" || {
+    echo "error: secondmate Git directory cannot be bound for mutation: $home" >&2
+    exit 2
+  }
+  bound_git_dir=$AGENT_OS_BOUND_PATH
+  agent_os_open_bound_dir "$original_common_dir" || {
+    echo "error: secondmate common Git directory cannot be bound for mutation: $home" >&2
+    exit 2
+  }
+  bound_common_dir=$AGENT_OS_BOUND_PATH
+  git_policy="$bound_git_dir/agent-os-runtime-source"
+  home_policy="$bound_config/agent-os-source-policy"
+  required_policy="$bound_config/agent-os-source-policy.required"
+  pending_policy="$bound_config/agent-os-source-policy.pending"
   for policy in "$git_policy" "$home_policy"; do
     if [ -e "$policy" ]; then
       validate_policy "$policy" || {
@@ -360,54 +470,94 @@ for index in "${!homes[@]}"; do
     fi
   fi
   if [ -z "$selected_pending" ] && \
-    [ -n "$(trusted_git -C "$home" status --porcelain --untracked-files=all)" ]; then
+    [ -n "$(agent_os_bound_git "$bound_git_dir" "$bound_home" status --porcelain --untracked-files=all)" ]; then
     echo "error: secondmate source is not clean: $home" >&2
     exit 2
   fi
   validated_ids+=("$id")
   validated_homes+=("$home")
-  git_dirs+=("$RESOLVED_GIT_DIR")
+  treehouse_homes+=("$treehouse_home")
+  git_dirs+=("$original_git_dir")
+  common_dirs+=("$original_common_dir")
+  bound_homes+=("$bound_home")
+  bound_configs+=("$bound_config")
+  bound_git_dirs+=("$bound_git_dir")
+  bound_common_dirs+=("$bound_common_dir")
   pending_policies+=("$selected_pending")
 done
+
+assert_secondmate_binding() {
+  local id=$1 treehouse_home=$2 home=$3 git_dir=$4 common_dir=$5 bound_home=$6 bound_config=$7 bound_git=$8 bound_common=$9
+  validate_treehouse_lease "$id" "$treehouse_home" "$home" || return 1
+  agent_os_bound_dir_matches "$home" "$bound_home" || return 1
+  agent_os_bound_dir_matches "$home/config" "$bound_config" || return 1
+  agent_os_bound_dir_matches "$git_dir" "$bound_git" || return 1
+  agent_os_bound_dir_matches "$common_dir" "$bound_common" || return 1
+  resolve_git_metadata "$home" || return 1
+  [ "$RESOLVED_GIT_DIR" -ef "$bound_git" ] || return 1
+  [ "$RESOLVED_COMMON_DIR" -ef "$bound_common" ] || return 1
+  validate_git_binding "$home"
+}
 
 marker="mode=$SOURCE_MODE
 commit=$SOURCE_COMMIT
 source_sha256=$SOURCE_SHA"
 for index in "${!validated_homes[@]}"; do
+  id=${validated_ids[$index]}
+  treehouse_home=${treehouse_homes[$index]}
   home=${validated_homes[$index]}
   git_dir=${git_dirs[$index]}
+  common_dir=${common_dirs[$index]}
+  bound_home=${bound_homes[$index]}
+  bound_config=${bound_configs[$index]}
+  bound_git_dir=${bound_git_dirs[$index]}
+  bound_common_dir=${bound_common_dirs[$index]}
   recovery_policy=${pending_policies[$index]}
-  trusted_git -c protocol.file.allow=always -C "$home" fetch --no-tags "$FM_ROOT" "$SOURCE_COMMIT"
-  [ "$(trusted_git -C "$home" rev-parse FETCH_HEAD)" = "$SOURCE_COMMIT" ] || exit 2
-  [ "$(trusted_git -C "$home" rev-parse 'FETCH_HEAD^{tree}')" = "$SOURCE_TREE" ] || exit 2
+  assert_secondmate_binding "$id" "$treehouse_home" "$home" "$git_dir" "$common_dir" \
+    "$bound_home" "$bound_config" "$bound_git_dir" "$bound_common_dir" || {
+    echo "error: secondmate ownership changed before mutation: $home" >&2
+    exit 2
+  }
+  agent_os_bound_git "$bound_git_dir" "$bound_home" -c protocol.file.allow=always \
+    fetch --no-tags "$FM_ROOT" "$SOURCE_COMMIT"
+  [ "$(agent_os_bound_git "$bound_git_dir" "$bound_home" rev-parse FETCH_HEAD)" = "$SOURCE_COMMIT" ] || exit 2
+  [ "$(agent_os_bound_git "$bound_git_dir" "$bound_home" rev-parse 'FETCH_HEAD^{tree}')" = "$SOURCE_TREE" ] || exit 2
   if [ -n "$recovery_policy" ] && \
-    [ -n "$(trusted_git -C "$home" status --porcelain --untracked-files=all)" ]; then
-    recover_pending_checkout "$home" "$recovery_policy" || {
+    [ -n "$(agent_os_bound_git "$bound_git_dir" "$bound_home" status --porcelain --untracked-files=all)" ]; then
+    recovery_policy="$bound_config/agent-os-source-policy.pending"
+    recover_pending_checkout "$bound_git_dir" "$bound_home" "$recovery_policy" || {
       echo "error: secondmate immutable policy journal cannot recover source: $home" >&2
       exit 2
     }
   fi
-  mkdir -p "$home/config"
-  pending_policy="$home/config/agent-os-source-policy.pending"
-  pending_tmp="$home/config/.agent-os-source-policy.pending.$$"
+  assert_secondmate_binding "$id" "$treehouse_home" "$home" "$git_dir" "$common_dir" \
+    "$bound_home" "$bound_config" "$bound_git_dir" "$bound_common_dir" || exit 2
+  pending_policy="$bound_config/agent-os-source-policy.pending"
+  pending_tmp="$bound_config/.agent-os-source-policy.pending.$$"
   printf '%s\n' "$marker" > "$pending_tmp"
   mv "$pending_tmp" "$pending_policy"
-  required_policy="$home/config/agent-os-source-policy.required"
-  required_tmp="$home/config/.agent-os-source-policy.required.$$"
+  required_policy="$bound_config/agent-os-source-policy.required"
+  required_tmp="$bound_config/.agent-os-source-policy.required.$$"
   printf 'immutable\n' > "$required_tmp"
   mv "$required_tmp" "$required_policy"
-  trusted_git -C "$home" checkout --detach "$SOURCE_COMMIT"
-  trusted_git -C "$home" remote set-url origin "$SOURCE_ORIGIN"
-  home_marker_tmp="$home/config/.agent-os-source-policy.$$"
+  assert_secondmate_binding "$id" "$treehouse_home" "$home" "$git_dir" "$common_dir" \
+    "$bound_home" "$bound_config" "$bound_git_dir" "$bound_common_dir" || exit 2
+  agent_os_bound_git "$bound_git_dir" "$bound_home" checkout --detach "$SOURCE_COMMIT"
+  agent_os_bound_git "$bound_git_dir" "$bound_home" remote set-url origin "$SOURCE_ORIGIN"
+  assert_secondmate_binding "$id" "$treehouse_home" "$home" "$git_dir" "$common_dir" \
+    "$bound_home" "$bound_config" "$bound_git_dir" "$bound_common_dir" || exit 2
+  home_marker_tmp="$bound_config/.agent-os-source-policy.$$"
   printf '%s\n' "$marker" > "$home_marker_tmp"
-  mv "$home_marker_tmp" "$home/config/agent-os-source-policy"
-  marker_tmp="$git_dir/agent-os-runtime-source.$$"
+  mv "$home_marker_tmp" "$bound_config/agent-os-source-policy"
+  marker_tmp="$bound_git_dir/agent-os-runtime-source.$$"
   printf '%s\n' "$marker" > "$marker_tmp"
-  mv "$marker_tmp" "$git_dir/agent-os-runtime-source"
-  cmp "$home/config/agent-os-source-policy" "$git_dir/agent-os-runtime-source" || exit 2
-  [ "$(trusted_git -C "$home" rev-parse HEAD)" = "$SOURCE_COMMIT" ] || exit 2
-  [ "$(trusted_git -C "$home" rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE" ] || exit 2
-  [ -z "$(trusted_git -C "$home" status --porcelain --untracked-files=all)" ] || exit 2
+  mv "$marker_tmp" "$bound_git_dir/agent-os-runtime-source"
+  cmp "$bound_config/agent-os-source-policy" "$bound_git_dir/agent-os-runtime-source" || exit 2
+  [ "$(agent_os_bound_git "$bound_git_dir" "$bound_home" rev-parse HEAD)" = "$SOURCE_COMMIT" ] || exit 2
+  [ "$(agent_os_bound_git "$bound_git_dir" "$bound_home" rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE" ] || exit 2
+  [ -z "$(agent_os_bound_git "$bound_git_dir" "$bound_home" status --porcelain --untracked-files=all)" ] || exit 2
+  assert_secondmate_binding "$id" "$treehouse_home" "$home" "$git_dir" "$common_dir" \
+    "$bound_home" "$bound_config" "$bound_git_dir" "$bound_common_dir" || exit 2
   rm "$pending_policy"
   printf 'selected: %s\n' "$home"
 done

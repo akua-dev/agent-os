@@ -265,24 +265,43 @@ jobs:
             expected_claim_sha=$2
             expected_reservation_digest=$3
             attempt_ref="refs/agent-os/candidate-build-attempts/$GITHUB_SHA/$owner_run_id"
-            if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/${attempt_ref#refs/}" \
+            BUILD_ATTEMPT_STATE=
+            if gh api "repos/$GITHUB_REPOSITORY/git/ref/${attempt_ref#refs/}" \
               > "$RUNNER_TEMP/candidate-build-attempt-ref.json" \
               2> "$RUNNER_TEMP/candidate-build-attempt-ref.err"; then
-              if grep -Eiq '404|Not Found' "$RUNNER_TEMP/candidate-build-attempt-ref.err"; then
-                return 1
+              :
+            else
+              if grep -Eq '^gh: Not Found \(HTTP 404\)$' \
+                "$RUNNER_TEMP/candidate-build-attempt-ref.err"; then
+                BUILD_ATTEMPT_STATE=absent
+                return 0
               fi
               cat "$RUNNER_TEMP/candidate-build-attempt-ref.err" >&2
+              echo "::error::candidate build attempt reference is unreadable"
               exit 1
             fi
-            attempt_sha=$(jq -er .object.sha "$RUNNER_TEMP/candidate-build-attempt-ref.json")
+            attempt_sha=$(jq -er .object.sha "$RUNNER_TEMP/candidate-build-attempt-ref.json") || {
+              echo "::error::candidate build attempt reference metadata is invalid"
+              exit 1
+            }
             gh api "repos/$GITHUB_REPOSITORY/git/commits/$attempt_sha" \
-              > "$RUNNER_TEMP/candidate-build-attempt-commit.json"
+              > "$RUNNER_TEMP/candidate-build-attempt-commit.json" || {
+              echo "::error::candidate build attempt commit is unreadable"
+              exit 1
+            }
             jq -e --arg source_tree "$source_tree_sha" --arg claim "$expected_claim_sha" \
               '.tree.sha == $source_tree and (.parents | length == 1) and .parents[0].sha == $claim' \
-              "$RUNNER_TEMP/candidate-build-attempt-commit.json" >/dev/null
+              "$RUNNER_TEMP/candidate-build-attempt-commit.json" >/dev/null || {
+              echo "::error::candidate build attempt ownership metadata is invalid"
+              exit 1
+            }
             expected_attempt_message=$(printf 'agent-os-candidate-build-attempt-v1\nsource-commit=%s\nsource-tree=%s\nreservation-digest=%s\nowner-run-id=%s\nclaim-commit=%s' \
               "$GITHUB_SHA" "$source_tree_sha" "$expected_reservation_digest" "$owner_run_id" "$expected_claim_sha")
-            [ "$(jq -r .message "$RUNNER_TEMP/candidate-build-attempt-commit.json")" = "$expected_attempt_message" ]
+            [ "$(jq -r .message "$RUNNER_TEMP/candidate-build-attempt-commit.json")" = "$expected_attempt_message" ] || {
+              echo "::error::candidate build attempt message is invalid"
+              exit 1
+            }
+            BUILD_ATTEMPT_STATE=attempted
           }
           load_latest_claim() {
             claim_ref="$claim_prefix/initial"
@@ -392,6 +411,7 @@ jobs:
           if [ "$referrer_count" -eq 0 ]; then
             artifact_owner=$CLAIM_OWNER
             artifact_claim_sha=$CLAIM_SHA
+            load_build_attempt "$artifact_owner" "$artifact_claim_sha" "$reservation_digest"
             artifact_name="agent-os-candidate-record-$GITHUB_SHA"
             gh api --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$artifact_name&per_page=100" \
               > "$RUNNER_TEMP/candidate-trusted-artifacts.json"
@@ -440,6 +460,8 @@ jobs:
               cp "$RUNNER_TEMP/candidate-trusted-artifact/agent-os-bootstrap.tar" image/agent-os-bootstrap.tar
               image_digest=$(jq -er .image_digest "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
               bootstrap_sha=$(jq -er .bootstrap_archive_sha256 "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
+              decision=$(bin/agent-os-candidate-state.sh "$BUILD_ATTEMPT_STATE" exact-record exact)
+              [ "$decision" = reuse-record ]
               ensure_build_owner
               printf 'build=false\nrecord_artifact=true\ncandidate_record_digest=%s\nimage_digest=%s\nbootstrap_sha256=%s\n' \
                 "$candidate_record_digest" "$image_digest" "$bootstrap_sha" >> "$GITHUB_OUTPUT"
@@ -479,16 +501,16 @@ jobs:
               archive_sha=$(jq -er .oci_archive_sha256 "$RUNNER_TEMP/candidate-build-artifact/candidate-build.json")
               [ "$(sha256sum "$RUNNER_TEMP/candidate-build-artifact/candidate-image.tar" | awk '{print $1}')" = "$archive_sha" ]
               cp "$RUNNER_TEMP/candidate-build-artifact/candidate-image.tar" "$RUNNER_TEMP/candidate-image.tar"
+              decision=$(bin/agent-os-candidate-state.sh "$BUILD_ATTEMPT_STATE" exact-build exact)
+              [ "$decision" = reuse-build ]
               ensure_build_owner
               printf 'build=false\npublish_image=true\nrecord_artifact=false\nimage_digest=%s\nbootstrap_sha256=%s\n' \
                 "$image_digest" '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' >> "$GITHUB_OUTPUT"
               echo "::notice::candidate reservation recovered from exact build evidence"
               exit 0
             fi
-            if load_build_attempt "$artifact_owner" "$artifact_claim_sha" "$reservation_digest"; then
-              echo "::error::candidate build attempt has no durable exact evidence; refusing rebuild"
-              exit 1
-            fi
+            decision=$(bin/agent-os-candidate-state.sh "$BUILD_ATTEMPT_STATE" absent exact)
+            [ "$decision" = build ]
             ensure_build_owner
             printf 'build=true\nrecord_artifact=false\nbootstrap_sha256=%s\nclaim_sha=%s\nclaim_owner=%s\n' \
               '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' "$CLAIM_SHA" "$CLAIM_OWNER" >> "$GITHUB_OUTPUT"

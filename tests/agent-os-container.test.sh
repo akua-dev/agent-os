@@ -277,8 +277,13 @@ assert_grep 'agent-os-candidate-build-$GITHUB_SHA' "$IMAGE_WORKFLOW" \
   "candidate builds must persist their exact digest immediately"
 assert_grep 'refs/agent-os/candidate-build-attempts/$GITHUB_SHA/$owner_run_id' "$IMAGE_WORKFLOW" \
   "candidate retries must resolve the exact owner-bound build attempt"
-assert_grep 'candidate build attempt has no durable exact evidence; refusing rebuild' "$IMAGE_WORKFLOW" \
+assert_grep 'candidate build attempt has no durable exact evidence; refusing rebuild' \
+  "$ROOT/bin/agent-os-candidate-state.sh" \
   "candidate cancellation must fail closed instead of rebuilding"
+assert_grep 'bin/agent-os-candidate-state.sh "$BUILD_ATTEMPT_STATE" absent exact' "$IMAGE_WORKFLOW" \
+  "candidate rebuild authorization must use the executable state machine"
+assert_no_grep 'if load_build_attempt' "$IMAGE_WORKFLOW" \
+  "candidate attempt validation must never run in a conditional errexit context"
 attempt_line=$(grep -n 'name: Claim owner-bound candidate build attempt' "$IMAGE_WORKFLOW" | cut -d: -f1)
 build_line=$(grep -n 'name: Build release candidate once' "$IMAGE_WORKFLOW" | cut -d: -f1)
 build_evidence_line=$(grep -n 'name: Stage exact candidate build evidence' "$IMAGE_WORKFLOW" | cut -d: -f1)
@@ -289,7 +294,7 @@ record_line=$(grep -n 'name: Prepare immutable release candidate record' "$IMAGE
   [ "$build_line" -lt "$build_evidence_line" ] && \
   [ "$build_evidence_line" -lt "$image_publish_line" ] && [ "$image_publish_line" -lt "$record_line" ] || \
   fail "owner-bound attempt state must precede build and exact evidence publication"
-attempt_guard_line=$(grep -n 'if load_build_attempt "$artifact_owner"' "$IMAGE_WORKFLOW" | cut -d: -f1)
+attempt_guard_line=$(grep -n 'load_build_attempt "$artifact_owner"' "$IMAGE_WORKFLOW" | cut -d: -f1)
 rebuild_line=$(grep -n "printf 'build=true" "$IMAGE_WORKFLOW" | cut -d: -f1)
 [ -n "$attempt_guard_line" ] && [ -n "$rebuild_line" ] && [ "$attempt_guard_line" -lt "$rebuild_line" ] || \
   fail "candidate upload failure must be rejected before any rebuild is authorized"
