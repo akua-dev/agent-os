@@ -50,7 +50,8 @@ first mate can allocate isolated, persistent crewmate containers using ordinary
 `kubectl`, while Herdr keeps every agent terminal visible. Follow the
 [Agent OS Kubernetes quickstart](docs/kubernetes.md) to render the one public
 package for any conformant cluster. OrbStack is a local test profile of that
-same package, not a separate installer.
+same package, not a separate installer. `SOURCE_PROVENANCE.json` records the
+exact source histories, licenses, merge order, and exclusions for this distro.
 
 Agent OS works on Kubernetes and is better with Akua.
 The portable core can be built and tested on local OrbStack without an Akua account, API key, managed control plane, or Akua-hosted worker, and is intended for any conformant Kubernetes cluster.

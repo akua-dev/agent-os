@@ -24,6 +24,43 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify source closure and assemble clean tracked context
+        run: |
+          set -euo pipefail
+          tests/agent-os-source-provenance.test.sh
+          context="$RUNNER_TEMP/agent-os-source"
+          bin/agent-os-source-context.sh "$context" HEAD
+
+      - name: Record immutable source evidence
+        run: |
+          set -euo pipefail
+          commit=$(git rev-parse HEAD)
+          tree=$(git rev-parse 'HEAD^{tree}')
+          archive_sha256=$(git archive --format=tar HEAD | sha256sum | awk '{print $1}')
+          jq -n \
+            --arg repository "https://github.com/akua-dev/agent-os" \
+            --arg commit "$commit" \
+            --arg tree "$tree" \
+            --arg archive_sha256 "$archive_sha256" \
+            '{repository:$repository,commit:$commit,tree:$tree,git_archive_sha256:$archive_sha256}' \
+            > "$RUNNER_TEMP/agent-os-source-evidence.json"
+          {
+            echo '### Agent OS source evidence'
+            echo
+            echo "Commit: \`$commit\`"
+            echo "Tree: \`$tree\`"
+            echo "Stable git archive SHA-256: \`$archive_sha256\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload source evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-os-source-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/agent-os-source-evidence.json
+          if-no-files-found: error
 
       - uses: docker/setup-qemu-action@v3
 
@@ -51,11 +88,15 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ${{ runner.temp }}/agent-os-source
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
+          build-args: |
+            SOURCE_REPOSITORY=https://github.com/akua-dev/agent-os
+            SOURCE_REVISION=${{ github.sha }}
+            SOURCE_VERSION=${{ steps.metadata.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: mode=max

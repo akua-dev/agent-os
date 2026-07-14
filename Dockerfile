@@ -9,6 +9,14 @@ ARG NO_MISTAKES_VERSION=1.34.0
 ARG BUN_VERSION=1.3.14
 ARG AKUA_VERSION=0.8.25
 ARG K9S_VERSION=0.51.0
+ARG SOURCE_REPOSITORY=https://github.com/akua-dev/agent-os
+ARG SOURCE_REVISION
+ARG SOURCE_VERSION=dev
+
+LABEL org.opencontainers.image.source=$SOURCE_REPOSITORY \
+      org.opencontainers.image.revision=$SOURCE_REVISION \
+      org.opencontainers.image.version=$SOURCE_VERSION \
+      org.opencontainers.image.licenses=MIT
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -145,7 +153,9 @@ RUN mkdir -p /home/agent /opt/agent-os /opt/image-usr-local
 
 COPY . /opt/agent-os
 
-RUN install -D -m 0644 /opt/agent-os/THIRD_PARTY_NOTICES.md /usr/share/doc/agent-os/THIRD_PARTY_NOTICES.md \
+RUN install -D -m 0644 /opt/agent-os/LICENSE /usr/share/doc/agent-os/LICENSE \
+  && install -D -m 0644 /opt/agent-os/SOURCE_PROVENANCE.json /usr/share/doc/agent-os/SOURCE_PROVENANCE.json \
+  && install -D -m 0644 /opt/agent-os/THIRD_PARTY_NOTICES.md /usr/share/doc/agent-os/THIRD_PARTY_NOTICES.md \
   && install -D -m 0644 /opt/agent-os/THIRD_PARTY_SOURCES.md /usr/share/doc/agent-os/THIRD_PARTY_SOURCES.md
 
 RUN cd /opt/agent-os/tools/agent-os \
