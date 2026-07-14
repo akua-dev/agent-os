@@ -446,10 +446,14 @@ jobs:
                 .schema_version == 1 and .commit == $commit and .tree == $tree and
                 .reservation_digest == $reservation and .image_repository == $repository and
                 .owner_run_id == $owner and
-                (.image_digest | test("^sha256:[0-9a-f]{64}$"))' \
+                (.image_digest | test("^sha256:[0-9a-f]{64}$")) and
+                (.oci_archive_sha256 | test("^[0-9a-f]{64}$"))' \
                 "$RUNNER_TEMP/candidate-build-artifact/candidate-build.json" >/dev/null
               image_digest=$(jq -er .image_digest "$RUNNER_TEMP/candidate-build-artifact/candidate-build.json")
-              printf 'build=false\nrecord_artifact=false\nimage_digest=%s\nbootstrap_sha256=%s\n' \
+              archive_sha=$(jq -er .oci_archive_sha256 "$RUNNER_TEMP/candidate-build-artifact/candidate-build.json")
+              [ "$(sha256sum "$RUNNER_TEMP/candidate-build-artifact/candidate-image.tar" | awk '{print $1}')" = "$archive_sha" ]
+              cp "$RUNNER_TEMP/candidate-build-artifact/candidate-image.tar" "$RUNNER_TEMP/candidate-image.tar"
+              printf 'build=false\npublish_image=true\nrecord_artifact=false\nimage_digest=%s\nbootstrap_sha256=%s\n' \
                 "$image_digest" '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' >> "$GITHUB_OUTPUT"
               echo "::notice::candidate reservation recovered from exact build evidence"
               exit 0
@@ -518,7 +522,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=oci,dest=${{ runner.temp }}/candidate-image.tar,oci-mediatypes=true
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: mode=max
@@ -537,13 +541,15 @@ jobs:
           set -eu
           image_digest='${{ steps.candidate_build.outputs.digest }}'
           [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          archive_sha=$(sha256sum "$RUNNER_TEMP/candidate-image.tar" | awk '{print $1}')
           jq -cnS \
             --arg commit '${{ steps.candidate_source.outputs.commit }}' \
             --arg tree '${{ steps.candidate_source.outputs.tree }}' \
             --arg reservation '${{ steps.candidate_reservation.outputs.reservation_digest }}' \
             --arg repository "$IMAGE" --arg image "$image_digest" \
+            --arg archive "$archive_sha" \
             --argjson owner "$GITHUB_RUN_ID" \
-            '{schema_version:1,commit:$commit,tree:$tree,reservation_digest:$reservation,image_repository:$repository,image_digest:$image,owner_run_id:$owner}' \
+            '{schema_version:1,commit:$commit,tree:$tree,reservation_digest:$reservation,image_repository:$repository,image_digest:$image,oci_archive_sha256:$archive,owner_run_id:$owner}' \
             > "$RUNNER_TEMP/candidate-build.json"
 
       - name: Stage exact candidate build evidence
@@ -551,9 +557,26 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: agent-os-candidate-build-${{ github.sha }}
-          path: ${{ runner.temp }}/candidate-build.json
+          path: |
+            ${{ runner.temp }}/candidate-build.json
+            ${{ runner.temp }}/candidate-image.tar
           if-no-files-found: error
           retention-days: 90
+
+      - name: Publish exact evidenced candidate image
+        if: github.ref == 'refs/heads/main' && (steps.candidate_reservation.outputs.build == 'true' || steps.candidate_reservation.outputs.publish_image == 'true')
+        env:
+          CANDIDATE_BUILD_DIGEST: ${{ steps.candidate_build.outputs.digest || steps.candidate_reservation.outputs.image_digest }}
+        run: |
+          set -eu
+          image_digest=$CANDIDATE_BUILD_DIGEST
+          [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          archive_sha=$(jq -er .oci_archive_sha256 "$RUNNER_TEMP/candidate-build.json" 2>/dev/null || \
+            jq -er .oci_archive_sha256 "$RUNNER_TEMP/candidate-build-artifact/candidate-build.json")
+          [ "$(sha256sum "$RUNNER_TEMP/candidate-image.tar" | awk '{print $1}')" = "$archive_sha" ]
+          oras cp --from-oci-layout "$RUNNER_TEMP/candidate-image.tar@$image_digest" "$IMAGE"
+          oras manifest fetch "$IMAGE@$image_digest" > "$RUNNER_TEMP/candidate-image-readback.json"
+          [ "sha256:$(sha256sum "$RUNNER_TEMP/candidate-image-readback.json" | awk '{print $1}')" = "$image_digest" ]
 
       - name: Prepare immutable release candidate record
         if: github.ref == 'refs/heads/main'

@@ -7,7 +7,7 @@ SYNC="$ROOT/bin/agent-os-runtime-secondmates.sh"
 TMP=$(fm_test_tmproot agent-os-runtime-secondmates)
 FM_HOME_DIR="$TMP/home"
 WORK="$TMP/work"
-LEASE="$TMP/lease"
+LEASE=
 
 fm_git_identity fmtest fmtest@example.com
 
@@ -27,10 +27,16 @@ git -C "$WORK" add version
 git -C "$WORK" commit -qm B
 B_COMMIT=$(git -C "$WORK" rev-parse HEAD)
 B_TREE=$(git -C "$WORK" rev-parse 'HEAD^{tree}')
+B_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+A_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
+LEASE="$FM_HOME_DIR/runtime-sources/$A_COMMIT-$A_SHA"
+mkdir -p "$FM_HOME_DIR/runtime-sources"
 git clone -q "$WORK" "$LEASE"
 git -C "$LEASE" remote set-url origin https://github.com/akua-dev/agent-os.git
 git -C "$LEASE" checkout -q --detach "$A_COMMIT"
+printf 'mode=release\ncommit=%s\nsource_sha256=%s\n' "$A_COMMIT" "$A_SHA" \
+  > "$LEASE/.git/agent-os-runtime-source"
 git -C "$LEASE" worktree add -q --detach "$TMP/linked" "$A_COMMIT"
 git clone -q "$LEASE" "$TMP/standalone"
 git -C "$TMP/standalone" checkout -q --detach "$A_COMMIT"
@@ -64,9 +70,6 @@ run_sync() {
 
 make_primary primary-b "$B_COMMIT"
 make_primary primary-a "$A_COMMIT"
-B_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-A_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-
 run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null || \
   fail "A to B secondmate selection failed"
 for id in linked standalone; do
@@ -117,6 +120,41 @@ cmp "$gitdir/agent-os-runtime-source" "$TMP/standalone/config/agent-os-source-po
 run_sync "$TMP/primary-a" "$A_COMMIT" "$A_TREE" "$A_SHA" >/dev/null || \
   fail "secondmate did not return to A after journal recovery"
 pass "secondmate selection recovers journaled policy transitions"
+
+gitdir=$(git -C "$TMP/standalone" rev-parse --absolute-git-dir)
+printf 'mode=release\ncommit=%s\nsource_sha256=%s\n' "$B_COMMIT" "$B_SHA" \
+  > "$TMP/standalone/config/agent-os-source-policy.pending"
+git -C "$WORK" show "$B_COMMIT:version" > "$TMP/standalone/version"
+run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null || \
+  fail "interrupted secondmate checkout was not recovered from its journal"
+[ "$(git -C "$TMP/standalone" rev-parse HEAD)" = "$B_COMMIT" ] || \
+  fail "interrupted secondmate checkout did not select B"
+[ -z "$(git -C "$TMP/standalone" status --porcelain --untracked-files=all)" ] || \
+  fail "interrupted secondmate checkout recovery remained dirty"
+[ ! -e "$TMP/standalone/config/agent-os-source-policy.pending" ] || \
+  fail "interrupted secondmate checkout retained its journal"
+run_sync "$TMP/primary-a" "$A_COMMIT" "$A_TREE" "$A_SHA" >/dev/null || \
+  fail "secondmate did not return to A after interrupted checkout recovery"
+pass "secondmate selection verifies and recovers interrupted journaled checkouts"
+
+git clone -q "$LEASE" "$TMP/foreign-common"
+git -C "$TMP/foreign-common" checkout -q --detach "$A_COMMIT"
+git -C "$TMP/foreign-common" worktree add -q --detach "$TMP/foreign-linked" "$A_COMMIT"
+printf 'foreign-linked\n' > "$TMP/foreign-linked/.fm-secondmate-home"
+mkdir -p "$TMP/foreign-linked/data" "$TMP/foreign-linked/state" \
+  "$TMP/foreign-linked/config" "$TMP/foreign-linked/projects"
+{
+  printf 'window=firstmate:fm-foreign-linked\n'
+  printf 'kind=secondmate\n'
+  printf 'home=%s/foreign-linked\n' "$TMP"
+} > "$FM_HOME_DIR/state/foreign-linked.meta"
+if run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null 2>&1; then
+  fail "linked secondmate owned by a foreign common directory was accepted"
+fi
+[ "$(git -C "$TMP/foreign-linked" rev-parse HEAD)" = "$A_COMMIT" ] || \
+  fail "foreign linked-worktree metadata was mutated"
+rm "$FM_HOME_DIR/state/foreign-linked.meta"
+pass "secondmate selection binds linked common metadata to runtime-source ownership"
 
 git clone -q "$LEASE" "$TMP/redirected"
 git -C "$TMP/redirected" checkout -q --detach "$A_COMMIT"

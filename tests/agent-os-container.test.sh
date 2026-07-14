@@ -272,15 +272,23 @@ assert_grep 'recovering incomplete candidate reservation' "$IMAGE_WORKFLOW" \
 assert_grep 'candidate reservation recovered from durable trusted artifact' "$IMAGE_WORKFLOW" \
   "zero-referrer retries must recover durable trusted candidate evidence"
 assert_grep 'candidate reservation recovered from exact build evidence' "$IMAGE_WORKFLOW" \
-  "zero-referrer retries must reuse an owner-bound pushed image digest"
+  "zero-referrer retries must reuse an owner-bound retained image digest"
 assert_grep 'agent-os-candidate-build-$GITHUB_SHA' "$IMAGE_WORKFLOW" \
   "candidate builds must persist their exact digest immediately"
 build_line=$(grep -n 'name: Build release candidate once' "$IMAGE_WORKFLOW" | cut -d: -f1)
 build_evidence_line=$(grep -n 'name: Stage exact candidate build evidence' "$IMAGE_WORKFLOW" | cut -d: -f1)
+image_publish_line=$(grep -n 'name: Publish exact evidenced candidate image' "$IMAGE_WORKFLOW" | cut -d: -f1)
 record_line=$(grep -n 'name: Prepare immutable release candidate record' "$IMAGE_WORKFLOW" | cut -d: -f1)
-[ -n "$build_line" ] && [ -n "$build_evidence_line" ] && [ -n "$record_line" ] && \
-  [ "$build_line" -lt "$build_evidence_line" ] && [ "$build_evidence_line" -lt "$record_line" ] || \
-  fail "exact build evidence must be durable before candidate record preparation"
+[ -n "$build_line" ] && [ -n "$build_evidence_line" ] && [ -n "$image_publish_line" ] && \
+  [ -n "$record_line" ] && [ "$build_line" -lt "$build_evidence_line" ] && \
+  [ "$build_evidence_line" -lt "$image_publish_line" ] && [ "$image_publish_line" -lt "$record_line" ] || \
+  fail "exact build evidence must be durable before candidate image publication"
+assert_grep 'type=oci,dest=${{ runner.temp }}/candidate-image.tar' "$IMAGE_WORKFLOW" \
+  "candidate builds must retain their exact OCI output before publication"
+assert_grep 'oci_archive_sha256' "$IMAGE_WORKFLOW" \
+  "candidate recovery must authenticate the retained OCI output"
+assert_grep 'oras cp --from-oci-layout "$RUNNER_TEMP/candidate-image.tar@$image_digest" "$IMAGE"' "$IMAGE_WORKFLOW" \
+  "candidate publication must copy only the evidenced content-addressed image"
 assert_grep '.path == ".github/workflows/agent-os-image.yml"' "$IMAGE_WORKFLOW" \
   "candidate artifact recovery must bind the authorized workflow"
 assert_grep '.repository.full_name == $repo' "$IMAGE_WORKFLOW" \
@@ -325,8 +333,8 @@ assert_no_grep 'oras tag ' "$IMAGE_WORKFLOW" \
   "release publication must never create a mutable registry semver tag"
 assert_grep 'release registry tag coordinate already exists' "$IMAGE_WORKFLOW" \
   "release publication must reject conflicting mutable registry coordinates"
-assert_no_grep 'oras cp --from-oci-layout' "$IMAGE_WORKFLOW" \
-  "release publication must not rebuild or re-upload an OCI layout"
+[ "$(grep -c 'oras cp --from-oci-layout' "$IMAGE_WORKFLOW")" -eq 1 ] || \
+  fail "only initial evidenced candidate publication may upload an OCI layout"
 assert_grep 'oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6' "$IMAGE_WORKFLOW" \
   "release publication must pin the OCI transfer implementation"
 assert_grep 'Canonical install digest:' "$IMAGE_WORKFLOW" \
@@ -392,8 +400,8 @@ assert_grep 'linux/amd64,linux/arm64' "$ROOT/.github/workflows/agent-os-image.ym
   fail "the read-only validation job must build without publishing"
 [ "$(grep -c '^          push: true$' "$IMAGE_WORKFLOW")" -eq 1 ] || \
   fail "only the protected main publication build may use mutable-tag push mode"
-assert_grep 'push-by-digest=true' "$IMAGE_WORKFLOW" \
-  "the release candidate must publish without a mutable image tag"
+assert_no_grep 'push-by-digest=true,name-canonical=true,push=true' "$IMAGE_WORKFLOW" \
+  "the candidate build must not push before exact evidence is durable"
 assert_grep 'id: build' "$ROOT/.github/workflows/agent-os-image.yml" \
   "release workflow must expose its build result"
 assert_grep 'steps.build.outputs.digest' "$ROOT/.github/workflows/agent-os-image.yml" \

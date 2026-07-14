@@ -63,7 +63,7 @@ resolve_file_path() {
 }
 
 validate_git_binding() {
-  local root=$1 expected backlink backlink_path relative
+  local root=$1 expected backlink backlink_path relative runtime_root source_root source_key policy_commit policy_sha
   expected=$(resolve_file_path "$root/.git") || return 1
   if [ -d "$root/.git" ] && [ ! -L "$root/.git" ]; then
     [ "$RESOLVED_GIT_DIR" = "$expected" ] || return 1
@@ -86,6 +86,16 @@ validate_git_binding() {
   relative=${RESOLVED_GIT_DIR#"$RESOLVED_COMMON_DIR"/worktrees/}
   case "$relative" in ''|*/*) return 1 ;; esac
   [ -d "$RESOLVED_COMMON_DIR" ] && [ ! -L "$RESOLVED_COMMON_DIR" ] || return 1
+  runtime_root=$(cd "$FM_HOME/runtime-sources" 2>/dev/null && pwd -P) || return 1
+  source_root=$(cd "$RESOLVED_COMMON_DIR/.." 2>/dev/null && pwd -P) || return 1
+  case "$source_root" in "$runtime_root"/*) ;; *) return 1 ;; esac
+  source_key=${source_root#"$runtime_root"/}
+  case "$source_key" in ''|*/*) return 1 ;; esac
+  [ "$RESOLVED_COMMON_DIR" = "$source_root/.git" ] || return 1
+  validate_policy "$RESOLVED_COMMON_DIR/agent-os-runtime-source" || return 1
+  policy_commit=$(sed -n 's/^commit=//p' "$RESOLVED_COMMON_DIR/agent-os-runtime-source")
+  policy_sha=$(sed -n 's/^source_sha256=//p' "$RESOLVED_COMMON_DIR/agent-os-runtime-source")
+  [ "$source_key" = "$policy_commit-$policy_sha" ]
 }
 
 validate_config() {
@@ -139,6 +149,86 @@ validate_policy() {
   [ "$(wc -l < "$policy" | tr -d ' ')" -eq 3 ]
 }
 
+trusted_tree_entry() {
+  local home=$1 commit=$2 path=$3 entry
+  entry=$(trusted_git -C "$home" ls-tree "$commit" -- "$path") || return 1
+  printf '%s' "$entry" | awk 'NR == 1 { print $1 " " $3 }'
+}
+
+worktree_entry() {
+  local home=$1 path=$2 mode hash
+  if [ -L "$home/$path" ]; then
+    mode=120000
+    hash=$(printf '%s' "$(readlink "$home/$path")" | trusted_git -C "$home" hash-object --stdin)
+  elif [ -f "$home/$path" ]; then
+    if [ -x "$home/$path" ]; then mode=100755; else mode=100644; fi
+    hash=$(trusted_git -C "$home" hash-object -- "$home/$path")
+  elif [ ! -e "$home/$path" ]; then
+    printf '\n'
+    return 0
+  else
+    return 1
+  fi
+  printf '%s %s\n' "$mode" "$hash"
+}
+
+entry_matches_transition() {
+  local home=$1 path=$2 actual=$3 commit expected
+  shift 3
+  for commit in "$@"; do
+    expected=$(trusted_tree_entry "$home" "$commit" "$path") || return 1
+    [ "$actual" = "$expected" ] && return 0
+  done
+  return 1
+}
+
+verify_pending_checkout() {
+  local home=$1 pending=$2 current_commit pending_commit record path worktree index index_entries status_file valid
+  current_commit=$(trusted_git -C "$home" rev-parse HEAD) || return 1
+  pending_commit=$(sed -n 's/^commit=//p' "$pending")
+  trusted_git -C "$home" rev-parse "$pending_commit^{commit}" >/dev/null || return 1
+  status_file=$(mktemp "${TMPDIR:-/tmp}/agent-os-secondmate-status.XXXXXX") || return 1
+  if ! trusted_git -c status.renames=false -C "$home" status \
+    --porcelain=v1 -z --untracked-files=all > "$status_file"; then
+    rm -f "$status_file"
+    return 1
+  fi
+  RECOVERY_PATHS=()
+  valid=true
+  while IFS= read -r -d '' record; do
+    path=${record:3}
+    if [ -z "$path" ]; then valid=false; break; fi
+    worktree=$(worktree_entry "$home" "$path") || { valid=false; break; }
+    entry_matches_transition "$home" "$path" "$worktree" \
+      "$current_commit" "$pending_commit" "$SOURCE_COMMIT" || { valid=false; break; }
+    index_entries=$(trusted_git -C "$home" ls-files -s -- "$path") || { valid=false; break; }
+    index=$(printf '%s' "$index_entries" | awk '
+      NR == 1 { entry=$1 " " $2 }
+      END { if (NR <= 1) print entry; else exit 1 }
+    ') || { valid=false; break; }
+    entry_matches_transition "$home" "$path" "$index" \
+      "$current_commit" "$pending_commit" "$SOURCE_COMMIT" || { valid=false; break; }
+    RECOVERY_PATHS+=("$path")
+  done < "$status_file"
+  rm -f "$status_file"
+  [ "$valid" = true ]
+}
+
+recover_pending_checkout() {
+  local home=$1 pending=$2 old_head path
+  verify_pending_checkout "$home" "$pending" || return 1
+  old_head=$(trusted_git -C "$home" rev-parse HEAD) || return 1
+  trusted_git -C "$home" restore --source="$SOURCE_COMMIT" --staged --worktree -- .
+  for path in "${RECOVERY_PATHS[@]}"; do
+    if [ -z "$(trusted_tree_entry "$home" "$SOURCE_COMMIT" "$path")" ] && \
+      { [ -f "$home/$path" ] || [ -L "$home/$path" ]; }; then
+      rm -f -- "$home/$path"
+    fi
+  done
+  trusted_git -C "$home" update-ref --no-deref HEAD "$SOURCE_COMMIT" "$old_head"
+  [ -z "$(trusted_git -C "$home" status --porcelain --untracked-files=all)" ]
+}
+
 ids=()
 homes=()
 add_home() {
@@ -172,6 +262,7 @@ fi
 validated_ids=()
 validated_homes=()
 git_dirs=()
+pending_policies=()
 seen_homes=$'\n'
 for index in "${!homes[@]}"; do
   id=${ids[$index]}
@@ -214,10 +305,15 @@ for index in "${!homes[@]}"; do
     echo "error: secondmate Git configuration is invalid: $home" >&2
     exit 2
   }
-  [ -z "$(trusted_git -C "$home" status --porcelain --untracked-files=all)" ] || {
-    echo "error: secondmate source is not clean: $home" >&2
-    exit 2
-  }
+  if [ -f "$home/.git" ]; then
+    common_source=$(cd "$RESOLVED_COMMON_DIR/.." && pwd -P)
+    common_commit=$(sed -n 's/^commit=//p' "$RESOLVED_COMMON_DIR/agent-os-runtime-source")
+    [ "$(trusted_git -C "$common_source" rev-parse HEAD)" = "$common_commit" ] && \
+      [ -z "$(trusted_git -C "$common_source" status --porcelain --untracked-files=all)" ] || {
+      echo "error: secondmate linked Git ownership is invalid: $home" >&2
+      exit 2
+    }
+  fi
   git_policy="$RESOLVED_GIT_DIR/agent-os-runtime-source"
   home_policy="$home/config/agent-os-source-policy"
   required_policy="$home/config/agent-os-source-policy.required"
@@ -242,13 +338,16 @@ for index in "${!homes[@]}"; do
       echo "error: secondmate immutable policy journal is invalid: $home" >&2
       exit 2
     }
+    selected_pending=$pending_policy
   elif [ -e "$required_policy" ]; then
+    selected_pending=
     if ! { [ -e "$git_policy" ] && [ -e "$home_policy" ] && \
       cmp "$git_policy" "$home_policy"; }; then
       echo "error: secondmate immutable policy is incomplete: $home" >&2
       exit 2
     fi
   else
+    selected_pending=
     if [ -e "$home_policy" ] && [ ! -e "$git_policy" ]; then
       echo "error: secondmate immutable policy is incomplete: $home" >&2
       exit 2
@@ -260,9 +359,15 @@ for index in "${!homes[@]}"; do
       }
     fi
   fi
+  if [ -z "$selected_pending" ] && \
+    [ -n "$(trusted_git -C "$home" status --porcelain --untracked-files=all)" ]; then
+    echo "error: secondmate source is not clean: $home" >&2
+    exit 2
+  fi
   validated_ids+=("$id")
   validated_homes+=("$home")
   git_dirs+=("$RESOLVED_GIT_DIR")
+  pending_policies+=("$selected_pending")
 done
 
 marker="mode=$SOURCE_MODE
@@ -271,9 +376,17 @@ source_sha256=$SOURCE_SHA"
 for index in "${!validated_homes[@]}"; do
   home=${validated_homes[$index]}
   git_dir=${git_dirs[$index]}
+  recovery_policy=${pending_policies[$index]}
   trusted_git -c protocol.file.allow=always -C "$home" fetch --no-tags "$FM_ROOT" "$SOURCE_COMMIT"
   [ "$(trusted_git -C "$home" rev-parse FETCH_HEAD)" = "$SOURCE_COMMIT" ] || exit 2
   [ "$(trusted_git -C "$home" rev-parse 'FETCH_HEAD^{tree}')" = "$SOURCE_TREE" ] || exit 2
+  if [ -n "$recovery_policy" ] && \
+    [ -n "$(trusted_git -C "$home" status --porcelain --untracked-files=all)" ]; then
+    recover_pending_checkout "$home" "$recovery_policy" || {
+      echo "error: secondmate immutable policy journal cannot recover source: $home" >&2
+      exit 2
+    }
+  fi
   mkdir -p "$home/config"
   pending_policy="$home/config/agent-os-source-policy.pending"
   pending_tmp="$home/config/.agent-os-source-policy.pending.$$"
