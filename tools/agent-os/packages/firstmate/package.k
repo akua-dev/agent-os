@@ -1,4 +1,5 @@
 import akua.ctx
+import regex
 
 schema Input:
     """Inputs for one persistent Firstmate on a conformant Kubernetes cluster."""
@@ -14,23 +15,33 @@ schema Input:
     memoryRequest: str = "1Gi"
     cpuLimit: str = "4"
     memoryLimit: str = "8Gi"
+    operationId: str = ""
+    serviceAccountName: str = "agent-os-firstmate"
 
     check:
-        allowMutableImage or "@sha256:" in image, "image must use an immutable @sha256 digest unless the local profile explicitly allows a mutable image"
+        allowMutableImage or regex.match(image, r"^((([a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*|(\[(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,5}(?::[0-9A-Fa-f]{1,4}){1,2}|(?:[0-9A-Fa-f]{1,4}:){1,4}(?::[0-9A-Fa-f]{1,4}){1,3}|(?:[0-9A-Fa-f]{1,4}:){1,3}(?::[0-9A-Fa-f]{1,4}){1,4}|(?:[0-9A-Fa-f]{1,4}:){1,2}(?::[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(?:(?::[0-9A-Fa-f]{1,4}){1,6})|:(?:(?::[0-9A-Fa-f]{1,4}){1,7}|:))\]))(:[0-9]+)?)/)?[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*(\/[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$") or regex.match(image, r"^\[(?:(?:[0-9A-Fa-f]{1,4}:){6}|::(?:[0-9A-Fa-f]{1,4}:){0,5}|[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0,4}|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0,3}|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0,2}|(?:[0-9A-Fa-f]{1,4}:){3}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0,1}|(?:[0-9A-Fa-f]{1,4}:){4}[0-9A-Fa-f]{1,4}::)(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}\](:[0-9]+)?\/[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*(\/[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$"), "image must use one complete OCI reference with an immutable @sha256 digest unless the local profile explicitly allows a mutable image"
+        operationId == "" or regex.match(operationId, r"^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$"), "operationId must be empty or a valid Kubernetes label value"
+        regex.match(serviceAccountName, r"^agent-os-firstmate(-[a-z0-9]{12})?$"), "serviceAccountName must be the deterministic legacy name or a lifecycle-generated installation identity"
 
 input: Input = ctx.input()
 
-labels = {
+selectorLabels = {
     "app.kubernetes.io/name" = "agent-os"
     "app.kubernetes.io/component" = "firstmate"
+    "app.kubernetes.io/managed-by" = "agent-os"
 }
+labels = selectorLabels | ({ "agent-os.dev/operation-id" = input.operationId } if input.operationId != "" else {})
+
+installationId = "agent-os-firstmate:${input.namespace}"
+ownershipAnnotations = { "agent-os.dev/installation-id" = installationId }
 
 namespaceResources = [{
     apiVersion = "v1"
     kind = "Namespace"
     metadata = {
         name = input.namespace
-        labels = { "app.kubernetes.io/part-of" = "agent-os" }
+        labels = labels | { "app.kubernetes.io/part-of" = "agent-os" }
+        annotations = ownershipAnnotations
     }
 }] if input.createNamespace else []
 
@@ -42,17 +53,28 @@ namespaceRbacResources = [
             name = "agent-os-firstmate-runtime"
             namespace = input.namespace
             labels = labels
+            annotations = ownershipAnnotations
         }
         rules = [
             {
                 apiGroups = [""]
-                resources = ["pods", "pods/log", "pods/exec", "persistentvolumeclaims"]
+                resources = ["pods", "persistentvolumeclaims"]
+                verbs = ["get", "list", "watch", "create", "delete", "patch"]
+            },
+            {
+                apiGroups = [""]
+                resources = ["pods/log", "pods/exec"]
                 verbs = ["get", "list", "watch", "create", "delete"]
             },
             {
                 apiGroups = ["apps"]
                 resources = ["statefulsets"]
                 verbs = ["get", "list", "watch"]
+            },
+            {
+                apiGroups = ["coordination.k8s.io"]
+                resources = ["leases"]
+                verbs = ["get", "create", "update", "delete"]
             },
         ]
     },
@@ -63,6 +85,7 @@ namespaceRbacResources = [
             name = "agent-os-firstmate-runtime"
             namespace = input.namespace
             labels = labels
+            annotations = ownershipAnnotations
         }
         roleRef = {
             apiGroup = "rbac.authorization.k8s.io"
@@ -71,7 +94,7 @@ namespaceRbacResources = [
         }
         subjects = [{
             kind = "ServiceAccount"
-            name = "agent-os-firstmate"
+            name = input.serviceAccountName
             namespace = input.namespace
         }]
     },
@@ -83,6 +106,7 @@ clusterAdminResources = [{
     metadata = {
         name = "agent-os-firstmate-${input.namespace}"
         labels = labels
+        annotations = ownershipAnnotations
     }
     roleRef = {
         apiGroup = "rbac.authorization.k8s.io"
@@ -91,7 +115,7 @@ clusterAdminResources = [{
     }
     subjects = [{
         kind = "ServiceAccount"
-        name = "agent-os-firstmate"
+        name = input.serviceAccountName
         namespace = input.namespace
     }]
 }] if input.rbac == "cluster-admin" else []
@@ -101,9 +125,10 @@ resources = namespaceResources + [
         apiVersion = "v1"
         kind = "ServiceAccount"
         metadata = {
-            name = "agent-os-firstmate"
+            name = input.serviceAccountName
             namespace = input.namespace
             labels = labels
+            annotations = ownershipAnnotations
         }
         automountServiceAccountToken = True
     },
@@ -114,6 +139,7 @@ resources = namespaceResources + [
             name = "agent-os-firstmate-home"
             namespace = input.namespace
             labels = labels
+            annotations = ownershipAnnotations
         }
         spec = {
             accessModes = ["ReadWriteOnce"]
@@ -127,10 +153,11 @@ resources = namespaceResources + [
             name = "agent-os-firstmate"
             namespace = input.namespace
             labels = labels
+            annotations = ownershipAnnotations
         }
         spec = {
             clusterIP = "None"
-            selector = labels
+            selector = selectorLabels
         }
     },
 ] + namespaceRbacResources + clusterAdminResources + [
@@ -141,11 +168,14 @@ resources = namespaceResources + [
             name = "agent-os-firstmate"
             namespace = input.namespace
             labels = labels
+            annotations = ownershipAnnotations | {
+                "agent-os.dev/rbac-mode" = input.rbac
+            }
         }
         spec = {
             serviceName = "agent-os-firstmate"
             replicas = 1
-            selector = { matchLabels = labels }
+            selector = { matchLabels = selectorLabels }
             template = {
                 metadata = {
                     labels = labels
@@ -154,7 +184,7 @@ resources = namespaceResources + [
                     }
                 }
                 spec = {
-                    serviceAccountName = "agent-os-firstmate"
+                    serviceAccountName = input.serviceAccountName
                     securityContext = {
                         fsGroup = 0
                         runAsGroup = 0
@@ -198,7 +228,6 @@ resources = namespaceResources + [
                         }
                         volumeMounts = [
                             { name = "home", mountPath = "/home/agent" },
-                            { name = "home", mountPath = "/usr/local", subPath = "usr-local" },
                         ]
                     }]
                     volumes = [{

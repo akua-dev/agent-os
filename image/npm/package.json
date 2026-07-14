@@ -1,0 +1,13 @@
+{
+  "name": "agent-os-image-runtime",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.80.6",
+    "chrome-devtools-axi": "0.1.26",
+    "gh-axi": "0.1.27",
+    "lavish-axi": "0.1.40",
+    "quota-axi": "0.1.5",
+    "tasks-axi": "0.2.2"
+  }
+}

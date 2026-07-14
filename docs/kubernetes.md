@@ -17,7 +17,7 @@ No Kubernetes Secret is required for the portable install.
 The package has no credential field or Secret reference.
 Runtime AI, GitHub, or other authority is created separately by its owner after installation and is never supplied through package inputs, command arguments, or rendered YAML.
 
-The package requires an image digest because a mutable tag cannot identify an upgrade or recovery input.
+The package requires one complete 64-hex image digest because a mutable or malformed reference cannot identify an upgrade or recovery input.
 The source tree contains an intentionally non-installable placeholder until the first public image release is published.
 Replace it only with the digest recorded by that release workflow.
 
@@ -39,6 +39,10 @@ bin/agent-os-kubernetes.sh install
 
 The installer renders only `tools/agent-os/packages/firstmate/package.k`, applies that fresh output to the named context, and waits for `agent-os-firstmate` to roll out.
 It never reads an ambient Kubernetes context.
+The namespace in the rendered StatefulSet is authoritative, and an inconsistent `AGENT_OS_NAMESPACE` stops the operation before any Kubernetes request.
+With `createNamespace: true`, install creates only an absent namespace or reuses one carrying the exact package installation identity.
+It refuses to adopt a pre-existing unowned or foreign namespace.
+With `createNamespace: false`, the selected namespace must already exist without Agent OS ownership metadata and remains outside package ownership.
 
 The default `rbac: namespace` creates a ServiceAccount plus a Role and RoleBinding scoped to the selected namespace.
 That Role allows Firstmate to manage runtime crewmate Pods and PVCs and inspect its StatefulSet.
@@ -46,7 +50,8 @@ Set `rbac: none` only when another reviewed authority handles those runtime oper
 Set `rbac: cluster-admin` only for an isolated intelligence cluster after reviewing the broader ClusterRoleBinding.
 
 The persistent home PVC defaults to `20Gi` and is mounted at `/home/agent`.
-`/usr/local` is a subpath of that same PVC so user-installed global tools survive Pod replacement.
+Image-owned `/usr/local` remains immutable, while user-installed tools persist under `/home/agent/.local` and the other home-scoped prefixes on the PVC.
+The init container authenticates an image ownership manifest and refuses ambiguous legacy `/usr/local` migrations instead of retaining stale image binaries.
 
 ## Operations
 
@@ -55,6 +60,12 @@ To upgrade, use a new released digest in the same input file and apply it throug
 ```sh
 bin/agent-os-kubernetes.sh upgrade
 ```
+
+Upgrade applies and verifies the desired workload and RBAC before removing obsolete namespace Role and RoleBinding resources.
+Routine `namespace` and `none` operations never inspect or delete cluster-scoped RBAC.
+When a downgrade may leave the exact package-owned ClusterRoleBinding, upgrade exits incomplete and prints a separately confirmed `cleanup-cluster-rbac --yes` command plus the required absence evidence.
+Run that command only through an explicitly approved cluster-admin identity.
+It refuses to delete a same-name binding unless its ownership label and installation annotation both match.
 
 To roll back only the Firstmate workload revision, use Kubernetes StatefulSet history.
 This does not roll back package inputs, RBAC, or persistent data.
@@ -69,12 +80,20 @@ To inspect the workload, use the same explicit context and namespace.
 bin/agent-os-kubernetes.sh status
 ```
 
-Uninstall is deliberately confirmed and bounded to a fresh render of the selected package inputs.
-When those inputs create the namespace, deleting that rendered Namespace also removes everything in that namespace.
-When `createNamespace: false`, the command deletes only the rendered Agent OS resources in the existing namespace.
+Uninstall is deliberately confirmed and bounded to namespaced resources from a fresh render plus the deterministic namespace Role and RoleBinding names.
+It retains the namespace by default and reports possible cluster-scoped residue without requesting cluster-wide authority.
+Use the separately printed privileged cleanup command to remove an exactly owned ClusterRoleBinding.
+The optional `--delete-namespace` flag works only for `createNamespace: true`, rechecks the exact installation identity, inventories every listable namespaced resource type, and refuses deletion while any foreign resource remains.
+With `createNamespace: false`, the namespace is never deleted.
 
 ```sh
 bin/agent-os-kubernetes.sh uninstall --yes
+```
+
+To delete an exactly owned and otherwise empty namespace as part of the confirmed uninstall, use:
+
+```sh
+bin/agent-os-kubernetes.sh uninstall --yes --delete-namespace
 ```
 
 ## Runtime mates
@@ -82,6 +101,19 @@ bin/agent-os-kubernetes.sh uninstall --yes
 Firstmate creates a separate-Pod crewmate at runtime with the internal `crewmate.yaml` template in the canonical package.
 It is not a second public package and is not a Marketplace product.
 Each runtime mate has its own PVC and no ambient Kubernetes ServiceAccount token.
+Creating one requires an explicitly authorized, pre-created Secret in the same namespace with an `auth.json` key.
+Pass only that Secret's name through `AGENT_OS_AI_SECRET`; the helper never discovers or copies the primary credential.
+The Secret projects only `auth.json` into a dedicated read-only runtime directory, and the entrypoint links that file into the writable PVC-backed Pi state without copying credential bytes.
+A missing Secret or key keeps the Pod unready, so creation fails closed and removes the non-running Pod while retaining its PVC for an authorized retry.
+
+```sh
+AGENT_OS_AI_SECRET=scout-1-ai-auth bin/agent-os-crewmate.sh create scout-1
+```
+
+Use `stop` for a Pod-only shutdown and `restart` for a Pod-only replacement after an approved Secret rotation.
+The ambiguous `delete` operation is rejected.
+Only `purge <id> --yes` removes the PVC, and it requires the owned Pod to be absent, exact ownership, a fresh clean checkpoint annotation from the stopped home, and a non-secret evidence file.
+The full rotation, urgent-revocation, checkpoint, and purge procedure is owned by the `kubernetes-fleet` operating skill.
 
 The existing [same-Pod](evidence/2026-07-13-same-pod-firstmate.md) and [separate-Pod recovery](evidence/2026-07-13-separate-pod-recovery.md) records remain local lifecycle evidence.
 They do not substitute for a clean published-image installation.

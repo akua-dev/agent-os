@@ -1,4 +1,58 @@
-FROM node:24-trixie-slim
+FROM node:24-trixie-slim@sha256:366fdef91728b1b7fa18c84fba63b6e79ed77b7e10cc206878e9705da4d7b169 AS source-bootstrap
+
+ARG AGENT_OS_SOURCE_COMMIT
+ARG AGENT_OS_SOURCE_TREE
+ARG AGENT_OS_SOURCE_BRANCH=main
+ARG AGENT_OS_SOURCE_ORIGIN=https://github.com/akua-dev/agent-os.git
+ARG AGENT_OS_SOURCE_MODE=main
+ARG AGENT_OS_SOURCE_REF=refs/heads/main
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends git \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY image/agent-os-source.tar image/agent-os-bootstrap.tar image/agent-os-source.attestation /tmp/
+
+RUN set -eu; \
+  test -n "$AGENT_OS_SOURCE_COMMIT"; \
+  test -n "$AGENT_OS_SOURCE_TREE"; \
+  test "$AGENT_OS_SOURCE_BRANCH" = main; \
+  test "$AGENT_OS_SOURCE_ORIGIN" = https://github.com/akua-dev/agent-os.git; \
+  case "$AGENT_OS_SOURCE_MODE" in main|candidate|event|release) ;; *) exit 1 ;; esac; \
+  test -n "$AGENT_OS_SOURCE_REF"; \
+  grep -Fx "mode=$AGENT_OS_SOURCE_MODE" /tmp/agent-os-source.attestation; \
+  grep -Fx "commit=$AGENT_OS_SOURCE_COMMIT" /tmp/agent-os-source.attestation; \
+  grep -Fx "tree=$AGENT_OS_SOURCE_TREE" /tmp/agent-os-source.attestation; \
+  grep -Fx "branch=$AGENT_OS_SOURCE_BRANCH" /tmp/agent-os-source.attestation; \
+  grep -Fx "origin=$AGENT_OS_SOURCE_ORIGIN" /tmp/agent-os-source.attestation; \
+  grep -Fx "ref=$AGENT_OS_SOURCE_REF" /tmp/agent-os-source.attestation; \
+  source_sha=$(sha256sum /tmp/agent-os-source.tar | awk '{print $1}'); \
+  bootstrap_sha=$(sha256sum /tmp/agent-os-bootstrap.tar | awk '{print $1}'); \
+  grep -Fx "source_sha256=$source_sha" /tmp/agent-os-source.attestation; \
+  grep -Fx "bootstrap_sha256=$bootstrap_sha" /tmp/agent-os-source.attestation; \
+  tar -xf /tmp/agent-os-bootstrap.tar -C /opt; \
+  mv /opt/bootstrap.git /opt/agent-os-bootstrap.git; \
+  test "$(git --git-dir=/opt/agent-os-bootstrap.git rev-parse "$AGENT_OS_SOURCE_COMMIT")" = "$AGENT_OS_SOURCE_COMMIT"; \
+  test "$(git --git-dir=/opt/agent-os-bootstrap.git rev-parse "$AGENT_OS_SOURCE_COMMIT^{tree}")" = "$AGENT_OS_SOURCE_TREE"; \
+  test -s /opt/agent-os-bootstrap.git/shallow; \
+  test "$(git --git-dir=/opt/agent-os-bootstrap.git remote get-url origin)" = "$AGENT_OS_SOURCE_ORIGIN"; \
+  test -z "$(git --git-dir=/opt/agent-os-bootstrap.git ls-tree -r --name-only "$AGENT_OS_SOURCE_COMMIT" -- config data projects state .no-mistakes)"; \
+  test ! -e /opt/agent-os-bootstrap.git/hooks; \
+  git --git-dir=/opt/agent-os-bootstrap.git archive --format=tar --output=/tmp/verified-source.tar "$AGENT_OS_SOURCE_COMMIT"; \
+  cmp /tmp/verified-source.tar /tmp/agent-os-source.tar; \
+  mkdir -p /opt/agent-os; \
+  tar -xf /tmp/verified-source.tar -C /opt/agent-os; \
+  test "$(git --git-dir=/opt/agent-os-bootstrap.git rev-parse "$AGENT_OS_SOURCE_COMMIT^{tree}")" = "$AGENT_OS_SOURCE_TREE"; \
+  rm -f /tmp/verified-source.tar /tmp/agent-os-source.tar /tmp/agent-os-bootstrap.tar /tmp/agent-os-source.attestation; \
+  printf '%s\n' "$AGENT_OS_SOURCE_COMMIT" > /opt/agent-os-source.commit; \
+  printf '%s\n' "$AGENT_OS_SOURCE_TREE" > /opt/agent-os-source.tree; \
+  printf '%s\n' "$source_sha" > /opt/agent-os-source.sha256; \
+  printf '%s\n' "$AGENT_OS_SOURCE_BRANCH" > /opt/agent-os-source.branch; \
+  printf '%s\n' "$AGENT_OS_SOURCE_ORIGIN" > /opt/agent-os-source.origin; \
+  printf '%s\n' "$AGENT_OS_SOURCE_MODE" > /opt/agent-os-source.mode; \
+  printf '%s\n' "$AGENT_OS_SOURCE_REF" > /opt/agent-os-source.ref
+
+FROM node:24-trixie-slim@sha256:366fdef91728b1b7fa18c84fba63b6e79ed77b7e10cc206878e9705da4d7b169
 
 ARG TARGETARCH
 ARG HERDR_VERSION=0.7.3
@@ -9,6 +63,14 @@ ARG NO_MISTAKES_VERSION=1.34.0
 ARG BUN_VERSION=1.3.14
 ARG AKUA_VERSION=0.8.25
 ARG K9S_VERSION=0.51.0
+ARG AGENT_OS_SOURCE_COMMIT
+ARG AGENT_OS_SOURCE_TREE
+ARG AGENT_OS_SOURCE_BRANCH=main
+ARG AGENT_OS_SOURCE_ORIGIN=https://github.com/akua-dev/agent-os.git
+
+COPY image/debian.sources /etc/apt/sources.list.d/debian.sources
+
+RUN echo "9767ac71230276e282fdb39a087c889a277835b47751a0c0e5a9da0e8352e289  /etc/apt/sources.list.d/debian.sources" | sha256sum -c -
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -47,7 +109,10 @@ RUN set -eu; \
   esac; \
   curl -fsSL "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" -o /usr/local/bin/kubectl; \
   echo "$sha  /usr/local/bin/kubectl" | sha256sum -c -; \
-  chmod 0755 /usr/local/bin/kubectl
+  chmod 0755 /usr/local/bin/kubectl; \
+  mkdir -p /usr/share/licenses/kubectl; \
+  curl -fsSL "https://raw.githubusercontent.com/kubernetes/kubernetes/1f328c5e9dd683d0c5e69f3d7d58f8371278dec2/LICENSE" -o /usr/share/licenses/kubectl/LICENSE; \
+  echo "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30  /usr/share/licenses/kubectl/LICENSE" | sha256sum -c -
 
 RUN set -eu; \
   case "$TARGETARCH" in \
@@ -60,6 +125,9 @@ RUN set -eu; \
   echo "$sha  /tmp/${asset}" | sha256sum -c -; \
   tar -xzf "/tmp/${asset}" -C /tmp; \
   install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${TARGETARCH}/bin/gh" /usr/local/bin/gh; \
+  mkdir -p /usr/share/licenses/gh; \
+  curl -fsSL "https://raw.githubusercontent.com/cli/cli/b300f2ec7ec9dc9addc39b2ad88c54097ded7ca0/LICENSE" -o /usr/share/licenses/gh/LICENSE; \
+  echo "6da4adc42392c8485e40b4251c7e332fc3352df1947c9ffade71dd60b14a7a4f  /usr/share/licenses/gh/LICENSE" | sha256sum -c -; \
   rm -rf "/tmp/${asset}" "/tmp/gh_${GH_VERSION}_linux_${TARGETARCH}"
 
 RUN set -eu; \
@@ -77,6 +145,11 @@ RUN set -eu; \
   echo "$no_mistakes_sha  /tmp/${no_mistakes_asset}" | sha256sum -c -; \
   tar -xzf "/tmp/${no_mistakes_asset}" -C /usr/local/bin; \
   chmod 0755 /usr/local/bin/treehouse /usr/local/bin/no-mistakes; \
+  mkdir -p /usr/share/licenses/treehouse /usr/share/licenses/no-mistakes; \
+  curl -fsSL "https://raw.githubusercontent.com/kunchenguid/treehouse/68fa3d2556542add76bf80255787b8625a5041a6/LICENSE" -o /usr/share/licenses/treehouse/LICENSE; \
+  echo "1b962d20f826f6a758c737f8aa4e8e76dc719b8aa78fcfacdfb46681bb36c2f4  /usr/share/licenses/treehouse/LICENSE" | sha256sum -c -; \
+  curl -fsSL "https://raw.githubusercontent.com/kunchenguid/no-mistakes/dc5a80059d3c0f1abbf28f20f43d994b8399bee6/LICENSE" -o /usr/share/licenses/no-mistakes/LICENSE; \
+  echo "945016bd37e1ba7211622ef60ee1d23ab727896ba7710edd21e8fbe983863969  /usr/share/licenses/no-mistakes/LICENSE" | sha256sum -c -; \
   rm -f "/tmp/${treehouse_asset}" "/tmp/${no_mistakes_asset}"
 
 RUN set -eu; \
@@ -90,6 +163,9 @@ RUN set -eu; \
   echo "$sha  /tmp/${asset}" | sha256sum -c -; \
   unzip -q "/tmp/${asset}" -d /tmp/bun; \
   install -m 0755 "/tmp/bun/bun-linux-${bun_arch}/bun" /usr/local/bin/bun; \
+  mkdir -p /usr/share/licenses/bun; \
+  curl -fsSL "https://raw.githubusercontent.com/oven-sh/bun/0d9b296af33f2b851fcbf4df3e9ec89751734ba4/LICENSE.md" -o /usr/share/licenses/bun/LICENSE.md; \
+  echo "2c6160ec8fb853f7e8f97d9b249e756c9b0ac44860a68b6bf4f1b0bcbc5c3741  /usr/share/licenses/bun/LICENSE.md" | sha256sum -c -; \
   rm -rf "/tmp/${asset}" /tmp/bun
 
 RUN set -eu; \
@@ -122,28 +198,40 @@ RUN set -eu; \
   mkdir -p /usr/share/licenses/k9s; \
   curl -fsSL "https://raw.githubusercontent.com/derailed/k9s/v${K9S_VERSION}/LICENSE" -o /usr/share/licenses/k9s/LICENSE
 
-RUN npm install --global \
-  @earendil-works/pi-coding-agent@0.80.6 \
-  gh-axi@0.1.27 \
-  chrome-devtools-axi@0.1.26 \
-  lavish-axi@0.1.40 \
-  tasks-axi@0.2.2 \
-  quota-axi@0.1.5
+COPY image/npm/package.json image/npm/package-lock.json /opt/agent-os-npm/
+
+RUN echo "3646e31389155fbce155c828d8db46bc60ff2976c2d8d29e6633f260f56fd06d  /opt/agent-os-npm/package.json" | sha256sum -c - \
+  && echo "f77f31c67455d6f72e6411d5fa82669b9cc95306d518ff655b7c7795cfd41ca2  /opt/agent-os-npm/package-lock.json" | sha256sum -c - \
+  && npm ci --omit=dev --ignore-scripts --no-audit --no-fund --prefix /opt/agent-os-npm \
+  && mkdir -p /usr/local/lib/node_modules \
+  && cp -a /opt/agent-os-npm/node_modules/. /usr/local/lib/node_modules/ \
+  && for command in pi gh-axi chrome-devtools-axi lavish-axi tasks-axi quota-axi; do \
+    ln -s "/usr/local/lib/node_modules/.bin/$command" "/usr/local/bin/$command"; \
+  done \
+  && rm -rf /opt/agent-os-npm
 
 ENV FM_HOME=/home/agent \
     HOME=/home/agent \
     XDG_CONFIG_HOME=/home/agent/.config \
     XDG_DATA_HOME=/home/agent/.local/share \
     XDG_CACHE_HOME=/home/agent/.cache \
-    NPM_CONFIG_PREFIX=/usr/local \
+    NPM_CONFIG_PREFIX=/home/agent/.local \
     BUN_INSTALL=/home/agent/.bun \
     CARGO_HOME=/home/agent/.cargo \
     PATH=/home/agent/.local/bin:/home/agent/.bun/bin:/home/agent/.cargo/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin \
     HERDR_SESSION=default
 
-RUN mkdir -p /home/agent /opt/agent-os /opt/image-usr-local
+RUN mkdir -p /home/agent /opt/agent-os
 
-COPY . /opt/agent-os
+COPY --from=source-bootstrap /opt/agent-os /opt/agent-os
+COPY --from=source-bootstrap /opt/agent-os-bootstrap.git /opt/agent-os-bootstrap.git
+COPY --from=source-bootstrap /opt/agent-os-source.commit /opt/agent-os-source.commit
+COPY --from=source-bootstrap /opt/agent-os-source.tree /opt/agent-os-source.tree
+COPY --from=source-bootstrap /opt/agent-os-source.sha256 /opt/agent-os-source.sha256
+COPY --from=source-bootstrap /opt/agent-os-source.branch /opt/agent-os-source.branch
+COPY --from=source-bootstrap /opt/agent-os-source.origin /opt/agent-os-source.origin
+COPY --from=source-bootstrap /opt/agent-os-source.mode /opt/agent-os-source.mode
+COPY --from=source-bootstrap /opt/agent-os-source.ref /opt/agent-os-source.ref
 
 RUN install -D -m 0644 /opt/agent-os/THIRD_PARTY_NOTICES.md /usr/share/doc/agent-os/THIRD_PARTY_NOTICES.md \
   && install -D -m 0644 /opt/agent-os/THIRD_PARTY_SOURCES.md /usr/share/doc/agent-os/THIRD_PARTY_SOURCES.md
@@ -151,7 +239,10 @@ RUN install -D -m 0644 /opt/agent-os/THIRD_PARTY_NOTICES.md /usr/share/doc/agent
 RUN cd /opt/agent-os/tools/agent-os \
   && bun install --frozen-lockfile --production --ignore-scripts \
   && ln -s /opt/agent-os/tools/agent-os/src/cli.ts /usr/local/bin/agent-os \
-  && cp -a /usr/local/. /opt/image-usr-local/
+  && cd /usr/local \
+  && find . \( -type f -o -type l \) -print | LC_ALL=C sort | while IFS= read -r path; do sha256sum "$path"; done > /opt/agent-os-image-usr-local.manifest \
+  && cd /opt \
+  && sha256sum agent-os-image-usr-local.manifest > agent-os-image-usr-local.manifest.sha256
 
-WORKDIR /opt/agent-os
+WORKDIR /home/agent/firstmate
 ENTRYPOINT ["/opt/agent-os/bin/agent-os-container-entrypoint.sh"]

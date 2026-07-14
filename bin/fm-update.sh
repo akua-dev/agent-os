@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Self-update a running firstmate and its secondmates to the latest origin.
+# Update a running firstmate and its secondmates according to source policy.
 #
-# Mechanical half of the /updatefirstmate skill. Fast-forwards the running
-# firstmate repo's default branch from origin, then fast-forwards every
+# Mechanical half of the /updatefirstmate skill. Mutable sources fast-forward
+# the running firstmate repo's default branch from origin, then fast-forward every
 # registered secondmate home (each a treehouse worktree of this same repo, or
 # a standalone clone) the same way. FAST-FORWARD ONLY, exactly like
 # fm-fleet-sync.sh: never force, never create a merge commit, never stash;
@@ -14,6 +14,8 @@
 # fetched on their own. Secondmate homes are leased at a detached HEAD on the
 # default branch, so a fast-forward there advances HEAD only and never touches
 # any other worktree's checkout or the shared `main` branch.
+# Candidate and release image sources carry persisted immutable provenance;
+# this script refuses those sources before any fetch or checkout mutation.
 #
 # The fast-forward mechanics live in bin/fm-ff-lib.sh (base_mode "origin" here);
 # the same library drives the local-HEAD secondmate sync used by fm-spawn.sh and
@@ -46,6 +48,105 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
   exit 0
 fi
 [ $# -eq 0 ] || { usage; exit 1; }
+
+persisted_policy=fast-forward
+resolve_policy_git_dir() {
+  local root=$1 pointer
+  if [ -d "$root/.git" ] && [ ! -L "$root/.git" ]; then
+    POLICY_GIT_DIR=$(cd "$root/.git" && pwd -P)
+  elif [ -f "$root/.git" ] && [ ! -L "$root/.git" ]; then
+    [ "$(wc -l < "$root/.git" | tr -d ' ')" -eq 1 ] || return 1
+    pointer=$(sed -n 's/^gitdir: //p' "$root/.git")
+    [ -n "$pointer" ] || return 1
+    case "$pointer" in
+      /*) POLICY_GIT_DIR=$(cd "$pointer" 2>/dev/null && pwd -P) || return 1 ;;
+      *) POLICY_GIT_DIR=$(cd "$root/$(dirname "$pointer")" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$(basename "$pointer")") || return 1 ;;
+    esac
+  else
+    return 1
+  fi
+}
+
+POLICY_GIT_DIR=
+resolve_policy_git_dir "$FM_ROOT" || true
+policy_file=${POLICY_GIT_DIR:+$POLICY_GIT_DIR/agent-os-runtime-source}
+home_policy_file="$FM_ROOT/config/agent-os-source-policy"
+required_policy_file="$FM_ROOT/config/agent-os-source-policy.required"
+pending_policy_file="$FM_ROOT/config/agent-os-source-policy.pending"
+secondmate_home=false
+if [ -e "$FM_ROOT/.fm-secondmate-home" ]; then
+  [ -f "$FM_ROOT/.fm-secondmate-home" ] && [ ! -L "$FM_ROOT/.fm-secondmate-home" ] || {
+    echo "error: invalid secondmate home provenance" >&2
+    exit 2
+  }
+  secondmate_home=true
+fi
+if [ "$secondmate_home" = true ] && \
+  { [ -e "$policy_file" ] || [ -e "$home_policy_file" ] || \
+    [ -e "$required_policy_file" ] || [ -e "$pending_policy_file" ]; }; then
+  [ ! -e "$pending_policy_file" ] || {
+    echo "error: immutable source provenance transition is incomplete" >&2
+    exit 2
+  }
+  if [ -e "$required_policy_file" ]; then
+    [ -f "$required_policy_file" ] && [ ! -L "$required_policy_file" ] && \
+      [ "$(cat "$required_policy_file")" = immutable ] || {
+      echo "error: invalid immutable source provenance requirement" >&2
+      exit 2
+    }
+  fi
+  [ -f "$policy_file" ] && [ ! -L "$policy_file" ] && \
+    [ -f "$home_policy_file" ] && [ ! -L "$home_policy_file" ] || {
+    echo "error: immutable source provenance is incomplete" >&2
+    exit 2
+  }
+  cmp "$policy_file" "$home_policy_file" >/dev/null || {
+    echo "error: immutable source provenance does not match the secondmate home policy" >&2
+    exit 2
+  }
+elif [ "$secondmate_home" = false ] && \
+  { [ -e "$home_policy_file" ] || [ -e "$required_policy_file" ] || [ -e "$pending_policy_file" ]; }; then
+  echo "error: immutable source provenance exists outside a secondmate home" >&2
+  exit 2
+fi
+if [ -f "$policy_file" ]; then
+  policy_mode=$(sed -n 's/^mode=//p' "$policy_file")
+  policy_commit=$(sed -n 's/^commit=//p' "$policy_file")
+  policy_source_sha=$(sed -n 's/^source_sha256=//p' "$policy_file")
+  case "$policy_mode" in candidate|release) ;; *) echo "error: invalid immutable source provenance" >&2; exit 2 ;; esac
+  [[ "$policy_commit" =~ ^[0-9a-f]{40}$ ]] && [[ "$policy_source_sha" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "error: invalid immutable source provenance" >&2
+    exit 2
+  }
+  if [ "${FM_ROOT#"$FM_HOME/runtime-sources/"}" != "$FM_ROOT" ]; then
+    expected_root="$FM_HOME/runtime-sources/$policy_commit-$policy_source_sha"
+    [ "$(cd "$FM_ROOT" && pwd -P)" = "$(cd "$expected_root" 2>/dev/null && pwd -P)" ] || {
+      echo "error: immutable source provenance does not match FM_ROOT" >&2
+      exit 2
+    }
+  else
+    [ -f "$FM_ROOT/.fm-secondmate-home" ] && [ ! -L "$FM_ROOT/.fm-secondmate-home" ] || {
+      echo "error: immutable source provenance is outside a verified runtime home" >&2
+      exit 2
+    }
+  fi
+  persisted_policy=immutable
+elif [ "${FM_ROOT#"$FM_HOME/runtime-sources/"}" != "$FM_ROOT" ]; then
+  echo "error: immutable source provenance is unavailable" >&2
+  exit 2
+fi
+
+case "$persisted_policy" in
+  fast-forward) ;;
+  immutable)
+    echo "error: self-update is disabled for immutable image source" >&2
+    exit 2
+    ;;
+  *)
+    echo "error: invalid Agent OS source update policy" >&2
+    exit 2
+    ;;
+esac
 
 # --- main firstmate repo ---------------------------------------------------
 

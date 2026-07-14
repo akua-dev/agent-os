@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:
@@ -14,7 +15,7 @@ jobs:
     name: Lint shell scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
       - name: Install pinned ShellCheck
         run: |
           set -eu
@@ -31,7 +32,7 @@ jobs:
     # hung watcher or tmux test instead of riding GitHub's 360-minute default.
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           fetch-depth: 0
       - name: Install pinned ShellCheck
@@ -55,10 +56,38 @@ jobs:
       - name: Install Akua renderer
         run: |
           set -eu
-          export AKUA_INSTALL="$RUNNER_TEMP/akua"
-          curl -fsSL https://cli.akua.dev/install | sh -s -- 0.8.25
-          echo "$AKUA_INSTALL/bin" >> "$GITHUB_PATH"
-          "$AKUA_INSTALL/bin/akua" --version
+          version=0.8.25
+          case "$(uname -m)" in
+            x86_64)
+              triple=x86_64-unknown-linux-gnu
+              sha=bc57afbffe7e18aacd2146e2cd67151c56e7a3c279fe659312ff7ffb359cd03a
+              ;;
+            aarch64)
+              triple=aarch64-unknown-linux-gnu
+              sha=3a3c6bae72764cbd85a6e4e0877a05e5def8f7aeee8563b7918099214a1a313a
+              ;;
+            *)
+              echo "::error::unsupported Akua runner architecture: $(uname -m)"
+              exit 1
+              ;;
+          esac
+          asset="akua-v${version}-${triple}.tar.gz"
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL "https://github.com/akua-dev/akua/releases/download/v${version}/${asset}" -o "$RUNNER_TEMP/$asset"
+          printf '%s  %s\n' "$sha" "$RUNNER_TEMP/$asset" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/akua" "$RUNNER_TEMP/bin/akua"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/akua" --version
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version-file: tools/agent-os/.bun-version
+      - name: Check Agent OS tool
+        working-directory: tools/agent-os
+        run: |
+          set -eu
+          bun install --frozen-lockfile --ignore-scripts
+          bun run check
       - run: |
           set -eu
           for test_script in tests/*.test.sh; do
@@ -69,7 +98,7 @@ jobs:
     name: Repo invariants
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
       - name: Symlinks must stay intact
         run: |
           set -eu

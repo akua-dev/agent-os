@@ -9,63 +9,1048 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: agent-os-image-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   IMAGE: ghcr.io/akua-dev/agent-os
 
 jobs:
-  build:
-    name: Build linux/amd64 and linux/arm64
+  behavior:
+    name: Exact-source behavior gate
+    uses: ./.github/workflows/ci.yml
+
+  provenance:
+    if: github.event_name == 'push'
+    name: Protected-main source provenance
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify publication source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          set -eu
+          trusted_git() {
+            env -i HOME=/nonexistent PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C \
+              GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+              /usr/bin/git -c credential.helper= -c core.hooksPath=/dev/null \
+              -c http.proxy= -c https.proxy= "$@"
+          }
+          if [ "$GITHUB_REF" = refs/heads/main ]; then
+            [ "$REF_PROTECTED" = true ] || { echo "::error::main is not reported protected"; exit 1; }
+          elif [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            tag=${GITHUB_REF#refs/tags/}
+            [ "$(trusted_git cat-file -t "$GITHUB_REF")" = tag ] || { echo "::error::release tag must be annotated"; exit 1; }
+            record_commit=$(trusted_git for-each-ref --format='%(contents)' "$GITHUB_REF" | sed -n 's/^release-record-commit=\([0-9a-f]\{40\}\)$/\1/p')
+            [ -n "$record_commit" ] || { echo "::error::release tag lacks immutable record commit"; exit 1; }
+            trusted_git fetch --no-tags https://github.com/akua-dev/agent-os.git refs/heads/main:refs/remotes/origin/main
+            trusted_git merge-base --is-ancestor "$record_commit" refs/remotes/origin/main
+            gh api "repos/$GITHUB_REPOSITORY/branches/main/protection" >/dev/null
+            trusted_git show "$record_commit:image/releases/$tag.json" > "$RUNNER_TEMP/release-record.json"
+            trusted_git merge-base --is-ancestor "$(jq -r .commit "$RUNNER_TEMP/release-record.json")" refs/remotes/origin/main
+            ruleset_id=$(jq -r .tag_ruleset_id "$RUNNER_TEMP/release-record.json")
+            gh api "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id" > "$RUNNER_TEMP/tag-ruleset.json"
+            ruleset_sha=$(jq -cS . "$RUNNER_TEMP/tag-ruleset.json" | sha256sum | awk '{print $1}')
+            [ "$ruleset_sha" = "$(jq -r .tag_ruleset_sha256 "$RUNNER_TEMP/release-record.json")" ] || {
+              echo "::error::release tag ruleset differs from immutable record"
+              exit 1
+            }
+            jq -e '
+              .enforcement == "active" and .target == "tag" and
+              (.bypass_actors | length == 0) and
+              ([.rules[].type] | index("deletion") != null and index("non_fast_forward") != null)' \
+              "$RUNNER_TEMP/tag-ruleset.json" >/dev/null || {
+              echo "::error::release tag ruleset is not active, immutable, tag-targeted, and bypass-free"
+              exit 1
+            }
+            ruby -rjson - "$GITHUB_REF" "$RUNNER_TEMP/tag-ruleset.json" <<'RUBY'
+          ref, path = ARGV
+          names = JSON.parse(File.read(path)).fetch("conditions").fetch("ref_name")
+          include_patterns = names.fetch("include")
+          exclude_patterns = names.fetch("exclude")
+          patterns = include_patterns + exclude_patterns
+          abort "release tag ruleset contains unsupported ref syntax" unless patterns.all? do |pattern|
+            pattern.is_a?(String) && !pattern.include?("\\") && !pattern.include?("[^") &&
+              (!pattern.start_with?("~") || pattern == "~ALL")
+          end
+          matches = lambda do |pattern|
+            pattern == "~ALL" || File.fnmatch?(pattern, ref, File::FNM_PATHNAME)
+          end
+          unless !include_patterns.empty? && include_patterns.any?(&matches) && !exclude_patterns.any?(&matches)
+            abort "release tag is not covered exclusively by the recorded tag ruleset"
+          end
+          RUBY
+          else
+            echo "::error::unsupported publication ref $GITHUB_REF"
+            exit 1
+          fi
+
+  validate:
+    name: Validate linux/amd64 and linux/arm64
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
-      - uses: docker/setup-qemu-action@v3
+      - name: Prepare exact source bundle
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        id: source
+        run: |
+          set -eu
+          trusted_git() {
+            env -i HOME=/nonexistent PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C \
+              GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+              /usr/bin/git -c credential.helper= -c core.hooksPath=/dev/null \
+              -c http.proxy= -c https.proxy= "$@"
+          }
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            [ "$(trusted_git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}" ]
+            AGENT_OS_SOURCE_MODE=event AGENT_OS_SOURCE_EVENT_COMMIT="${{ github.event.pull_request.head.sha }}" \
+              bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/source-metadata"
+          else
+            bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/source-metadata"
+          fi
+          cat "$RUNNER_TEMP/source-metadata" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-buildx-action@v3
+      - if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+
+      - if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Build without publication credentials
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+          build-args: |
+            AGENT_OS_SOURCE_COMMIT=${{ steps.source.outputs.commit }}
+            AGENT_OS_SOURCE_TREE=${{ steps.source.outputs.tree }}
+            AGENT_OS_SOURCE_BRANCH=${{ steps.source.outputs.branch }}
+            AGENT_OS_SOURCE_ORIGIN=${{ steps.source.outputs.origin }}
+            AGENT_OS_SOURCE_MODE=${{ steps.source.outputs.mode }}
+            AGENT_OS_SOURCE_REF=${{ steps.source.outputs.ref }}
+
+  publish:
+    if: github.event_name == 'push'
+    needs: [behavior, provenance, validate]
+    name: Publish linux/amd64 and linux/arm64
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare exact release candidate source
+        if: github.ref == 'refs/heads/main'
+        id: candidate_source
+        run: |
+          set -eu
+          AGENT_OS_SOURCE_MODE=candidate bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/candidate-source-metadata"
+          cat "$RUNNER_TEMP/candidate-source-metadata" >> "$GITHUB_OUTPUT"
+
+      - if: github.ref == 'refs/heads/main'
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6
+        with:
+          version: 1.3.0
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compute image tags
+      - name: Prepare immutable release source
+        if: startsWith(github.ref, 'refs/tags/')
+        id: release_source
+        run: |
+          set -eu
+          trusted_git() {
+            env -i HOME=/nonexistent PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C \
+              GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+              /usr/bin/git -c credential.helper= -c core.hooksPath=/dev/null \
+              -c http.proxy= -c https.proxy= "$@"
+          }
+          record_commit=$(trusted_git for-each-ref --format='%(contents)' "$GITHUB_REF" | sed -n 's/^release-record-commit=\([0-9a-f]\{40\}\)$/\1/p')
+          trusted_git show "$record_commit:image/releases/${GITHUB_REF#refs/tags/}.json" > "$RUNNER_TEMP/release-record.json"
+          candidate_record_digest=$(jq -er '.candidate_record_digest' "$RUNNER_TEMP/release-record.json")
+          oras manifest fetch "$IMAGE@$candidate_record_digest" > "$RUNNER_TEMP/release-source-candidate-manifest.json"
+          [ "sha256:$(sha256sum "$RUNNER_TEMP/release-source-candidate-manifest.json" | awk '{print $1}')" = "$candidate_record_digest" ]
+          bootstrap_blob=$(jq -er '[.layers[] | select(.mediaType == "application/vnd.akua.agent-os.bootstrap.v1+tar" and .annotations["org.opencontainers.image.title"] == "agent-os-bootstrap.tar")] | select(length == 1) | .[0].digest' "$RUNNER_TEMP/release-source-candidate-manifest.json")
+          oras blob fetch --output "$RUNNER_TEMP/agent-os-bootstrap.tar" "$IMAGE@$bootstrap_blob"
+          [ "$(sha256sum "$RUNNER_TEMP/agent-os-bootstrap.tar" | awk '{print $1}')" = "$(jq -r .bootstrap_archive_sha256 "$RUNNER_TEMP/release-record.json")" ]
+          AGENT_OS_SOURCE_MODE=release AGENT_OS_SOURCE_RELEASE_TAG="${GITHUB_REF#refs/tags/}" \
+            AGENT_OS_RELEASE_RECORD_COMMIT="$record_commit" \
+            AGENT_OS_RELEASE_BOOTSTRAP_ARCHIVE="$RUNNER_TEMP/agent-os-bootstrap.tar" \
+            bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/release-source-metadata"
+          [ "$(sha256sum "$RUNNER_TEMP/release-record.json" | awk '{print $1}')" = \
+            "$(sed -n 's/^release_record_sha256=//p' "$RUNNER_TEMP/release-source-metadata")" ]
+          cat "$RUNNER_TEMP/release-source-metadata" >> "$GITHUB_OUTPUT"
+
+      - name: Reserve or recover commit-indexed release candidate
+        if: github.ref == 'refs/heads/main'
+        id: candidate_reservation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          claim_prefix="refs/agent-os/candidate-reservations/$GITHUB_SHA"
+          source_tree_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$GITHUB_SHA" --jq .tree.sha)
+          create_claim() {
+            claim_ref=$1
+            owner_run_id=$2
+            claim_message=$(printf 'agent-os-candidate-reservation-v1\nsource-commit=%s\nowner-run-id=%s' \
+              "$GITHUB_SHA" "$owner_run_id")
+            claim_commit=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/commits" \
+              --raw-field message="$claim_message" --raw-field tree="$source_tree_sha" \
+              --raw-field "parents[]=$GITHUB_SHA" --jq .sha)
+            if gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              --raw-field ref="$claim_ref" --raw-field sha="$claim_commit" \
+              > "$RUNNER_TEMP/candidate-claim-create.json" \
+              2> "$RUNNER_TEMP/candidate-claim-create.err"; then
+              return 0
+            fi
+            if grep -Eiq '422|Reference already exists' "$RUNNER_TEMP/candidate-claim-create.err"; then
+              return 1
+            fi
+            cat "$RUNNER_TEMP/candidate-claim-create.err" >&2
+            exit 1
+          }
+          load_claim() {
+            claim_ref=$1
+            claim_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/${claim_ref#refs/}" --jq .object.sha)
+            gh api "repos/$GITHUB_REPOSITORY/git/commits/$claim_sha" \
+              > "$RUNNER_TEMP/candidate-claim-commit.json"
+            jq -e --arg source "$GITHUB_SHA" --arg tree "$source_tree_sha" \
+              '.tree.sha == $tree and (.parents | length == 1) and .parents[0].sha == $source' \
+              "$RUNNER_TEMP/candidate-claim-commit.json" >/dev/null
+            CLAIM_OWNER=$(jq -r .message "$RUNNER_TEMP/candidate-claim-commit.json" |
+              sed -n 's/^owner-run-id=\([0-9][0-9]*\)$/\1/p')
+            [[ "$CLAIM_OWNER" =~ ^[0-9]+$ ]]
+            expected_message=$(printf 'agent-os-candidate-reservation-v1\nsource-commit=%s\nowner-run-id=%s' \
+              "$GITHUB_SHA" "$CLAIM_OWNER")
+            [ "$(jq -r .message "$RUNNER_TEMP/candidate-claim-commit.json")" = "$expected_message" ]
+            CLAIM_SHA=$claim_sha
+          }
+          load_build_attempt() {
+            owner_run_id=$1
+            expected_claim_sha=$2
+            expected_reservation_digest=$3
+            attempt_ref="refs/agent-os/candidate-build-attempts/$GITHUB_SHA/$owner_run_id"
+            BUILD_ATTEMPT_STATE=
+            if gh api "repos/$GITHUB_REPOSITORY/git/ref/${attempt_ref#refs/}" \
+              > "$RUNNER_TEMP/candidate-build-attempt-ref.json" \
+              2> "$RUNNER_TEMP/candidate-build-attempt-ref.err"; then
+              :
+            else
+              if grep -Eq '^gh: Not Found \(HTTP 404\)$' \
+                "$RUNNER_TEMP/candidate-build-attempt-ref.err"; then
+                BUILD_ATTEMPT_STATE=absent
+                return 0
+              fi
+              cat "$RUNNER_TEMP/candidate-build-attempt-ref.err" >&2
+              echo "::error::candidate build attempt reference is unreadable"
+              exit 1
+            fi
+            attempt_sha=$(jq -er .object.sha "$RUNNER_TEMP/candidate-build-attempt-ref.json") || {
+              echo "::error::candidate build attempt reference metadata is invalid"
+              exit 1
+            }
+            gh api "repos/$GITHUB_REPOSITORY/git/commits/$attempt_sha" \
+              > "$RUNNER_TEMP/candidate-build-attempt-commit.json" || {
+              echo "::error::candidate build attempt commit is unreadable"
+              exit 1
+            }
+            jq -e --arg source_tree "$source_tree_sha" --arg claim "$expected_claim_sha" \
+              '.tree.sha == $source_tree and (.parents | length == 1) and .parents[0].sha == $claim' \
+              "$RUNNER_TEMP/candidate-build-attempt-commit.json" >/dev/null || {
+              echo "::error::candidate build attempt ownership metadata is invalid"
+              exit 1
+            }
+            expected_attempt_message=$(printf 'agent-os-candidate-build-attempt-v1\nsource-commit=%s\nsource-tree=%s\nreservation-digest=%s\nowner-run-id=%s\nclaim-commit=%s' \
+              "$GITHUB_SHA" "$source_tree_sha" "$expected_reservation_digest" "$owner_run_id" "$expected_claim_sha")
+            [ "$(jq -r .message "$RUNNER_TEMP/candidate-build-attempt-commit.json")" = "$expected_attempt_message" ] || {
+              echo "::error::candidate build attempt message is invalid"
+              exit 1
+            }
+            BUILD_ATTEMPT_STATE=attempted
+          }
+          load_latest_claim() {
+            claim_ref="$claim_prefix/initial"
+            load_claim "$claim_ref"
+            CLAIM_OWNERS="|$CLAIM_OWNER|"
+            CLAIM_CHAIN_FILE="$RUNNER_TEMP/candidate-claim-chain.tsv"
+            printf '%s\t%s\n' "$CLAIM_OWNER" "$CLAIM_SHA" > "$CLAIM_CHAIN_FILE"
+            depth=0
+            while [ "$depth" -lt 32 ]; do
+              next_ref="$claim_prefix/recover-$CLAIM_OWNER"
+              if gh api "repos/$GITHUB_REPOSITORY/git/ref/${next_ref#refs/}" \
+                > "$RUNNER_TEMP/candidate-next-claim.json" \
+                2> "$RUNNER_TEMP/candidate-next-claim.err"; then
+                claim_ref=$next_ref
+                load_claim "$claim_ref"
+                case "$CLAIM_OWNERS" in
+                  *"|$CLAIM_OWNER|"*)
+                    echo "::error::candidate reservation recovery chain repeats an owner"
+                    exit 1
+                    ;;
+                esac
+                CLAIM_OWNERS="${CLAIM_OWNERS}${CLAIM_OWNER}|"
+                printf '%s\t%s\n' "$CLAIM_OWNER" "$CLAIM_SHA" >> "$CLAIM_CHAIN_FILE"
+                depth=$((depth + 1))
+                continue
+              fi
+              if grep -Eiq '404|Not Found' "$RUNNER_TEMP/candidate-next-claim.err"; then
+                return 0
+              fi
+              cat "$RUNNER_TEMP/candidate-next-claim.err" >&2
+              exit 1
+            done
+            echo "::error::candidate reservation recovery chain is invalid"
+            exit 1
+          }
+          ensure_build_owner() {
+            load_latest_claim
+            if [ "$CLAIM_OWNER" = "$GITHUB_RUN_ID" ]; then
+              return 0
+            fi
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CLAIM_OWNER" \
+              > "$RUNNER_TEMP/candidate-owner-run.json"
+            jq -e --arg sha "$GITHUB_SHA" --arg repo "$GITHUB_REPOSITORY" \
+              '.status == "completed" and .head_sha == $sha and .event == "push" and
+               .head_branch == "main" and .repository.full_name == $repo' \
+              "$RUNNER_TEMP/candidate-owner-run.json" >/dev/null || {
+              echo "::error::candidate reservation is owned by a live or foreign workflow run"
+              exit 1
+            }
+            recovery_ref="$claim_prefix/recover-$CLAIM_OWNER"
+            echo "::notice::recovering incomplete candidate reservation from run $CLAIM_OWNER"
+            create_claim "$recovery_ref" "$GITHUB_RUN_ID" || true
+            load_latest_claim
+            [ "$CLAIM_OWNER" = "$GITHUB_RUN_ID" ] || {
+              echo "::error::candidate reservation recovery was claimed by another workflow run"
+              exit 1
+            }
+          }
+          validate_artifact_run() {
+            artifact_run_id=$1
+            case "$CLAIM_OWNERS" in
+              *"|$artifact_run_id|"*) ;;
+              *)
+                echo "::error::candidate artifact run is outside the authorized claim chain"
+                exit 1
+                ;;
+            esac
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$artifact_run_id" \
+              > "$RUNNER_TEMP/candidate-artifact-run.json"
+            jq -e --argjson run "$artifact_run_id" --arg sha "$GITHUB_SHA" \
+              --arg repo "$GITHUB_REPOSITORY" '
+              .id == $run and .head_sha == $sha and .event == "push" and
+              .head_branch == "main" and .repository.full_name == $repo and
+              .path == ".github/workflows/agent-os-image.yml"' \
+              "$RUNNER_TEMP/candidate-artifact-run.json" >/dev/null || {
+              echo "::error::candidate artifact run is not an authorized publication workflow"
+              exit 1
+            }
+          }
+          load_exact_build_artifact() {
+            exact_build_owner=$1
+            validate_artifact_run "$exact_build_owner"
+            build_artifact_id=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$exact_build_owner" \
+              '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | .[0].id' \
+              "$RUNNER_TEMP/candidate-build-artifacts.json")
+            rm -rf "$RUNNER_TEMP/candidate-build-artifact"
+            mkdir "$RUNNER_TEMP/candidate-build-artifact"
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$build_artifact_id/zip" \
+              > "$RUNNER_TEMP/candidate-build-artifact.zip"
+            unzip -q "$RUNNER_TEMP/candidate-build-artifact.zip" -d "$RUNNER_TEMP/candidate-build-artifact"
+            jq -e --arg commit '${{ steps.candidate_source.outputs.commit }}' \
+              --arg tree '${{ steps.candidate_source.outputs.tree }}' \
+              --arg reservation "$reservation_digest" --arg repository "$IMAGE" \
+              --argjson owner "$exact_build_owner" '
+              .schema_version == 1 and .commit == $commit and .tree == $tree and
+              .reservation_digest == $reservation and .image_repository == $repository and
+              .owner_run_id == $owner and
+              (.image_digest | test("^sha256:[0-9a-f]{64}$")) and
+              (.oci_archive_sha256 | test("^[0-9a-f]{64}$"))' \
+              "$RUNNER_TEMP/candidate-build-artifact/candidate-build.json" >/dev/null
+            EXACT_BUILD_IMAGE_DIGEST=$(jq -er .image_digest \
+              "$RUNNER_TEMP/candidate-build-artifact/candidate-build.json")
+            EXACT_BUILD_ARCHIVE_SHA=$(jq -er .oci_archive_sha256 \
+              "$RUNNER_TEMP/candidate-build-artifact/candidate-build.json")
+            [ "$(sha256sum "$RUNNER_TEMP/candidate-build-artifact/candidate-image.tar" | awk '{print $1}')" = \
+              "$EXACT_BUILD_ARCHIVE_SHA" ]
+            cp "$RUNNER_TEMP/candidate-build-artifact/candidate-image.tar" \
+              "$RUNNER_TEMP/candidate-image.tar"
+          }
+          create_claim "$claim_prefix/initial" "$GITHUB_RUN_ID" || true
+          load_latest_claim
+          printf '{}\n' > "$RUNNER_TEMP/candidate-reservation-config.json"
+          jq -cnS \
+            --arg commit '${{ steps.candidate_source.outputs.commit }}' \
+            --arg tree '${{ steps.candidate_source.outputs.tree }}' \
+            --arg source '${{ steps.candidate_source.outputs.source_sha256 }}' \
+            '{schema_version:1,commit:$commit,tree:$tree,source_archive_sha256:$source}' \
+            > "$RUNNER_TEMP/candidate-reservation.json"
+          oras blob push --media-type application/vnd.oci.empty.v1+json --descriptor \
+            "$IMAGE" "$RUNNER_TEMP/candidate-reservation-config.json" > "$RUNNER_TEMP/candidate-reservation-config-descriptor.json"
+          oras blob push --media-type application/vnd.akua.agent-os.candidate-reservation.v1+json --descriptor \
+            "$IMAGE" "$RUNNER_TEMP/candidate-reservation.json" > "$RUNNER_TEMP/candidate-reservation-descriptor.json"
+          config_descriptor=$(jq -cS '{mediaType,digest,size}' "$RUNNER_TEMP/candidate-reservation-config-descriptor.json")
+          reservation_descriptor=$(jq -cS '{mediaType,digest,size,annotations:{"org.opencontainers.image.title":"candidate-reservation.json"}}' "$RUNNER_TEMP/candidate-reservation-descriptor.json")
+          jq -cnS --argjson config "$config_descriptor" --argjson reservation "$reservation_descriptor" \
+            '{schemaVersion:2,mediaType:"application/vnd.oci.image.manifest.v1+json",artifactType:"application/vnd.akua.agent-os.candidate-reservation.v1",config:$config,layers:[$reservation]}' \
+            > "$RUNNER_TEMP/candidate-reservation-manifest.json"
+          reservation_digest="sha256:$(sha256sum "$RUNNER_TEMP/candidate-reservation-manifest.json" | awk '{print $1}')"
+          reservation_size=$(wc -c < "$RUNNER_TEMP/candidate-reservation-manifest.json" | tr -d ' ')
+          if oras manifest fetch "$IMAGE@$reservation_digest" > "$RUNNER_TEMP/candidate-reservation-existing.json" 2> "$RUNNER_TEMP/candidate-reservation.err"; then
+            cmp "$RUNNER_TEMP/candidate-reservation-manifest.json" "$RUNNER_TEMP/candidate-reservation-existing.json"
+          elif grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/candidate-reservation.err"; then
+            oras manifest push --descriptor "$IMAGE@$reservation_digest" \
+              "$RUNNER_TEMP/candidate-reservation-manifest.json" > "$RUNNER_TEMP/candidate-reservation-push.json"
+            [ "$(jq -r .digest "$RUNNER_TEMP/candidate-reservation-push.json")" = "$reservation_digest" ]
+          else
+            cat "$RUNNER_TEMP/candidate-reservation.err" >&2
+            exit 1
+          fi
+          oras manifest fetch "$IMAGE@$reservation_digest" > "$RUNNER_TEMP/candidate-reservation-readback.json"
+          cmp "$RUNNER_TEMP/candidate-reservation-manifest.json" "$RUNNER_TEMP/candidate-reservation-readback.json"
+          printf 'reservation_digest=%s\nreservation_size=%s\n' "$reservation_digest" "$reservation_size" >> "$GITHUB_OUTPUT"
+          oras discover --distribution-spec v1.1-referrers-api --artifact-type application/vnd.akua.agent-os.release-candidate.v1 \
+            --format json --depth 1 "$IMAGE@$reservation_digest" > "$RUNNER_TEMP/candidate-reservation-referrers.json"
+          referrer_count=$(jq -er '.referrers | length' "$RUNNER_TEMP/candidate-reservation-referrers.json")
+          if [ "$referrer_count" -eq 0 ]; then
+            artifact_name="agent-os-candidate-record-$GITHUB_SHA"
+            gh api --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$artifact_name&per_page=100" \
+              > "$RUNNER_TEMP/candidate-trusted-artifacts.json"
+            artifact_name="agent-os-candidate-build-$GITHUB_SHA"
+            gh api --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$artifact_name&per_page=100" \
+              > "$RUNNER_TEMP/candidate-build-artifacts.json"
+            chain_state="$RUNNER_TEMP/candidate-claim-chain-state.tsv"
+            : > "$chain_state"
+            while IFS=$'\t' read -r owner claim_sha; do
+              load_build_attempt "$owner" "$claim_sha" "$reservation_digest"
+              record_count=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$owner" \
+                '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | length' \
+                "$RUNNER_TEMP/candidate-trusted-artifacts.json")
+              build_count=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$owner" \
+                '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | length' \
+                "$RUNNER_TEMP/candidate-build-artifacts.json")
+              [ "$record_count" -le 1 ] && [ "$build_count" -le 1 ] || {
+                echo "::error::candidate claim owner has conflicting durable evidence"
+                exit 1
+              }
+              printf '%s\t%s\t%s\t%s\t%s\n' "$owner" "$claim_sha" \
+                "$BUILD_ATTEMPT_STATE" "$record_count" "$build_count" >> "$chain_state"
+            done < "$CLAIM_CHAIN_FILE"
+            decision=$(bin/agent-os-candidate-state.sh "$chain_state")
+            IFS=$'\t' read -r candidate_action artifact_owner paired_build_owner <<EOF
+          $decision
+          EOF
+            case "$candidate_action" in
+              build)
+                artifact_owner=$CLAIM_OWNER
+                build_artifact_owner=$artifact_owner
+                BUILD_ATTEMPT_STATE=absent
+                ;;
+              reuse-record|reuse-build)
+                [[ "$artifact_owner" =~ ^[0-9]+$ ]]
+                [ -z "$paired_build_owner" ]
+                build_artifact_owner=$artifact_owner
+                BUILD_ATTEMPT_STATE=attempted
+                ;;
+              reuse-record-pair)
+                [[ "$artifact_owner" =~ ^[0-9]+$ ]]
+                [[ "$paired_build_owner" =~ ^[0-9]+$ ]]
+                build_artifact_owner=$paired_build_owner
+                BUILD_ATTEMPT_STATE=attempted
+                ;;
+              *)
+                echo "::error::candidate claim-chain decision is invalid"
+                exit 1
+                ;;
+            esac
+            trusted_artifact_count=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$artifact_owner" \
+              '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | length' \
+              "$RUNNER_TEMP/candidate-trusted-artifacts.json")
+            [ "$trusted_artifact_count" -le 1 ] || {
+              echo "::error::candidate reservation has conflicting trusted artifacts"
+              exit 1
+            }
+            build_artifact_count=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$build_artifact_owner" \
+              '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | length' \
+              "$RUNNER_TEMP/candidate-build-artifacts.json")
+            [ "$build_artifact_count" -le 1 ] || {
+              echo "::error::candidate reservation has conflicting exact build evidence"
+              exit 1
+            }
+            if [ "$candidate_action" = reuse-record ] || [ "$candidate_action" = reuse-record-pair ]; then
+              [ "$trusted_artifact_count" -eq 1 ] || exit 1
+              validate_artifact_run "$artifact_owner"
+              trusted_artifact_id=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$artifact_owner" \
+                '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | .[0].id' \
+                "$RUNNER_TEMP/candidate-trusted-artifacts.json")
+              mkdir "$RUNNER_TEMP/candidate-trusted-artifact"
+              gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$trusted_artifact_id/zip" \
+                > "$RUNNER_TEMP/candidate-trusted-artifact.zip"
+              unzip -q "$RUNNER_TEMP/candidate-trusted-artifact.zip" -d "$RUNNER_TEMP/candidate-trusted-artifact"
+              candidate_record_digest="sha256:$(sha256sum "$RUNNER_TEMP/candidate-trusted-artifact/candidate-manifest.json" | awk '{print $1}')"
+              jq -e --arg reservation "$reservation_digest" '
+                .schemaVersion == 2 and
+                .artifactType == "application/vnd.akua.agent-os.release-candidate.v1" and
+                .subject.digest == $reservation and
+                ([.layers[] | select(.mediaType == "application/vnd.akua.agent-os.release-candidate.v1+json")] | length == 1) and
+                ([.layers[] | select(.mediaType == "application/vnd.akua.agent-os.bootstrap.v1+tar" and .annotations["org.opencontainers.image.title"] == "agent-os-bootstrap.tar")] | length == 1)' \
+                "$RUNNER_TEMP/candidate-trusted-artifact/candidate-manifest.json" >/dev/null
+              record_blob=$(jq -er '[.layers[] | select(.mediaType == "application/vnd.akua.agent-os.release-candidate.v1+json")] | .[0].digest' \
+                "$RUNNER_TEMP/candidate-trusted-artifact/candidate-manifest.json")
+              bootstrap_blob=$(jq -er '[.layers[] | select(.mediaType == "application/vnd.akua.agent-os.bootstrap.v1+tar")] | .[0].digest' \
+                "$RUNNER_TEMP/candidate-trusted-artifact/candidate-manifest.json")
+              [ "$record_blob" = "sha256:$(sha256sum "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json" | awk '{print $1}')" ]
+              [ "$bootstrap_blob" = "sha256:$(sha256sum "$RUNNER_TEMP/candidate-trusted-artifact/agent-os-bootstrap.tar" | awk '{print $1}')" ]
+              jq -e \
+                --arg commit '${{ steps.candidate_source.outputs.commit }}' \
+                --arg tree '${{ steps.candidate_source.outputs.tree }}' \
+                --arg source '${{ steps.candidate_source.outputs.source_sha256 }}' \
+                --arg bootstrap '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' \
+                --arg repository "$IMAGE" '
+                .schema_version == 1 and .source_mode == "candidate" and
+                .commit == $commit and .tree == $tree and
+                .source_archive_sha256 == $source and .bootstrap_archive_sha256 == $bootstrap and
+                .image_repository == $repository and
+                (.image_digest | test("^sha256:[0-9a-f]{64}$"))' \
+                "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json" >/dev/null
+              cp "$RUNNER_TEMP/candidate-trusted-artifact/agent-os-bootstrap.tar" image/agent-os-bootstrap.tar
+              image_digest=$(jq -er .image_digest "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
+              bootstrap_sha=$(jq -er .bootstrap_archive_sha256 "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
+              if [ "$candidate_action" = reuse-record-pair ]; then
+                [ "$build_artifact_count" -eq 1 ] || exit 1
+                load_exact_build_artifact "$build_artifact_owner"
+                [ "$EXACT_BUILD_IMAGE_DIGEST" = "$image_digest" ] || {
+                  echo "::error::paired candidate build and record evidence disagree"
+                  exit 1
+                }
+              else
+                [ "$build_artifact_count" -eq 0 ] || exit 1
+              fi
+              ensure_build_owner
+              printf 'build=false\nrecord_artifact=true\ncandidate_record_digest=%s\nimage_digest=%s\nbootstrap_sha256=%s\n' \
+                "$candidate_record_digest" "$image_digest" "$bootstrap_sha" >> "$GITHUB_OUTPUT"
+              echo "::notice::candidate reservation recovered from durable trusted artifact"
+              exit 0
+            fi
+            if [ "$candidate_action" = reuse-build ]; then
+              [ "$build_artifact_count" -eq 1 ] || exit 1
+              load_exact_build_artifact "$artifact_owner"
+              image_digest=$EXACT_BUILD_IMAGE_DIGEST
+              ensure_build_owner
+              printf 'build=false\npublish_image=true\nrecord_artifact=false\nimage_digest=%s\nbootstrap_sha256=%s\n' \
+                "$image_digest" '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' >> "$GITHUB_OUTPUT"
+              echo "::notice::candidate reservation recovered from exact build evidence"
+              exit 0
+            fi
+            [ "$candidate_action" = build ]
+            ensure_build_owner
+            printf 'build=true\nrecord_artifact=false\nbootstrap_sha256=%s\nclaim_sha=%s\nclaim_owner=%s\n' \
+              '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' "$CLAIM_SHA" "$CLAIM_OWNER" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [ "$referrer_count" -eq 1 ] || { echo "::error::candidate reservation has conflicting records"; exit 1; }
+          candidate_record_digest=$(jq -er '.referrers[0].digest' "$RUNNER_TEMP/candidate-reservation-referrers.json")
+          oras manifest fetch "$IMAGE@$candidate_record_digest" > "$RUNNER_TEMP/candidate-recovered-manifest.json"
+          artifact_name="agent-os-candidate-record-$GITHUB_SHA"
+          gh api --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$artifact_name&per_page=100" \
+            > "$RUNNER_TEMP/candidate-trusted-artifacts.json"
+          trusted_artifact_count=$(jq -er --arg sha "$GITHUB_SHA" \
+            '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha)] | length' \
+            "$RUNNER_TEMP/candidate-trusted-artifacts.json")
+          [ "$trusted_artifact_count" -eq 1 ] || {
+            echo "::error::partial candidate reservation requires trusted recovery"
+            exit 1
+          }
+          trusted_artifact_id=$(jq -er --arg sha "$GITHUB_SHA" \
+            '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha)] | .[0].id' \
+            "$RUNNER_TEMP/candidate-trusted-artifacts.json")
+          artifact_run_id=$(jq -er --arg sha "$GITHUB_SHA" \
+            '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha)] | .[0].workflow_run.id' \
+            "$RUNNER_TEMP/candidate-trusted-artifacts.json")
+          validate_artifact_run "$artifact_run_id"
+          mkdir "$RUNNER_TEMP/candidate-trusted-artifact"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$trusted_artifact_id/zip" \
+            > "$RUNNER_TEMP/candidate-trusted-artifact.zip"
+          unzip -q "$RUNNER_TEMP/candidate-trusted-artifact.zip" -d "$RUNNER_TEMP/candidate-trusted-artifact"
+          cmp "$RUNNER_TEMP/candidate-trusted-artifact/candidate-manifest.json" \
+            "$RUNNER_TEMP/candidate-recovered-manifest.json"
+          record_blob=$(jq -er '[.layers[] | select(.mediaType == "application/vnd.akua.agent-os.release-candidate.v1+json")] | select(length == 1) | .[0].digest' "$RUNNER_TEMP/candidate-recovered-manifest.json")
+          bootstrap_blob=$(jq -er '[.layers[] | select(.mediaType == "application/vnd.akua.agent-os.bootstrap.v1+tar" and .annotations["org.opencontainers.image.title"] == "agent-os-bootstrap.tar")] | select(length == 1) | .[0].digest' "$RUNNER_TEMP/candidate-recovered-manifest.json")
+          oras blob fetch --output "$RUNNER_TEMP/candidate-recovered-record.json" "$IMAGE@$record_blob"
+          oras blob fetch --output "$RUNNER_TEMP/candidate-recovered-bootstrap.tar" "$IMAGE@$bootstrap_blob"
+          cmp "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json" "$RUNNER_TEMP/candidate-recovered-record.json"
+          cmp "$RUNNER_TEMP/candidate-trusted-artifact/agent-os-bootstrap.tar" "$RUNNER_TEMP/candidate-recovered-bootstrap.tar"
+          cp "$RUNNER_TEMP/candidate-trusted-artifact/agent-os-bootstrap.tar" image/agent-os-bootstrap.tar
+          image_digest=$(jq -er '.image_digest | select(test("^sha256:[0-9a-f]{64}$"))' "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
+          bootstrap_sha=$(jq -er '.bootstrap_archive_sha256 | select(test("^[0-9a-f]{64}$"))' "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
+          [ "$(sha256sum image/agent-os-bootstrap.tar | awk '{print $1}')" = "$bootstrap_sha" ]
+          printf 'build=false\nrecord_artifact=true\ncandidate_record_digest=%s\nimage_digest=%s\nbootstrap_sha256=%s\n' \
+            "$candidate_record_digest" "$image_digest" "$bootstrap_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Reject legacy candidate coordinates
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -eu
+          legacy_ref="$IMAGE:release-candidate-$GITHUB_SHA"
+          if oras manifest fetch --descriptor "$legacy_ref" > "$RUNNER_TEMP/legacy-candidate.json" 2> "$RUNNER_TEMP/legacy-candidate.err"; then
+            echo "::error::pre-existing release candidate lacks an independently trusted record"
+            exit 1
+          elif grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/legacy-candidate.err"; then
+            :
+          else
+            cat "$RUNNER_TEMP/legacy-candidate.err" >&2
+            exit 1
+          fi
+
+      - name: Claim owner-bound candidate build attempt
+        if: github.ref == 'refs/heads/main' && steps.candidate_reservation.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          claim_sha='${{ steps.candidate_reservation.outputs.claim_sha }}'
+          claim_owner='${{ steps.candidate_reservation.outputs.claim_owner }}'
+          reservation_digest='${{ steps.candidate_reservation.outputs.reservation_digest }}'
+          [[ "$claim_sha" =~ ^[0-9a-f]{40}$ ]]
+          [ "$claim_owner" = "$GITHUB_RUN_ID" ]
+          [[ "$reservation_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          source_tree_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$GITHUB_SHA" --jq .tree.sha)
+          [ "$source_tree_sha" = '${{ steps.candidate_source.outputs.tree }}' ]
+          attempt_ref="refs/agent-os/candidate-build-attempts/$GITHUB_SHA/$GITHUB_RUN_ID"
+          attempt_message=$(printf 'agent-os-candidate-build-attempt-v1\nsource-commit=%s\nsource-tree=%s\nreservation-digest=%s\nowner-run-id=%s\nclaim-commit=%s' \
+            "$GITHUB_SHA" "$source_tree_sha" "$reservation_digest" "$GITHUB_RUN_ID" "$claim_sha")
+          attempt_commit=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/commits" \
+            --raw-field message="$attempt_message" --raw-field tree="$source_tree_sha" \
+            --raw-field "parents[]=$claim_sha" --jq .sha)
+          if ! gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            --raw-field ref="$attempt_ref" --raw-field sha="$attempt_commit" \
+            > "$RUNNER_TEMP/candidate-build-attempt-create.json" \
+            2> "$RUNNER_TEMP/candidate-build-attempt-create.err"; then
+            cat "$RUNNER_TEMP/candidate-build-attempt-create.err" >&2
+            echo "::error::candidate build attempt already exists or could not be reserved; refusing rebuild"
+            exit 1
+          fi
+          readback_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/${attempt_ref#refs/}" --jq .object.sha)
+          [ "$readback_sha" = "$attempt_commit" ]
+          gh api "repos/$GITHUB_REPOSITORY/git/commits/$readback_sha" \
+            > "$RUNNER_TEMP/candidate-build-attempt-readback.json"
+          jq -e --arg tree "$source_tree_sha" --arg claim "$claim_sha" --arg message "$attempt_message" \
+            '.tree.sha == $tree and (.parents | length == 1) and .parents[0].sha == $claim and .message == $message' \
+            "$RUNNER_TEMP/candidate-build-attempt-readback.json" >/dev/null
+
+      - name: Build release candidate once
+        if: github.ref == 'refs/heads/main' && steps.candidate_reservation.outputs.build == 'true'
+        id: candidate_build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          outputs: type=oci,dest=${{ runner.temp }}/candidate-image.tar,oci-mediatypes=true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+          build-args: |
+            AGENT_OS_SOURCE_COMMIT=${{ steps.candidate_source.outputs.commit }}
+            AGENT_OS_SOURCE_TREE=${{ steps.candidate_source.outputs.tree }}
+            AGENT_OS_SOURCE_BRANCH=${{ steps.candidate_source.outputs.branch }}
+            AGENT_OS_SOURCE_ORIGIN=${{ steps.candidate_source.outputs.origin }}
+            AGENT_OS_SOURCE_MODE=${{ steps.candidate_source.outputs.mode }}
+            AGENT_OS_SOURCE_REF=${{ steps.candidate_source.outputs.ref }}
+
+      - name: Prepare exact candidate build evidence
+        if: github.ref == 'refs/heads/main' && steps.candidate_reservation.outputs.build == 'true'
+        run: |
+          set -eu
+          image_digest='${{ steps.candidate_build.outputs.digest }}'
+          [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          archive_sha=$(sha256sum "$RUNNER_TEMP/candidate-image.tar" | awk '{print $1}')
+          jq -cnS \
+            --arg commit '${{ steps.candidate_source.outputs.commit }}' \
+            --arg tree '${{ steps.candidate_source.outputs.tree }}' \
+            --arg reservation '${{ steps.candidate_reservation.outputs.reservation_digest }}' \
+            --arg repository "$IMAGE" --arg image "$image_digest" \
+            --arg archive "$archive_sha" \
+            --argjson owner "$GITHUB_RUN_ID" \
+            '{schema_version:1,commit:$commit,tree:$tree,reservation_digest:$reservation,image_repository:$repository,image_digest:$image,oci_archive_sha256:$archive,owner_run_id:$owner}' \
+            > "$RUNNER_TEMP/candidate-build.json"
+
+      - name: Stage exact candidate build evidence
+        if: github.ref == 'refs/heads/main' && steps.candidate_reservation.outputs.build == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: agent-os-candidate-build-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/candidate-build.json
+            ${{ runner.temp }}/candidate-image.tar
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish exact evidenced candidate image
+        if: github.ref == 'refs/heads/main' && (steps.candidate_reservation.outputs.build == 'true' || steps.candidate_reservation.outputs.publish_image == 'true')
+        env:
+          CANDIDATE_BUILD_DIGEST: ${{ steps.candidate_build.outputs.digest || steps.candidate_reservation.outputs.image_digest }}
+        run: |
+          set -eu
+          image_digest=$CANDIDATE_BUILD_DIGEST
+          [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          archive_sha=$(jq -er .oci_archive_sha256 "$RUNNER_TEMP/candidate-build.json" 2>/dev/null || \
+            jq -er .oci_archive_sha256 "$RUNNER_TEMP/candidate-build-artifact/candidate-build.json")
+          [ "$(sha256sum "$RUNNER_TEMP/candidate-image.tar" | awk '{print $1}')" = "$archive_sha" ]
+          oras cp --from-oci-layout "$RUNNER_TEMP/candidate-image.tar@$image_digest" "$IMAGE"
+          oras manifest fetch "$IMAGE@$image_digest" > "$RUNNER_TEMP/candidate-image-readback.json"
+          [ "sha256:$(sha256sum "$RUNNER_TEMP/candidate-image-readback.json" | awk '{print $1}')" = "$image_digest" ]
+
+      - name: Prepare immutable release candidate record
+        if: github.ref == 'refs/heads/main'
+        id: candidate_record
+        env:
+          CANDIDATE_BUILD_DIGEST: ${{ steps.candidate_build.outputs.digest || steps.candidate_reservation.outputs.image_digest }}
+        run: |
+          set -eu
+          verify_candidate_attestations() {
+            printf '%s' "$platform_manifests" | jq -r '.[].digest' | LC_ALL=C sort > "$RUNNER_TEMP/candidate-platform-digests"
+            : > "$RUNNER_TEMP/candidate-platform-subjects"
+            : > "$RUNNER_TEMP/candidate-sbom-digests"
+            : > "$RUNNER_TEMP/candidate-provenance-digests"
+            jq -r '.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .digest' \
+              "$RUNNER_TEMP/candidate-index.json" > "$RUNNER_TEMP/candidate-attestation-manifests"
+            [ "$(wc -l < "$RUNNER_TEMP/candidate-attestation-manifests" | tr -d ' ')" -eq 2 ]
+            while IFS= read -r manifest_digest; do
+              manifest_file="$RUNNER_TEMP/candidate-attestation-${manifest_digest#sha256:}.json"
+              sbom_file="$RUNNER_TEMP/candidate-sbom-${manifest_digest#sha256:}.json"
+              provenance_file="$RUNNER_TEMP/candidate-provenance-${manifest_digest#sha256:}.json"
+              docker buildx imagetools inspect --raw "$IMAGE@$manifest_digest" > "$manifest_file"
+              subject_digest=$(jq -er --arg manifest "$manifest_digest" '
+                .manifests[] | select(.digest == $manifest)
+                | .annotations["vnd.docker.reference.digest"] | select(test("^sha256:[0-9a-f]{64}$"))' \
+                "$RUNNER_TEMP/candidate-index.json")
+              printf '%s\n' "$subject_digest" >> "$RUNNER_TEMP/candidate-platform-subjects"
+              sbom_digest=$(jq -er '[.layers[] | select(.annotations["in-toto.io/predicate-type"] == "https://spdx.dev/Document")] | select(length == 1) | .[0].digest' "$manifest_file")
+              provenance_digest=$(jq -er '[.layers[] | select(.annotations["in-toto.io/predicate-type"] == "https://slsa.dev/provenance/v0.2")] | select(length == 1) | .[0].digest' "$manifest_file")
+              oras blob fetch --output "$sbom_file" "$IMAGE@$sbom_digest"
+              oras blob fetch --output "$provenance_file" "$IMAGE@$provenance_digest"
+              jq -e --arg subject "${subject_digest#sha256:}" '
+                .predicateType == "https://spdx.dev/Document" and
+                (.subject | length == 1) and .subject[0].digest.sha256 == $subject' \
+                "$sbom_file" >/dev/null || {
+                echo "::error::release candidate SBOM does not bind its exact platform manifest"
+                exit 1
+              }
+              jq -e --arg subject "${subject_digest#sha256:}" \
+                --arg commit '${{ steps.candidate_source.outputs.commit }}' \
+                --arg tree '${{ steps.candidate_source.outputs.tree }}' \
+                --arg branch '${{ steps.candidate_source.outputs.branch }}' \
+                --arg origin '${{ steps.candidate_source.outputs.origin }}' \
+                --arg mode '${{ steps.candidate_source.outputs.mode }}' \
+                --arg ref '${{ steps.candidate_source.outputs.ref }}' '
+                .predicateType == "https://slsa.dev/provenance/v0.2" and
+                (.subject | length == 1) and .subject[0].digest.sha256 == $subject and
+                .predicate.buildType == "https://mobyproject.org/buildkit@v1" and
+                .predicate.invocation.configSource.entryPoint == "Dockerfile" and
+                .predicate.metadata.completeness.parameters == true and
+                .predicate.invocation.parameters.args["build-arg:AGENT_OS_SOURCE_COMMIT"] == $commit and
+                .predicate.invocation.parameters.args["build-arg:AGENT_OS_SOURCE_TREE"] == $tree and
+                .predicate.invocation.parameters.args["build-arg:AGENT_OS_SOURCE_BRANCH"] == $branch and
+                .predicate.invocation.parameters.args["build-arg:AGENT_OS_SOURCE_ORIGIN"] == $origin and
+                .predicate.invocation.parameters.args["build-arg:AGENT_OS_SOURCE_MODE"] == $mode and
+                .predicate.invocation.parameters.args["build-arg:AGENT_OS_SOURCE_REF"] == $ref' \
+                "$provenance_file" >/dev/null || {
+                echo "::error::release candidate image provenance conflicts with the exact protected-main source"
+                exit 1
+              }
+              printf '%s\n' "$sbom_digest" >> "$RUNNER_TEMP/candidate-sbom-digests"
+              printf '%s\n' "$provenance_digest" >> "$RUNNER_TEMP/candidate-provenance-digests"
+            done < "$RUNNER_TEMP/candidate-attestation-manifests"
+            LC_ALL=C sort -o "$RUNNER_TEMP/candidate-platform-subjects" "$RUNNER_TEMP/candidate-platform-subjects"
+            cmp "$RUNNER_TEMP/candidate-platform-digests" "$RUNNER_TEMP/candidate-platform-subjects" || {
+              echo "::error::release candidate attestations do not map one-to-one onto both platforms"
+              exit 1
+            }
+            LC_ALL=C sort -o "$RUNNER_TEMP/candidate-sbom-digests" "$RUNNER_TEMP/candidate-sbom-digests"
+            LC_ALL=C sort -o "$RUNNER_TEMP/candidate-provenance-digests" "$RUNNER_TEMP/candidate-provenance-digests"
+          }
+          actual_image_digest=$CANDIDATE_BUILD_DIGEST
+          [[ "$actual_image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools inspect --raw "$IMAGE@$actual_image_digest" > "$RUNNER_TEMP/candidate-index.json"
+          [ "sha256:$(sha256sum "$RUNNER_TEMP/candidate-index.json" | awk '{print $1}')" = "$actual_image_digest" ]
+          platform_manifests=$(jq -cS '[.manifests[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")) | {platform:(.platform.os + "/" + .platform.architecture),digest,mediaType,size}] | sort_by(.platform)' "$RUNNER_TEMP/candidate-index.json")
+          printf '%s' "$platform_manifests" | jq -e '[.[].platform] == ["linux/amd64","linux/arm64"]' >/dev/null
+          verify_candidate_attestations
+          platform_manifests_sha256=$(printf '%s' "$platform_manifests" | sha256sum | awk '{print $1}')
+          buildkit_outputs=$(jq -cS '[.manifests[] | {digest,mediaType,size,platform,annotations}] | sort_by(.digest)' "$RUNNER_TEMP/candidate-index.json")
+          buildkit_outputs_sha256=$(printf '%s' "$buildkit_outputs" | sha256sum | awk '{print $1}')
+          actual_sbom_sha256=$(sha256sum "$RUNNER_TEMP/candidate-sbom-digests" | awk '{print $1}')
+          actual_provenance_sha256=$(sha256sum "$RUNNER_TEMP/candidate-provenance-digests" | awk '{print $1}')
+          jq -cnS \
+            --arg commit '${{ steps.candidate_source.outputs.commit }}' \
+            --arg tree '${{ steps.candidate_source.outputs.tree }}' \
+            --arg sourceArchive '${{ steps.candidate_source.outputs.source_sha256 }}' \
+            --arg bootstrapArchive '${{ steps.candidate_reservation.outputs.bootstrap_sha256 }}' \
+            --arg package "$(sha256sum tools/agent-os/packages/firstmate/package.k | awk '{print $1}')" \
+            --arg schema "$(sha256sum tools/agent-os/packages/firstmate/inputs.example.yaml | awk '{print $1}')" \
+            --arg quickstart "$(sha256sum docs/kubernetes.md | awk '{print $1}')" \
+            --arg repository "$IMAGE" --arg image "$actual_image_digest" \
+            --argjson platforms "$platform_manifests" --arg platformsSha "$platform_manifests_sha256" \
+            --arg sbom "$actual_sbom_sha256" --arg provenance "$actual_provenance_sha256" \
+            --arg buildkitOutputs "$buildkit_outputs_sha256" \
+            '{schema_version:1,source_mode:"candidate",commit:$commit,tree:$tree,source_archive_sha256:$sourceArchive,bootstrap_archive_sha256:$bootstrapArchive,package_sha256:$package,schema_sha256:$schema,quickstart_sha256:$quickstart,image_repository:$repository,image_digest:$image,platform_manifests:$platforms,platform_manifests_sha256:$platformsSha,sbom_sha256:$sbom,provenance_sha256:$provenance,buildkit_outputs_sha256:$buildkitOutputs}' \
+            > "$RUNNER_TEMP/candidate-record.json"
+          jq -e \
+            --arg commit '${{ steps.candidate_source.outputs.commit }}' --arg tree '${{ steps.candidate_source.outputs.tree }}' \
+            --arg sourceArchive '${{ steps.candidate_source.outputs.source_sha256 }}' \
+            --arg bootstrapArchive '${{ steps.candidate_reservation.outputs.bootstrap_sha256 }}' \
+            --arg package "$(sha256sum tools/agent-os/packages/firstmate/package.k | awk '{print $1}')" \
+            --arg schema "$(sha256sum tools/agent-os/packages/firstmate/inputs.example.yaml | awk '{print $1}')" \
+            --arg quickstart "$(sha256sum docs/kubernetes.md | awk '{print $1}')" \
+            --arg repository "$IMAGE" --arg image "$actual_image_digest" \
+            --argjson platforms "$platform_manifests" --arg platformsSha "$platform_manifests_sha256" \
+            --arg sbom "$actual_sbom_sha256" --arg provenance "$actual_provenance_sha256" \
+            --arg buildkitOutputs "$buildkit_outputs_sha256" \
+            '.schema_version == 1 and .source_mode == "candidate" and .commit == $commit and .tree == $tree and .source_archive_sha256 == $sourceArchive and .bootstrap_archive_sha256 == $bootstrapArchive and .package_sha256 == $package and .schema_sha256 == $schema and .quickstart_sha256 == $quickstart and .image_repository == $repository and .image_digest == $image and .platform_manifests == $platforms and .platform_manifests_sha256 == $platformsSha and .sbom_sha256 == $sbom and .provenance_sha256 == $provenance and .buildkit_outputs_sha256 == $buildkitOutputs' \
+            "$RUNNER_TEMP/candidate-record.json" >/dev/null || {
+            echo "::error::candidate record coordinate already contains different artifacts"
+            exit 1
+          }
+          printf '{}\n' > "$RUNNER_TEMP/candidate-config.json"
+          oras blob push --media-type application/vnd.oci.empty.v1+json --descriptor \
+            "$IMAGE" "$RUNNER_TEMP/candidate-config.json" > "$RUNNER_TEMP/candidate-config-descriptor.json"
+          oras blob push --media-type application/vnd.akua.agent-os.release-candidate.v1+json --descriptor \
+            "$IMAGE" "$RUNNER_TEMP/candidate-record.json" > "$RUNNER_TEMP/candidate-record-descriptor.json"
+          oras blob push --media-type application/vnd.akua.agent-os.bootstrap.v1+tar --descriptor \
+            "$IMAGE" image/agent-os-bootstrap.tar > "$RUNNER_TEMP/candidate-bootstrap-descriptor.json"
+          [ "$(jq -r .digest "$RUNNER_TEMP/candidate-bootstrap-descriptor.json")" = \
+            "sha256:${{ steps.candidate_reservation.outputs.bootstrap_sha256 }}" ]
+          config_descriptor=$(jq -cS '{mediaType,digest,size}' "$RUNNER_TEMP/candidate-config-descriptor.json")
+          record_descriptor=$(jq -cS '{mediaType,digest,size,annotations:{"org.opencontainers.image.title":"candidate-record.json"}}' "$RUNNER_TEMP/candidate-record-descriptor.json")
+          bootstrap_descriptor=$(jq -cS '{mediaType,digest,size,annotations:{"org.opencontainers.image.title":"agent-os-bootstrap.tar"}}' "$RUNNER_TEMP/candidate-bootstrap-descriptor.json")
+          reservation_subject=$(jq -cnS \
+            --arg digest '${{ steps.candidate_reservation.outputs.reservation_digest }}' \
+            --argjson size '${{ steps.candidate_reservation.outputs.reservation_size }}' \
+            '{mediaType:"application/vnd.oci.image.manifest.v1+json",digest:$digest,size:$size}')
+          jq -cnS --argjson config "$config_descriptor" --argjson record "$record_descriptor" \
+            --argjson bootstrap "$bootstrap_descriptor" --argjson subject "$reservation_subject" \
+            '{schemaVersion:2,mediaType:"application/vnd.oci.image.manifest.v1+json",artifactType:"application/vnd.akua.agent-os.release-candidate.v1",subject:$subject,config:$config,layers:[$record,$bootstrap]}' \
+            > "$RUNNER_TEMP/candidate-manifest.json"
+          candidate_record_digest="sha256:$(sha256sum "$RUNNER_TEMP/candidate-manifest.json" | awk '{print $1}')"
+          if [ -d "$RUNNER_TEMP/candidate-trusted-artifact" ]; then
+            cmp "$RUNNER_TEMP/candidate-record.json" "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json"
+            cmp "$RUNNER_TEMP/candidate-manifest.json" "$RUNNER_TEMP/candidate-trusted-artifact/candidate-manifest.json"
+            cmp image/agent-os-bootstrap.tar "$RUNNER_TEMP/candidate-trusted-artifact/agent-os-bootstrap.tar"
+          fi
+          cp image/agent-os-bootstrap.tar "$RUNNER_TEMP/agent-os-bootstrap.tar"
+          printf 'candidate_record_digest=%s\nimage_digest=%s\n' "$candidate_record_digest" "$actual_image_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Stage trusted candidate record evidence
+        if: github.ref == 'refs/heads/main' && steps.candidate_reservation.outputs.record_artifact != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: agent-os-candidate-record-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/candidate-record.json
+            ${{ runner.temp }}/candidate-manifest.json
+            ${{ runner.temp }}/agent-os-bootstrap.tar
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish immutable release candidate record
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -eu
+          candidate_record_digest='${{ steps.candidate_record.outputs.candidate_record_digest }}'
+          if oras manifest fetch "$IMAGE@$candidate_record_digest" > "$RUNNER_TEMP/candidate-existing-manifest.json" 2> "$RUNNER_TEMP/candidate-existing-manifest.err"; then
+            cmp "$RUNNER_TEMP/candidate-manifest.json" "$RUNNER_TEMP/candidate-existing-manifest.json" || {
+              echo "::error::candidate record coordinate already contains different artifacts"
+              exit 1
+            }
+          elif grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/candidate-existing-manifest.err"; then
+            oras manifest push --descriptor "$IMAGE@$candidate_record_digest" \
+              "$RUNNER_TEMP/candidate-manifest.json" > "$RUNNER_TEMP/candidate-push.json"
+            [ "$(jq -r .digest "$RUNNER_TEMP/candidate-push.json")" = "$candidate_record_digest" ]
+          else
+            cat "$RUNNER_TEMP/candidate-existing-manifest.err" >&2
+            exit 1
+          fi
+          oras manifest fetch "$IMAGE@$candidate_record_digest" > "$RUNNER_TEMP/candidate-readback-manifest.json"
+          cmp "$RUNNER_TEMP/candidate-manifest.json" "$RUNNER_TEMP/candidate-readback-manifest.json"
+          record_blob_digest=$(jq -er '[.layers[] | select(.mediaType == "application/vnd.akua.agent-os.release-candidate.v1+json")] | select(length == 1) | .[0].digest' "$RUNNER_TEMP/candidate-readback-manifest.json")
+          oras blob fetch --output "$RUNNER_TEMP/candidate-record-readback.json" "$IMAGE@$record_blob_digest"
+          cmp "$RUNNER_TEMP/candidate-record.json" "$RUNNER_TEMP/candidate-record-readback.json"
+          oras discover --distribution-spec v1.1-referrers-api --artifact-type application/vnd.akua.agent-os.release-candidate.v1 \
+            --format json --depth 1 "$IMAGE@${{ steps.candidate_reservation.outputs.reservation_digest }}" > "$RUNNER_TEMP/candidate-final-referrers.json"
+          jq -e --arg digest "$candidate_record_digest" '.referrers | length == 1 and .[0].digest == $digest' \
+            "$RUNNER_TEMP/candidate-final-referrers.json" >/dev/null || {
+            echo "::error::candidate reservation does not resolve to exactly one verified record"
+            exit 1
+          }
+
+      - name: Prepare protected-main source
+        if: github.ref == 'refs/heads/main'
+        id: main_source
+        run: |
+          set -eu
+          bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/main-source-metadata"
+          cat "$RUNNER_TEMP/main-source-metadata" >> "$GITHUB_OUTPUT"
+
+      - name: Compute main image tags
+        if: github.ref == 'refs/heads/main'
         id: metadata
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
         with:
           images: ${{ env.IMAGE }}
           tags: |
             type=sha,format=long
             type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=tag
 
-      - name: Build and optionally publish
+      - name: Build and publish
+        if: github.ref == 'refs/heads/main'
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: mode=max
           sbom: true
+          build-args: |
+            AGENT_OS_SOURCE_COMMIT=${{ steps.main_source.outputs.commit }}
+            AGENT_OS_SOURCE_TREE=${{ steps.main_source.outputs.tree }}
+            AGENT_OS_SOURCE_BRANCH=${{ steps.main_source.outputs.branch }}
+            AGENT_OS_SOURCE_ORIGIN=${{ steps.main_source.outputs.origin }}
+            AGENT_OS_SOURCE_MODE=${{ steps.main_source.outputs.mode }}
+            AGENT_OS_SOURCE_REF=${{ steps.main_source.outputs.ref }}
 
-      - name: Record published image digest
-        if: github.event_name != 'pull_request'
+      - name: Promote exact verified release candidate
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
+          set -eu
+          release_tag=${GITHUB_REF#refs/tags/}
+          candidate_record_digest=$(jq -er '.candidate_record_digest' "$RUNNER_TEMP/release-record.json")
+          oras manifest fetch "$IMAGE@$candidate_record_digest" > "$RUNNER_TEMP/release-candidate-manifest.json"
+          [ "sha256:$(sha256sum "$RUNNER_TEMP/release-candidate-manifest.json" | awk '{print $1}')" = "$candidate_record_digest" ]
+          candidate_record_blob=$(jq -er '
+            select(.schemaVersion == 2 and .artifactType == "application/vnd.akua.agent-os.release-candidate.v1")
+            | [.layers[] | select(.mediaType == "application/vnd.akua.agent-os.release-candidate.v1+json")]
+            | select(length == 1) | .[0].digest' \
+            "$RUNNER_TEMP/release-candidate-manifest.json")
+          oras blob fetch --output "$RUNNER_TEMP/release-candidate-record.json" "$IMAGE@$candidate_record_blob"
+          jq -cS '{schema_version,source_mode,commit,tree,source_archive_sha256,bootstrap_archive_sha256,package_sha256,schema_sha256,quickstart_sha256,image_repository,image_digest,platform_manifests,platform_manifests_sha256,sbom_sha256,provenance_sha256,buildkit_outputs_sha256}' \
+            "$RUNNER_TEMP/release-record.json" > "$RUNNER_TEMP/expected-candidate-record.json"
+          jq -cS . "$RUNNER_TEMP/release-candidate-record.json" > "$RUNNER_TEMP/actual-candidate-record.json"
+          cmp "$RUNNER_TEMP/expected-candidate-record.json" "$RUNNER_TEMP/actual-candidate-record.json"
+          RELEASE_DIGEST=$(jq -er '.image_digest' "$RUNNER_TEMP/release-record.json")
+          docker buildx imagetools inspect --raw "$IMAGE@$RELEASE_DIGEST" > "$RUNNER_TEMP/published-index.json"
+          [ "sha256:$(sha256sum "$RUNNER_TEMP/published-index.json" | awk '{print $1}')" = "$RELEASE_DIGEST" ]
+          actual_platforms=$(jq -cS '[.manifests[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")) | {platform:(.platform.os + "/" + .platform.architecture),digest,mediaType,size}] | sort_by(.platform)' "$RUNNER_TEMP/published-index.json")
+          [ "$actual_platforms" = "$(jq -cS '.platform_manifests' "$RUNNER_TEMP/release-record.json")" ]
+          [ "$(printf '%s' "$actual_platforms" | sha256sum | awk '{print $1}')" = "$(jq -r .platform_manifests_sha256 "$RUNNER_TEMP/release-record.json")" ]
+          actual_buildkit_outputs=$(jq -cS '[.manifests[] | {digest,mediaType,size,platform,annotations}] | sort_by(.digest)' "$RUNNER_TEMP/published-index.json")
+          [ "$(printf '%s' "$actual_buildkit_outputs" | sha256sum | awk '{print $1}')" = "$(jq -r .buildkit_outputs_sha256 "$RUNNER_TEMP/release-record.json")" ]
+          verify_published_attestations() {
+            printf '%s' "$actual_platforms" | jq -r '.[].digest' | LC_ALL=C sort > "$RUNNER_TEMP/published-platform-digests"
+            : > "$RUNNER_TEMP/published-platform-subjects"
+            : > "$RUNNER_TEMP/published-sbom-digests"
+            : > "$RUNNER_TEMP/published-provenance-digests"
+            jq -r '.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .digest' \
+              "$RUNNER_TEMP/published-index.json" > "$RUNNER_TEMP/published-attestation-manifests"
+            [ "$(wc -l < "$RUNNER_TEMP/published-attestation-manifests" | tr -d ' ')" -eq 2 ]
+            while IFS= read -r manifest_digest; do
+              manifest_file="$RUNNER_TEMP/published-attestation-${manifest_digest#sha256:}.json"
+              sbom_file="$RUNNER_TEMP/published-sbom-${manifest_digest#sha256:}.json"
+              provenance_file="$RUNNER_TEMP/published-provenance-${manifest_digest#sha256:}.json"
+              docker buildx imagetools inspect --raw "$IMAGE@$manifest_digest" > "$manifest_file"
+              subject_digest=$(jq -er --arg manifest "$manifest_digest" '
+                .manifests[] | select(.digest == $manifest)
+                | .annotations["vnd.docker.reference.digest"] | select(test("^sha256:[0-9a-f]{64}$"))' \
+                "$RUNNER_TEMP/published-index.json")
+              printf '%s\n' "$subject_digest" >> "$RUNNER_TEMP/published-platform-subjects"
+              sbom_digest=$(jq -er '[.layers[] | select(.annotations["in-toto.io/predicate-type"] == "https://spdx.dev/Document")] | select(length == 1) | .[0].digest' "$manifest_file")
+              provenance_digest=$(jq -er '[.layers[] | select(.annotations["in-toto.io/predicate-type"] == "https://slsa.dev/provenance/v0.2")] | select(length == 1) | .[0].digest' "$manifest_file")
+              oras blob fetch --output "$sbom_file" "$IMAGE@$sbom_digest"
+              oras blob fetch --output "$provenance_file" "$IMAGE@$provenance_digest"
+              jq -e --arg subject "${subject_digest#sha256:}" '
+                .predicateType == "https://spdx.dev/Document" and
+                (.subject | length == 1) and .subject[0].digest.sha256 == $subject' "$sbom_file" >/dev/null
+              jq -e --arg subject "${subject_digest#sha256:}" '
+                .predicateType == "https://slsa.dev/provenance/v0.2" and
+                (.subject | length == 1) and .subject[0].digest.sha256 == $subject' "$provenance_file" >/dev/null
+              printf '%s\n' "$sbom_digest" >> "$RUNNER_TEMP/published-sbom-digests"
+              printf '%s\n' "$provenance_digest" >> "$RUNNER_TEMP/published-provenance-digests"
+            done < "$RUNNER_TEMP/published-attestation-manifests"
+            LC_ALL=C sort -o "$RUNNER_TEMP/published-platform-subjects" "$RUNNER_TEMP/published-platform-subjects"
+            cmp "$RUNNER_TEMP/published-platform-digests" "$RUNNER_TEMP/published-platform-subjects"
+            LC_ALL=C sort -o "$RUNNER_TEMP/published-sbom-digests" "$RUNNER_TEMP/published-sbom-digests"
+            LC_ALL=C sort -o "$RUNNER_TEMP/published-provenance-digests" "$RUNNER_TEMP/published-provenance-digests"
+          }
+          verify_published_attestations
+          actual_sbom_sha256=$(sha256sum "$RUNNER_TEMP/published-sbom-digests" | awk '{print $1}')
+          actual_provenance_sha256=$(sha256sum "$RUNNER_TEMP/published-provenance-digests" | awk '{print $1}')
+          [ "$actual_sbom_sha256" = "$(jq -r .sbom_sha256 "$RUNNER_TEMP/release-record.json")" ]
+          [ "$actual_provenance_sha256" = "$(jq -r .provenance_sha256 "$RUNNER_TEMP/release-record.json")" ]
+          if oras manifest fetch --descriptor "$IMAGE:$release_tag" > "$RUNNER_TEMP/release-tag-descriptor.json" 2> "$RUNNER_TEMP/release-tag.err"; then
+            echo "::error::release registry tag coordinate already exists"
+            exit 1
+          elif grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/release-tag.err"; then
+            :
+          else
+            cat "$RUNNER_TEMP/release-tag.err" >&2
+            exit 1
+          fi
+          {
+            echo '### Agent OS release'
+            echo
+            echo "Canonical install digest: \`$IMAGE@$RELEASE_DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record protected-main publication
+        if: github.ref == 'refs/heads/main'
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -eu
           {
             echo '### Agent OS image'
             echo
-            echo "Digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "Digest: \`$BUILD_DIGEST\`"
+            echo "Release candidate: \`${{ steps.candidate_record.outputs.image_digest || steps.candidate_reservation.outputs.image_digest }}\`"
+            echo "Candidate record: \`${{ steps.candidate_record.outputs.candidate_record_digest || steps.candidate_reservation.outputs.candidate_record_digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"

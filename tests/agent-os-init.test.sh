@@ -6,19 +6,26 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 TMP=$(fm_test_tmproot agent-os-init)
-mkdir -p "$TMP/source/bin" "$TMP/persistent/.local/bin" "$TMP/persistent/usr-local/bin"
-printf 'baseline\n' > "$TMP/source/bin/baseline"
-printf 'runtime\n' > "$TMP/persistent/usr-local/bin/runtime-added"
+mkdir -p "$TMP/image" "$TMP/persistent/.local/bin"
+printf 'image-manifest\n' > "$TMP/image/manifest"
+(cd "$TMP/image" && sha256sum manifest > manifest.sha256)
 
-AGENT_OS_IMAGE_USR_LOCAL="$TMP/source" \
-AGENT_OS_PERSISTENT_ROOT="$TMP/persistent" \
-  "$ROOT/bin/agent-os-init.sh"
+AGENT_OS_IMAGE_MANIFEST="$TMP/image/manifest" \
+AGENT_OS_IMAGE_MANIFEST_SIGNATURE="$TMP/image/manifest.sha256" \
+AGENT_OS_PERSISTENT_ROOT="$TMP/persistent" "$ROOT/bin/agent-os-init.sh"
 
-assert_grep baseline "$TMP/persistent/usr-local/bin/baseline" "initializer must seed image tools"
-assert_grep runtime "$TMP/persistent/usr-local/bin/runtime-added" "initializer must preserve runtime tools"
-
-for directory in .config .cache .local/bin .local/share .bun .cargo usr-local; do
+for directory in .config .cache .local/bin .local/share .bun .cargo; do
   [ -d "$TMP/persistent/$directory" ] || fail "initializer must create persistent $directory"
 done
+assert_grep image-manifest "$TMP/persistent/.config/agent-os/previous-image-usr-local.manifest" \
+  "initializer must persist authenticated image ownership provenance"
 
-pass "initializer preserves image and runtime-installed tools"
+mkdir -p "$TMP/ambiguous/usr-local/bin"
+printf 'unknown\n' > "$TMP/ambiguous/usr-local/bin/tool"
+if AGENT_OS_IMAGE_MANIFEST="$TMP/image/manifest" \
+  AGENT_OS_IMAGE_MANIFEST_SIGNATURE="$TMP/image/manifest.sha256" \
+  AGENT_OS_PERSISTENT_ROOT="$TMP/ambiguous" "$ROOT/bin/agent-os-init.sh" >/dev/null 2>&1; then
+  fail "initializer must reject ambiguous legacy /usr/local ownership"
+fi
+
+pass "initializer separates immutable image tools from persistent user tools"
