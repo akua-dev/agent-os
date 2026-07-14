@@ -2,6 +2,20 @@
 
 export AGENT_OS_BOUND_PATH AGENT_OS_BOUND_TEST_FALLBACK_ACTIVE
 AGENT_OS_BOUND_TEST_FALLBACK_ACTIVE=false
+AGENT_OS_BOUND_DIR_HANDLES=()
+
+agent_os_register_bound_dir() {
+  AGENT_OS_BOUND_DIR_HANDLES+=("$1")
+}
+
+agent_os_bound_dir_is_open() {
+  local candidate=$1 bound
+  [ -d "$candidate" ] || return 1
+  for bound in "${AGENT_OS_BOUND_DIR_HANDLES[@]}"; do
+    [ "$candidate" = "$bound" ] && return 0
+  done
+  return 1
+}
 
 agent_os_open_bound_dir() {
   local dir=$1 fd fd_root
@@ -14,11 +28,13 @@ agent_os_open_bound_dir() {
       return 1
     }
     AGENT_OS_BOUND_PATH=$fd_root/$fd
+    agent_os_register_bound_dir "$AGENT_OS_BOUND_PATH"
     return 0
   elif [ "${AGENT_OS_TEST_BOUND_PATHS:-}" = true ]; then
     exec {fd}<&-
     AGENT_OS_BOUND_PATH=$(cd "$dir" && pwd -P)
     AGENT_OS_BOUND_TEST_FALLBACK_ACTIVE=true
+    agent_os_register_bound_dir "$AGENT_OS_BOUND_PATH"
     return 0
   else
     exec {fd}<&-
@@ -34,6 +50,9 @@ agent_os_bound_dir_matches() {
 agent_os_bound_git() {
   local git_dir=$1 common_dir=$2 work_tree=$3
   shift 3
+  agent_os_bound_dir_is_open "$git_dir" || return 1
+  agent_os_bound_dir_is_open "$common_dir" || return 1
+  agent_os_bound_dir_is_open "$work_tree" || return 1
   trusted_git --agent-os-common-dir "$common_dir" \
     --git-dir="$git_dir" --work-tree="$work_tree" "$@"
 }

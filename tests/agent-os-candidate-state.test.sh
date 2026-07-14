@@ -29,66 +29,78 @@ expect_refusal() {
   fi
 }
 
-write_chain "$OWNER_A\t$CLAIM_A\tabsent\tabsent"
+write_chain "$OWNER_A\t$CLAIM_A\tabsent\t0\t0"
 expect_decision build
 
 write_chain \
-  "$OWNER_A\t$CLAIM_A\tattempted\texact-build" \
-  "$OWNER_B\t$CLAIM_B\tabsent\tabsent"
+  "$OWNER_A\t$CLAIM_A\tattempted\t0\t1" \
+  "$OWNER_B\t$CLAIM_B\tabsent\t0\t0"
 expect_decision $'reuse-build\t'"$OWNER_A"
 
 write_chain \
-  "$OWNER_A\t$CLAIM_A\tattempted\texact-record" \
-  "$OWNER_B\t$CLAIM_B\tabsent\tabsent" \
-  "$OWNER_C\t$CLAIM_C\tabsent\tabsent"
+  "$OWNER_A\t$CLAIM_A\tattempted\t1\t0" \
+  "$OWNER_B\t$CLAIM_B\tabsent\t0\t0" \
+  "$OWNER_C\t$CLAIM_C\tabsent\t0\t0"
 expect_decision $'reuse-record\t'"$OWNER_A"
 
+write_chain \
+  "$OWNER_A\t$CLAIM_A\tattempted\t1\t1" \
+  "$OWNER_B\t$CLAIM_B\tabsent\t0\t0"
+expect_decision $'reuse-record-pair\t'"$OWNER_A"
+
 builds=0
-write_chain "$OWNER_A\t$CLAIM_A\tabsent\tabsent"
+write_chain "$OWNER_A\t$CLAIM_A\tabsent\t0\t0"
 decision=$("$STATE" "$TMP/chain.tsv") || fail "initial claim did not authorize its build"
 [ "$decision" = build ] && builds=$((builds + 1))
 write_chain \
-  "$OWNER_A\t$CLAIM_A\tattempted\texact-build" \
-  "$OWNER_B\t$CLAIM_B\tabsent\tabsent"
+  "$OWNER_A\t$CLAIM_A\tattempted\t0\t1" \
+  "$OWNER_B\t$CLAIM_B\tabsent\t0\t0"
 decision=$("$STATE" "$TMP/chain.tsv") || fail "handoff did not reuse ancestor evidence"
 [ "$decision" = build ] && builds=$((builds + 1))
 write_chain \
-  "$OWNER_A\t$CLAIM_A\tattempted\texact-build" \
-  "$OWNER_B\t$CLAIM_B\tabsent\tabsent" \
-  "$OWNER_C\t$CLAIM_C\tabsent\tabsent"
-decision=$("$STATE" "$TMP/chain.tsv") || fail "second handoff did not reuse ancestor evidence"
+  "$OWNER_A\t$CLAIM_A\tattempted\t1\t1" \
+  "$OWNER_B\t$CLAIM_B\tabsent\t0\t0" \
+  "$OWNER_C\t$CLAIM_C\tabsent\t0\t0"
+decision=$("$STATE" "$TMP/chain.tsv") || fail "second handoff did not prefer paired ancestor evidence"
 [ "$decision" = build ] && builds=$((builds + 1))
+[ "$decision" = $'reuse-record-pair\t'"$OWNER_A" ] || \
+  fail "second handoff did not reuse paired ancestor evidence"
 [ "$builds" -eq 1 ] || fail "claim-chain classifier authorized $builds builds"
 
 write_chain \
-  "$OWNER_A\t$CLAIM_A\tattempted\tabsent" \
-  "$OWNER_B\t$CLAIM_B\tabsent\tabsent"
+  "$OWNER_A\t$CLAIM_A\tattempted\t0\t0" \
+  "$OWNER_B\t$CLAIM_B\tabsent\t0\t0"
 expect_refusal
 
 write_chain \
-  "$OWNER_A\t$CLAIM_A\tattempted\texact-build" \
-  "$OWNER_B\t$CLAIM_B\tattempted\texact-build"
+  "$OWNER_A\t$CLAIM_A\tattempted\t0\t1" \
+  "$OWNER_B\t$CLAIM_B\tattempted\t0\t1"
 expect_refusal
 
 write_chain \
-  "$OWNER_A\t$CLAIM_A\tabsent\texact-build" \
-  "$OWNER_B\t$CLAIM_B\tabsent\tabsent"
+  "$OWNER_A\t$CLAIM_A\tabsent\t0\t1" \
+  "$OWNER_B\t$CLAIM_B\tabsent\t0\t0"
 expect_refusal
 
 for state in corrupt mismatched unreadable metadata-read-error partial ambiguous; do
-  write_chain "$OWNER_A\t$CLAIM_A\t$state\tabsent"
+  write_chain "$OWNER_A\t$CLAIM_A\t$state\t0\t0"
   expect_refusal
-  write_chain "$OWNER_A\t$CLAIM_A\tattempted\t$state"
+  write_chain "$OWNER_A\t$CLAIM_A\tattempted\t$state\t0"
+  expect_refusal
+done
+
+for counts in '2\t0' '0\t2' '2\t2'; do
+  write_chain "$OWNER_A\t$CLAIM_A\tattempted\t$counts"
   expect_refusal
 done
 
 write_chain \
-  "$OWNER_A\t$CLAIM_A\tabsent\tabsent" \
-  "$OWNER_A\t$CLAIM_B\tabsent\tabsent"
+  "$OWNER_A\t$CLAIM_A\tabsent\t0\t0" \
+  "$OWNER_A\t$CLAIM_B\tabsent\t0\t0"
 expect_refusal
 write_chain \
-  "$OWNER_A\t$CLAIM_A\tabsent\tabsent" \
-  "$OWNER_B\t$CLAIM_A\tabsent\tabsent"
+  "$OWNER_A\t$CLAIM_A\tabsent\t0\t0" \
+  "$OWNER_B\t$CLAIM_A\tabsent\t0\t0"
 expect_refusal
 
 pass "candidate claim-chain classifier permits one build and ancestor reuse only"

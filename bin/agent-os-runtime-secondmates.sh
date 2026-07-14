@@ -30,7 +30,7 @@ trusted_git() {
   if [ "${1:-}" = --agent-os-common-dir ]; then
     common_dir=${2:?bound common Git directory is required}
     shift 2
-    [ -d "$common_dir" ] && [ ! -L "$common_dir" ] || return 1
+    agent_os_bound_dir_is_open "$common_dir" || return 1
   fi
   if [ -n "$common_dir" ]; then
     env -i HOME=/nonexistent PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C \
@@ -110,6 +110,7 @@ acquire_primary_ownership_lock() {
 
 validate_treehouse_lease() {
   local id=$1 state_home=$2 home=$3 state state_json entry_count index entry_home canonical_count
+  VALIDATED_TREEHOUSE_NAME=
   state=$TREEHOUSE_POOL/treehouse-state.json
   [ "$TREEHOUSE_LOCK_FILE" -ef "$TREEHOUSE_LOCK_HANDLE" ] || return 1
   [ -r "$state" ] && [ -f "$state" ] && [ ! -L "$state" ] || return 1
@@ -122,7 +123,8 @@ validate_treehouse_lease() {
     ([.worktrees[] | select(
       .path == $home and .leased == true and .lease_holder == $holder and
       ((.destroying // false) == false) and ((.owner_pid // 0) == 0) and
-      ((.owner_started_at // 0) == 0) and (.name | type == "string" and length > 0) and
+      ((.owner_started_at // 0) == 0) and
+      (.name | type == "string" and test("^(?!\\.{1,2}$)[^/\\t\\r\\n]+$")) and
       (.leased_at | type == "string" and length > 0)
     )] | length == 1)' <<< "$state_json" >/dev/null || return 1
   entry_count=$(jq -er '.worktrees | length' <<< "$state_json") || return 1
@@ -134,7 +136,13 @@ validate_treehouse_lease() {
     [ "$entry_home" != "$home" ] || canonical_count=$((canonical_count + 1))
     index=$((index + 1))
   done
-  [ "$canonical_count" -eq 1 ]
+  [ "$canonical_count" -eq 1 ] || return 1
+  VALIDATED_TREEHOUSE_NAME=$(jq -er --arg home "$state_home" --arg holder "$id" '
+    [.worktrees[] | select(
+      .path == $home and .leased == true and .lease_holder == $holder and
+      ((.destroying // false) == false) and ((.owner_pid // 0) == 0) and
+      ((.owner_started_at // 0) == 0)
+    )] | select(length == 1) | .[0].name' <<< "$state_json")
 }
 
 resolve_git_metadata() {
@@ -207,7 +215,8 @@ validate_git_binding() {
 
 validate_bound_git_binding() {
   local root=$1 bound_home=$2 bound_git=$3 bound_common=$4 bound_source=$5 linked=$6 source_key=$7
-  local pointer pointer_path backlink backlink_path common common_path matches source_key policy_commit policy_sha
+  local expected_treehouse_name=$8 pointer pointer_path backlink backlink_path common common_path
+  local expected_git policy_commit policy_sha
   [ "$PRIMARY_OWNERSHIP_LOCK_FILE" -ef "$PRIMARY_OWNERSHIP_LOCK_HANDLE" ] || return 1
   if [ "$linked" = false ]; then
     [ -d "$bound_home/.git" ] && [ ! -L "$bound_home/.git" ] || return 1
@@ -241,12 +250,10 @@ validate_bound_git_binding() {
     *) common_path="$bound_git/$common" ;;
   esac
   [ "$common_path" -ef "$bound_common" ] || return 1
-  matches=0
-  for pointer_path in "$bound_common"/worktrees/*; do
-    [ -d "$pointer_path" ] || continue
-    [ "$pointer_path" -ef "$bound_git" ] && matches=$((matches + 1))
-  done
-  [ "$matches" -eq 1 ] || return 1
+  case "$expected_treehouse_name" in ''|.|..|*/*|*$'\t'*|*$'\r'*|*$'\n'*) return 1 ;; esac
+  expected_git=$bound_common/worktrees/$expected_treehouse_name
+  [ -d "$expected_git" ] && [ ! -L "$expected_git" ] || return 1
+  [ "$expected_git" -ef "$bound_git" ] || return 1
   [ "$bound_source/.git" -ef "$bound_common" ] || return 1
   validate_policy "$bound_common/agent-os-runtime-source" || return 1
   policy_commit=$(sed -n 's/^commit=//p' "$bound_common/agent-os-runtime-source")
@@ -437,6 +444,7 @@ acquire_primary_ownership_lock || {
 validated_ids=()
 validated_homes=()
 treehouse_homes=()
+treehouse_names=()
 ownership_modes=()
 git_dirs=()
 common_dirs=()
@@ -453,6 +461,7 @@ for index in "${!homes[@]}"; do
   home=${homes[$index]}
   proof=${proofs[$index]}
   treehouse_home=$home
+  treehouse_name=
   validate_secondmate_home "$id" "$home" || {
     echo "error: invalid secondmate home for $id: $VALIDATION_ERROR" >&2
     exit 2
@@ -507,11 +516,18 @@ for index in "${!homes[@]}"; do
       echo "error: secondmate Treehouse lease holder is not exact: $id" >&2
       exit 2
     }
+    treehouse_name=$VALIDATED_TREEHOUSE_NAME
   fi
   resolve_git_metadata "$home" || { echo "error: secondmate Git metadata is invalid: $home" >&2; exit 2; }
   original_git_dir=$RESOLVED_GIT_DIR
   original_common_dir=$RESOLVED_COMMON_DIR
   if [ "$ownership_mode" = treehouse ]; then
+    expected_git_dir=$original_common_dir/worktrees/$treehouse_name
+    [ -d "$expected_git_dir" ] && [ ! -L "$expected_git_dir" ] && \
+      [ "$expected_git_dir" -ef "$original_git_dir" ] || {
+      echo "error: secondmate Treehouse lease is not bound to its Git metadata: $id" >&2
+      exit 2
+    }
     original_source_dir=$(cd "$original_common_dir/.." && pwd -P) || exit 2
     runtime_root=$(cd "$FM_HOME/runtime-sources" && pwd -P) || exit 2
     case "$original_source_dir" in "$runtime_root"/*) ;; *) exit 2 ;; esac
@@ -556,7 +572,7 @@ for index in "${!homes[@]}"; do
   fi
   validate_bound_git_binding "$home" "$bound_home" "$bound_git_dir" \
     "$bound_common_dir" "$bound_source_dir" "$([ "$ownership_mode" = treehouse ] && printf true || printf false)" \
-    "$source_key" || {
+    "$source_key" "$treehouse_name" || {
     echo "error: bound secondmate Git ownership is invalid: $home" >&2
     exit 2
   }
@@ -625,6 +641,7 @@ for index in "${!homes[@]}"; do
   validated_ids+=("$id")
   validated_homes+=("$home")
   treehouse_homes+=("$treehouse_home")
+  treehouse_names+=("$treehouse_name")
   ownership_modes+=("$ownership_mode")
   git_dirs+=("$original_git_dir")
   common_dirs+=("$original_common_dir")
@@ -640,8 +657,10 @@ done
 assert_secondmate_binding() {
   local id=$1 ownership_mode=$2 treehouse_home=$3 home=$4 git_dir=$5 common_dir=$6 source_dir=$7
   local bound_home=$8 bound_config=$9 bound_git=${10} bound_common=${11} bound_source=${12}
+  local expected_treehouse_name=${13}
   if [ "$ownership_mode" = treehouse ]; then
     validate_treehouse_lease "$id" "$treehouse_home" "$home" || return 1
+    [ "$VALIDATED_TREEHOUSE_NAME" = "$expected_treehouse_name" ] || return 1
   else
     validate_primary_standalone_proof "$id" "$home" || return 1
   fi
@@ -655,12 +674,12 @@ assert_secondmate_binding() {
   [ "$RESOLVED_COMMON_DIR" -ef "$bound_common" ] || return 1
   validate_bound_git_binding "$home" "$bound_home" "$bound_git" "$bound_common" \
     "$bound_source" "$([ "$ownership_mode" = treehouse ] && printf true || printf false)" \
-    "${source_dir##*/}"
+    "${source_dir##*/}" "$expected_treehouse_name"
 }
 
 runtime_test_barrier() {
   local phase=$1
-  [ "${AGENT_OS_BOUND_TEST_FALLBACK_ACTIVE:-}" = true ] || return 0
+  [ "${AGENT_OS_TEST_BARRIERS:-}" = true ] || return 0
   [ "${AGENT_OS_TEST_BARRIER_PHASE:-}" = "$phase" ] || return 0
   [ -n "${AGENT_OS_TEST_BARRIER_READY:-}" ] && [ -n "${AGENT_OS_TEST_BARRIER_RELEASE:-}" ] || return 1
   printf '%s\n' "$$" > "$AGENT_OS_TEST_BARRIER_READY"
@@ -676,6 +695,7 @@ for index in "${!validated_homes[@]}"; do
   id=${validated_ids[$index]}
   ownership_mode=${ownership_modes[$index]}
   treehouse_home=${treehouse_homes[$index]}
+  treehouse_name=${treehouse_names[$index]}
   home=${validated_homes[$index]}
   git_dir=${git_dirs[$index]}
   common_dir=${common_dirs[$index]}
@@ -688,7 +708,7 @@ for index in "${!validated_homes[@]}"; do
   recovery_policy=${pending_policies[$index]}
   assert_secondmate_binding "$id" "$ownership_mode" "$treehouse_home" "$home" "$git_dir" \
     "$common_dir" "$source_dir" "$bound_home" "$bound_config" "$bound_git_dir" \
-    "$bound_common_dir" "$bound_source_dir" || {
+    "$bound_common_dir" "$bound_source_dir" "$treehouse_name" || {
     echo "error: secondmate ownership changed before mutation: $home" >&2
     exit 2
   }
@@ -707,7 +727,7 @@ for index in "${!validated_homes[@]}"; do
   fi
   assert_secondmate_binding "$id" "$ownership_mode" "$treehouse_home" "$home" "$git_dir" \
     "$common_dir" "$source_dir" "$bound_home" "$bound_config" "$bound_git_dir" \
-    "$bound_common_dir" "$bound_source_dir" || exit 2
+    "$bound_common_dir" "$bound_source_dir" "$treehouse_name" || exit 2
   runtime_test_barrier policy
   pending_policy="$bound_config/agent-os-source-policy.pending"
   pending_tmp="$bound_config/.agent-os-source-policy.pending.$$"
@@ -719,14 +739,14 @@ for index in "${!validated_homes[@]}"; do
   mv "$required_tmp" "$required_policy"
   assert_secondmate_binding "$id" "$ownership_mode" "$treehouse_home" "$home" "$git_dir" \
     "$common_dir" "$source_dir" "$bound_home" "$bound_config" "$bound_git_dir" \
-    "$bound_common_dir" "$bound_source_dir" || exit 2
+    "$bound_common_dir" "$bound_source_dir" "$treehouse_name" || exit 2
   runtime_test_barrier checkout
   agent_os_bound_git "$bound_git_dir" "$bound_common_dir" "$bound_home" checkout --detach "$SOURCE_COMMIT"
   runtime_test_barrier remote
   agent_os_bound_git "$bound_git_dir" "$bound_common_dir" "$bound_home" remote set-url origin "$SOURCE_ORIGIN"
   assert_secondmate_binding "$id" "$ownership_mode" "$treehouse_home" "$home" "$git_dir" \
     "$common_dir" "$source_dir" "$bound_home" "$bound_config" "$bound_git_dir" \
-    "$bound_common_dir" "$bound_source_dir" || exit 2
+    "$bound_common_dir" "$bound_source_dir" "$treehouse_name" || exit 2
   runtime_test_barrier marker
   home_marker_tmp="$bound_config/.agent-os-source-policy.$$"
   printf '%s\n' "$marker" > "$home_marker_tmp"
@@ -740,7 +760,7 @@ for index in "${!validated_homes[@]}"; do
   [ -z "$(agent_os_bound_git "$bound_git_dir" "$bound_common_dir" "$bound_home" status --porcelain --untracked-files=all)" ] || exit 2
   assert_secondmate_binding "$id" "$ownership_mode" "$treehouse_home" "$home" "$git_dir" \
     "$common_dir" "$source_dir" "$bound_home" "$bound_config" "$bound_git_dir" \
-    "$bound_common_dir" "$bound_source_dir" || exit 2
+    "$bound_common_dir" "$bound_source_dir" "$treehouse_name" || exit 2
   rm "$pending_policy"
   printf 'selected: %s\n' "$home"
 done

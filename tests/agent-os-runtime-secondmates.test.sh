@@ -359,6 +359,16 @@ jq '.worktrees += [(.worktrees[] | select(.lease_holder == "linked") | .path += 
 mv "$TEST_ROOT/state-next.json" "$TREEHOUSE_POOL/treehouse-state.json"
 expect_rejection_without_mutation "ambiguous planted Treehouse holder evidence"
 
+git -C "$LEASE" worktree add -q --detach "$TMP/leased-decoy" "$A_COMMIT"
+write_treehouse_state
+jq '(.worktrees[] | select(.lease_holder == "linked") | .name) = "leased-decoy"' \
+  "$TREEHOUSE_POOL/treehouse-state.json" > "$TEST_ROOT/state-next.json"
+mv "$TEST_ROOT/state-next.json" "$TREEHOUSE_POOL/treehouse-state.json"
+expect_rejection_without_mutation "Treehouse lease bound to another same-common worktree"
+[ "$(git -C "$TMP/leased-decoy" rev-parse HEAD)" = "$A_COMMIT" ] || \
+  fail "same-common decoy worktree was mutated"
+git -C "$LEASE" worktree remove "$TMP/leased-decoy"
+
 printf '{unreadable\n' > "$TREEHOUSE_POOL/treehouse-state.json"
 expect_rejection_without_mutation "unreadable Treehouse lease evidence"
 PRESERVE_TREEHOUSE_STATE=false
@@ -370,51 +380,59 @@ git -C "$TMP/toctou-foreign" checkout -q --detach "$A_COMMIT"
 linked_gitdir=$(git -C "$TMP/linked" rev-parse --absolute-git-dir)
 linked_commondir=$(cat "$linked_gitdir/commondir")
 linked_pointer=$(cat "$TMP/linked/.git")
-foreign_before=$(find "$TMP/toctou-foreign/.git" -type f -print0 | sort -z | \
-  xargs -0 shasum -a 256 | shasum -a 256 | awk '{print $1}')
-fleet_before=$(fleet_mutation_signature)
-write_treehouse_state
-PRESERVE_TREEHOUSE_STATE=true
-AGENT_OS_TEST_BARRIER_PHASE=fetch
-AGENT_OS_TEST_BARRIER_READY="$TEST_ROOT/toctou-ready"
-AGENT_OS_TEST_BARRIER_RELEASE="$TEST_ROOT/toctou-release"
-export AGENT_OS_TEST_BARRIER_PHASE AGENT_OS_TEST_BARRIER_READY AGENT_OS_TEST_BARRIER_RELEASE
-rm -f "$AGENT_OS_TEST_BARRIER_READY" "$AGENT_OS_TEST_BARRIER_RELEASE"
-run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" \
-  > "$TEST_ROOT/toctou-runtime.out" 2>&1 &
-runtime_pid=$!
-for _ in $(seq 1 500); do
-  [ -f "$AGENT_OS_TEST_BARRIER_READY" ] && break
-  sleep 0.01
-done
-[ -f "$AGENT_OS_TEST_BARRIER_READY" ] || {
-  kill "$runtime_pid" 2>/dev/null || true
-  fail "runtime TOCTOU barrier was not reached"
-}
-if AGENT_OS_TEST_BARRIER_PHASE= run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" \
-  >/dev/null 2>&1; then
+for barrier_phase in fetch policy checkout remote marker; do
+  foreign_before=$(find "$TMP/toctou-foreign/.git" -type f -print0 | sort -z | \
+    xargs -0 shasum -a 256 | shasum -a 256 | awk '{print $1}')
+  fleet_before=$(fleet_mutation_signature)
+  write_treehouse_state
+  PRESERVE_TREEHOUSE_STATE=true
+  AGENT_OS_TEST_BARRIERS=true
+  AGENT_OS_TEST_BARRIER_PHASE=$barrier_phase
+  AGENT_OS_TEST_BARRIER_READY="$TEST_ROOT/toctou-$barrier_phase-ready"
+  AGENT_OS_TEST_BARRIER_RELEASE="$TEST_ROOT/toctou-$barrier_phase-release"
+  export AGENT_OS_TEST_BARRIERS AGENT_OS_TEST_BARRIER_PHASE \
+    AGENT_OS_TEST_BARRIER_READY AGENT_OS_TEST_BARRIER_RELEASE
+  rm -f "$AGENT_OS_TEST_BARRIER_READY" "$AGENT_OS_TEST_BARRIER_RELEASE"
+  run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" \
+    > "$TEST_ROOT/toctou-$barrier_phase-runtime.out" 2>&1 &
+  runtime_pid=$!
+  for _ in $(seq 1 500); do
+    [ -f "$AGENT_OS_TEST_BARRIER_READY" ] && break
+    sleep 0.01
+  done
+  [ -f "$AGENT_OS_TEST_BARRIER_READY" ] || {
+    kill "$runtime_pid" 2>/dev/null || true
+    fail "runtime TOCTOU $barrier_phase barrier was not reached"
+  }
+  if [ "$barrier_phase" = fetch ] && \
+    AGENT_OS_TEST_BARRIERS='' AGENT_OS_TEST_BARRIER_PHASE='' \
+      run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null 2>&1; then
+    touch "$AGENT_OS_TEST_BARRIER_RELEASE"
+    wait "$runtime_pid" 2>/dev/null || true
+    fail "secondmate ownership lock admitted a concurrent runtime mutation"
+  fi
+  printf 'gitdir: %s/toctou-foreign/.git\n' "$TMP" > "$TMP/linked/.git"
+  printf '%s\n' "$TMP/toctou-foreign/.git" > "$linked_gitdir/commondir"
   touch "$AGENT_OS_TEST_BARRIER_RELEASE"
-  wait "$runtime_pid" 2>/dev/null || true
-  fail "secondmate ownership lock admitted a concurrent runtime mutation"
-fi
-printf 'gitdir: %s/toctou-foreign/.git\n' "$TMP" > "$TMP/linked/.git"
-printf '%s\n' "$TMP/toctou-foreign/.git" > "$linked_gitdir/commondir"
-touch "$AGENT_OS_TEST_BARRIER_RELEASE"
-if wait "$runtime_pid"; then
-  fail "runtime accepted a Git pointer and common-directory swap"
-fi
-printf '%s\n' "$linked_pointer" > "$TMP/linked/.git"
-printf '%s\n' "$linked_commondir" > "$linked_gitdir/commondir"
-unset AGENT_OS_TEST_BARRIER_PHASE AGENT_OS_TEST_BARRIER_READY AGENT_OS_TEST_BARRIER_RELEASE
-foreign_after=$(find "$TMP/toctou-foreign/.git" -type f -print0 | sort -z | \
-  xargs -0 shasum -a 256 | shasum -a 256 | awk '{print $1}')
-[ "$foreign_after" = "$foreign_before" ] || \
-  fail "runtime TOCTOU redirected Git mutation into a foreign repository"
-[ "$(fleet_mutation_signature)" = "$fleet_before" ] || \
-  fail "runtime TOCTOU changed secondmate source, remote, marker, or policy state"
-PRESERVE_TREEHOUSE_STATE=false
+  if wait "$runtime_pid"; then
+    fail "runtime accepted a Git pointer and common-directory swap at $barrier_phase"
+  fi
+  printf '%s\n' "$linked_pointer" > "$TMP/linked/.git"
+  printf '%s\n' "$linked_commondir" > "$linked_gitdir/commondir"
+  foreign_after=$(find "$TMP/toctou-foreign/.git" -type f -print0 | sort -z | \
+    xargs -0 shasum -a 256 | shasum -a 256 | awk '{print $1}')
+  [ "$foreign_after" = "$foreign_before" ] || \
+    fail "runtime TOCTOU $barrier_phase redirected mutation into a foreign repository"
+  unset AGENT_OS_TEST_BARRIERS AGENT_OS_TEST_BARRIER_PHASE \
+    AGENT_OS_TEST_BARRIER_READY AGENT_OS_TEST_BARRIER_RELEASE
+  PRESERVE_TREEHOUSE_STATE=false
+  run_sync "$TMP/primary-a" "$A_COMMIT" "$A_TREE" "$A_SHA" >/dev/null || \
+    fail "runtime TOCTOU $barrier_phase state could not be reconciled"
+  [ "$(fleet_mutation_signature)" = "$fleet_before" ] || \
+    fail "runtime TOCTOU $barrier_phase reconciliation changed persistent state"
+done
 write_treehouse_state
-pass "runtime lock and bound common directory defeat live Git pointer swaps"
+pass "runtime lock and bound directories defeat pointer swaps at every mutation phase"
 
 printf 'tampered\n' >> "$TMP/standalone/AGENTS.md"
 if run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null 2>&1; then

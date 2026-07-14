@@ -381,6 +381,36 @@ jobs:
               exit 1
             }
           }
+          load_exact_build_artifact() {
+            exact_build_owner=$1
+            validate_artifact_run "$exact_build_owner"
+            build_artifact_id=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$exact_build_owner" \
+              '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | .[0].id' \
+              "$RUNNER_TEMP/candidate-build-artifacts.json")
+            rm -rf "$RUNNER_TEMP/candidate-build-artifact"
+            mkdir "$RUNNER_TEMP/candidate-build-artifact"
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$build_artifact_id/zip" \
+              > "$RUNNER_TEMP/candidate-build-artifact.zip"
+            unzip -q "$RUNNER_TEMP/candidate-build-artifact.zip" -d "$RUNNER_TEMP/candidate-build-artifact"
+            jq -e --arg commit '${{ steps.candidate_source.outputs.commit }}' \
+              --arg tree '${{ steps.candidate_source.outputs.tree }}' \
+              --arg reservation "$reservation_digest" --arg repository "$IMAGE" \
+              --argjson owner "$exact_build_owner" '
+              .schema_version == 1 and .commit == $commit and .tree == $tree and
+              .reservation_digest == $reservation and .image_repository == $repository and
+              .owner_run_id == $owner and
+              (.image_digest | test("^sha256:[0-9a-f]{64}$")) and
+              (.oci_archive_sha256 | test("^[0-9a-f]{64}$"))' \
+              "$RUNNER_TEMP/candidate-build-artifact/candidate-build.json" >/dev/null
+            EXACT_BUILD_IMAGE_DIGEST=$(jq -er .image_digest \
+              "$RUNNER_TEMP/candidate-build-artifact/candidate-build.json")
+            EXACT_BUILD_ARCHIVE_SHA=$(jq -er .oci_archive_sha256 \
+              "$RUNNER_TEMP/candidate-build-artifact/candidate-build.json")
+            [ "$(sha256sum "$RUNNER_TEMP/candidate-build-artifact/candidate-image.tar" | awk '{print $1}')" = \
+              "$EXACT_BUILD_ARCHIVE_SHA" ]
+            cp "$RUNNER_TEMP/candidate-build-artifact/candidate-image.tar" \
+              "$RUNNER_TEMP/candidate-image.tar"
+          }
           create_claim "$claim_prefix/initial" "$GITHUB_RUN_ID" || true
           load_latest_claim
           printf '{}\n' > "$RUNNER_TEMP/candidate-reservation-config.json"
@@ -438,17 +468,8 @@ jobs:
                 echo "::error::candidate claim owner has conflicting durable evidence"
                 exit 1
               }
-              if [ "$record_count" -eq 1 ] && [ "$build_count" -eq 0 ]; then
-                evidence_state=exact-record
-              elif [ "$record_count" -eq 0 ] && [ "$build_count" -eq 1 ]; then
-                evidence_state=exact-build
-              elif [ "$record_count" -eq 0 ] && [ "$build_count" -eq 0 ]; then
-                evidence_state=absent
-              else
-                evidence_state=ambiguous
-              fi
-              printf '%s\t%s\t%s\t%s\n' "$owner" "$claim_sha" \
-                "$BUILD_ATTEMPT_STATE" "$evidence_state" >> "$chain_state"
+              printf '%s\t%s\t%s\t%s\t%s\n' "$owner" "$claim_sha" \
+                "$BUILD_ATTEMPT_STATE" "$record_count" "$build_count" >> "$chain_state"
             done < "$CLAIM_CHAIN_FILE"
             decision=$(bin/agent-os-candidate-state.sh "$chain_state")
             IFS=$'\t' read -r candidate_action artifact_owner <<EOF
@@ -459,7 +480,7 @@ EOF
                 artifact_owner=$CLAIM_OWNER
                 BUILD_ATTEMPT_STATE=absent
                 ;;
-              reuse-record|reuse-build)
+              reuse-record|reuse-record-pair|reuse-build)
                 [[ "$artifact_owner" =~ ^[0-9]+$ ]]
                 BUILD_ATTEMPT_STATE=attempted
                 ;;
@@ -475,7 +496,14 @@ EOF
               echo "::error::candidate reservation has conflicting trusted artifacts"
               exit 1
             }
-            if [ "$candidate_action" = reuse-record ]; then
+            build_artifact_count=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$artifact_owner" \
+              '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | length' \
+              "$RUNNER_TEMP/candidate-build-artifacts.json")
+            [ "$build_artifact_count" -le 1 ] || {
+              echo "::error::candidate reservation has conflicting exact build evidence"
+              exit 1
+            }
+            if [ "$candidate_action" = reuse-record ] || [ "$candidate_action" = reuse-record-pair ]; then
               [ "$trusted_artifact_count" -eq 1 ] || exit 1
               validate_artifact_run "$artifact_owner"
               trusted_artifact_id=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$artifact_owner" \
@@ -514,43 +542,26 @@ EOF
               cp "$RUNNER_TEMP/candidate-trusted-artifact/agent-os-bootstrap.tar" image/agent-os-bootstrap.tar
               image_digest=$(jq -er .image_digest "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
               bootstrap_sha=$(jq -er .bootstrap_archive_sha256 "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
+              if [ "$candidate_action" = reuse-record-pair ]; then
+                [ "$build_artifact_count" -eq 1 ] || exit 1
+                load_exact_build_artifact "$artifact_owner"
+                [ "$EXACT_BUILD_IMAGE_DIGEST" = "$image_digest" ] || {
+                  echo "::error::paired candidate build and record evidence disagree"
+                  exit 1
+                }
+              else
+                [ "$build_artifact_count" -eq 0 ] || exit 1
+              fi
               ensure_build_owner
               printf 'build=false\nrecord_artifact=true\ncandidate_record_digest=%s\nimage_digest=%s\nbootstrap_sha256=%s\n' \
                 "$candidate_record_digest" "$image_digest" "$bootstrap_sha" >> "$GITHUB_OUTPUT"
               echo "::notice::candidate reservation recovered from durable trusted artifact"
               exit 0
             fi
-            build_artifact_count=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$artifact_owner" \
-              '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | length' \
-              "$RUNNER_TEMP/candidate-build-artifacts.json")
-            [ "$build_artifact_count" -le 1 ] || {
-              echo "::error::candidate reservation has conflicting exact build evidence"
-              exit 1
-            }
             if [ "$candidate_action" = reuse-build ]; then
               [ "$build_artifact_count" -eq 1 ] || exit 1
-              validate_artifact_run "$artifact_owner"
-              build_artifact_id=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$artifact_owner" \
-                '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | .[0].id' \
-                "$RUNNER_TEMP/candidate-build-artifacts.json")
-              mkdir "$RUNNER_TEMP/candidate-build-artifact"
-              gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$build_artifact_id/zip" \
-                > "$RUNNER_TEMP/candidate-build-artifact.zip"
-              unzip -q "$RUNNER_TEMP/candidate-build-artifact.zip" -d "$RUNNER_TEMP/candidate-build-artifact"
-              jq -e --arg commit '${{ steps.candidate_source.outputs.commit }}' \
-                --arg tree '${{ steps.candidate_source.outputs.tree }}' \
-                --arg reservation "$reservation_digest" --arg repository "$IMAGE" \
-                --argjson owner "$artifact_owner" '
-                .schema_version == 1 and .commit == $commit and .tree == $tree and
-                .reservation_digest == $reservation and .image_repository == $repository and
-                .owner_run_id == $owner and
-                (.image_digest | test("^sha256:[0-9a-f]{64}$")) and
-                (.oci_archive_sha256 | test("^[0-9a-f]{64}$"))' \
-                "$RUNNER_TEMP/candidate-build-artifact/candidate-build.json" >/dev/null
-              image_digest=$(jq -er .image_digest "$RUNNER_TEMP/candidate-build-artifact/candidate-build.json")
-              archive_sha=$(jq -er .oci_archive_sha256 "$RUNNER_TEMP/candidate-build-artifact/candidate-build.json")
-              [ "$(sha256sum "$RUNNER_TEMP/candidate-build-artifact/candidate-image.tar" | awk '{print $1}')" = "$archive_sha" ]
-              cp "$RUNNER_TEMP/candidate-build-artifact/candidate-image.tar" "$RUNNER_TEMP/candidate-image.tar"
+              load_exact_build_artifact "$artifact_owner"
+              image_digest=$EXACT_BUILD_IMAGE_DIGEST
               ensure_build_owner
               printf 'build=false\npublish_image=true\nrecord_artifact=false\nimage_digest=%s\nbootstrap_sha256=%s\n' \
                 "$image_digest" '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' >> "$GITHUB_OUTPUT"
