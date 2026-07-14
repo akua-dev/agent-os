@@ -191,13 +191,22 @@ pass "real zellij: kill removes the pane+tab and is idempotent/best-effort"
 
 LABEL2="fm-smoke2"
 TASK_IDS2=$(fm_backend_zellij_create_task "$SESSION" "$LABEL2" /tmp) || fail "second create_task failed"
-read -r _TAB_ID2 PANE_ID2 <<EOF
+read -r TAB_ID2 PANE_ID2 <<EOF
 $TASK_IDS2
 EOF
+TITLE2=$(fm_backend_zellij_scoped_title "$LABEL2")
+fm_backend_zellij_cli "$SESSION" action list-tabs --json 2>/dev/null \
+  | jq -e --arg want "$TITLE2" --argjson t "$TAB_ID2" \
+    '[.[]? | select(.tab_id == $t and .name == $want)] | length == 1' >/dev/null \
+  || fail "recreated task did not return the exact home-scoped tab id"
+fm_backend_zellij_cli "$SESSION" action list-panes --json 2>/dev/null \
+  | jq -e --argjson t "$TAB_ID2" --argjson p "$PANE_ID2" \
+    '[.[]? | select(.tab_id == $t and .id == $p and .is_plugin == false)] | length == 1' >/dev/null \
+  || fail "recreated task did not return the exact terminal pane id"
 live=$(fm_backend_zellij_list_live "$SESSION")
 assert_contains_local() { case "$1" in *"$2"*) : ;; *) fail "$3"$'\n'"--- got ---"$'\n'"$1" ;; esac; }
 assert_contains_local "$live" "$LABEL2" "list_live did not report the freshly created task tab by name"
-pass "real zellij: list_live discovers a live task tab by fm-<id> name"
+pass "real zellij: recreating the final task tab returns the exact scoped tab and terminal-pane ids"
 
 fm_backend_zellij_kill "$SESSION:$PANE_ID2"
 

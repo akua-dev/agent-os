@@ -483,38 +483,45 @@ test_create_task_creates_and_parses_ids() {
   pass "fm_backend_zellij_create_task: creates a home-scoped tab and parses tab_id/pane_id from the response"
 }
 
-test_create_task_recovers_id_when_new_tab_output_is_empty() {
+test_create_task_recovers_empty_new_tab_id_from_exact_scoped_structure() {
   local dir fb out title
-  dir="$TMP_ROOT/create-task-empty-output"; mkdir -p "$dir/responses"
-  title=$(zellij_expected_scoped_title fm-newtask)
-  # 1: list-tabs --json -> no existing tabs, none active
+  dir="$TMP_ROOT/create-task-empty-id-recovery"; mkdir -p "$dir/responses"
+  title=$(zellij_expected_scoped_title fm-empty-id)
+  # 1: before new-tab, no duplicate exists.
   printf '[]\n' > "$dir/responses/1.out"
-  # 2: new-tab succeeds with empty stdout, as observed after closing and recreating a real tab.
-  # 3: list-tabs --json -> the uniquely named tab was created despite the empty response.
-  printf '[{"tab_id":3,"name":"%s","active":false}]\n' "$title" > "$dir/responses/3.out"
-  # 4: list-panes --json -> the new tab's terminal pane
+  # 2: new-tab succeeds but emits no stdout - observed after the prior task
+  # tab was closed on real Zellij 0.44.1.
+  # 3: structural recovery finds exactly the requested home-scoped tab.
+  printf '[{"tab_id":3,"name":"%s"}]\n' "$title" > "$dir/responses/3.out"
+  # 4: that tab has exactly one terminal pane.
   printf '[{"id":7,"tab_id":3,"is_plugin":false}]\n' > "$dir/responses/4.out"
   fb=$(make_zellij_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
     FM_ZELLIJ_SESSION_LIST="firstmate" \
-    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-newtask /tmp/proj' "$ROOT" )
-  [ "$out" = "3 7" ] || fail "create_task should recover the created tab id after empty new-tab output, got '$out'"
-  pass "fm_backend_zellij_create_task: recovers the created id when new-tab succeeds with empty output"
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-empty-id /tmp/proj' "$ROOT" )
+  [ "$out" = "3 7" ] || fail "create_task should recover '<tab_id> <pane_id>' from exact scoped structure after an empty new-tab id, got '$out'"
+  assert_contains "$(cat "$dir/log")" $'\x1f''new-tab' \
+    "create_task did not call new-tab before structural recovery"
+  assert_contains "$(cat "$dir/log")" $'\x1f''list-panes'$'\x1f''--json' \
+    "create_task did not resolve the recovered tab's terminal pane"
+  pass "fm_backend_zellij_create_task: recovers empty new-tab stdout only from the exact scoped tab and terminal pane"
 }
 
-test_create_task_waits_for_new_pane() {
-  local dir fb out
-  dir="$TMP_ROOT/create-task-delayed-pane"; mkdir -p "$dir/responses"
+test_create_task_refuses_empty_new_tab_id_without_unique_terminal_pane() {
+  local dir fb out status title
+  dir="$TMP_ROOT/create-task-empty-id-ambiguous-pane"; mkdir -p "$dir/responses"
+  title=$(zellij_expected_scoped_title fm-empty-id-ambiguous)
   printf '[]\n' > "$dir/responses/1.out"
-  printf '3\n' > "$dir/responses/2.out"
-  printf '[]\n' > "$dir/responses/3.out"
-  printf '[{"id":7,"tab_id":3,"is_plugin":false}]\n' > "$dir/responses/4.out"
+  printf '[{"tab_id":3,"name":"%s"}]\n' "$title" > "$dir/responses/3.out"
+  printf '[{"id":7,"tab_id":3,"is_plugin":false},{"id":8,"tab_id":3,"is_plugin":false}]\n' > "$dir/responses/4.out"
   fb=$(make_zellij_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
     FM_ZELLIJ_SESSION_LIST="firstmate" \
-    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-newtask /tmp/proj' "$ROOT" )
-  [ "$out" = "3 7" ] || fail "create_task should wait for the new tab's terminal pane, got '$out'"
-  pass "fm_backend_zellij_create_task: waits for the new tab's terminal pane to appear"
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-empty-id-ambiguous /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task should refuse empty new-tab stdout without exactly one terminal pane"
+  assert_contains "$out" "could not recover" "create_task did not report the structural recovery refusal"
+  pass "fm_backend_zellij_create_task: refuses empty new-tab stdout when structural recovery has no unique terminal pane"
 }
 
 test_create_task_restores_previously_active_tab() {
@@ -1070,8 +1077,8 @@ test_dispatch_routes_zellij_backend
 test_dispatch_busy_state_unknown_for_zellij
 test_create_task_refuses_duplicate_label
 test_create_task_creates_and_parses_ids
-test_create_task_recovers_id_when_new_tab_output_is_empty
-test_create_task_waits_for_new_pane
+test_create_task_recovers_empty_new_tab_id_from_exact_scoped_structure
+test_create_task_refuses_empty_new_tab_id_without_unique_terminal_pane
 test_create_task_restores_previously_active_tab
 test_create_task_no_restore_when_new_tab_was_already_active
 test_capture_small_reads_use_viewport_and_trim
