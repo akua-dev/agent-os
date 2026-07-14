@@ -7,7 +7,9 @@ data/
 .DS_Store
 __pycache__/
 *.pyc
-image/agent-os-source.bundle
+image/agent-os-source.tar
+image/agent-os-bootstrap.tar
+image/agent-os-source.attestation
 .env
 config/crew-harness
 config/crew-dispatch.json

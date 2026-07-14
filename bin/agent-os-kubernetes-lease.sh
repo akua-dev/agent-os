@@ -143,7 +143,7 @@ stop_lock_renewal() {
 }
 
 release_lock() {
-  local record identity holder uid rv after after_holder after_uid deadline
+  local record identity holder uid rv after after_holder after_uid deadline released_holder
   stop_lock_renewal
   [ -n "$LOCK_UID" ] || return 0
   deadline=$(lock_default_deadline)
@@ -160,6 +160,28 @@ release_lock() {
     [ "$uid" != "$LOCK_UID" ] || [ -z "$rv" ]; then
     echo "error: lifecycle Lease '$LOCK' changed ownership before release; retained" >&2
     return 1
+  fi
+  if [ "${LOCK_PERSISTENT:-0}" -eq 1 ]; then
+    released_holder=$LOCK_HOLDER_ID
+    LOCK_HOLDER_ID=released
+    if ! render_lock '1970-01-01T00:00:00Z' '1970-01-01T00:00:00Z' "$uid" "$rv" | \
+      lock_kube_mutation "$deadline" replace -f - >/dev/null; then
+      LOCK_HOLDER_ID=$released_holder
+      echo "error: persistent lifecycle Lease '$LOCK' release CAS failed; retained" >&2
+      return 1
+    fi
+    LOCK_HOLDER_ID=$released_holder
+    after=$(lock_record "$deadline") || return 1
+    if [ "$(printf '%s' "$after" | cut -f1-4)" != "$EXPECTED_LOCK" ] || \
+      [ "$(printf '%s' "$after" | cut -f5)" != released ] || \
+      [ "$(printf '%s' "$after" | cut -f9)" != "$uid" ] || \
+      [ "$(printf '%s' "$after" | cut -f10)" = "$rv" ]; then
+      echo "error: persistent lifecycle Lease '$LOCK' release did not verify" >&2
+      return 1
+    fi
+    LOCK_UID=
+    LOCK_RV=
+    return 0
   fi
   if ! printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s","resourceVersion":"%s"}}\n' "$uid" "$rv" | \
     lock_kube_mutation "$deadline" delete --raw "/apis/coordination.k8s.io/v1/namespaces/$LOCK_NAMESPACE/leases/$LOCK" -f - >/dev/null; then
@@ -200,7 +222,16 @@ acquire_lock() {
       exit 3
     fi
     mutation_ok=0
-    render_lock "$now" "$now" | lock_kube_mutation "$deadline" create -f - >/dev/null && mutation_ok=1
+    record=
+    if [ "${LOCK_PERSISTENT:-0}" -eq 1 ]; then
+      record=$(lock_record "$deadline") || {
+        echo "error: persistent lifecycle Lease '$LOCK' could not be read before acquisition" >&2
+        exit 3
+      }
+    fi
+    if [ -z "$record" ]; then
+      render_lock "$now" "$now" | lock_kube_mutation "$deadline" create -f - >/dev/null && mutation_ok=1
+    fi
     record=$(lock_record "$deadline") || {
       echo "error: lifecycle Lease '$LOCK' create result could not be reconciled before the acquisition deadline" >&2
       exit 3

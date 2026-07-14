@@ -57,7 +57,8 @@ Set `context` and `namespace` from the separately approved target and grant the 
 AGENT_OS_CONTEXT="$context" AGENT_OS_NAMESPACE="$namespace" bin/agent-os-akua-auth.sh grant "$secret_name"
 ```
 
-The helper holds the installation-wide lifecycle Lease, validates exact StatefulSet UID and resourceVersion, verifies the named Secret reference without reading Secret bytes, applies one CAS strategic patch, and verifies both the retained StatefulSet overlay and its exact-owned Pod.
+The helper holds the stable control Lease and namespace fleet Lease in that order, validates exact StatefulSet UID and resourceVersion, verifies the named Secret reference without reading Secret bytes, applies one CAS strategic patch, and verifies both the retained StatefulSet overlay and its exact-owned Pod.
+If grant verification fails, the helper removes the overlay by CAS, verifies the fail-closed rollout, records only bounded Secret metadata evidence, and requires an explicit revoke before a different Secret identity can be granted.
 
 Revocation is owned by the same integration boundary.
 Revoke the Akua API token and prove it fails first, then revoke the overlay through the same serialized helper:

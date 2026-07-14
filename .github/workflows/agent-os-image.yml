@@ -64,7 +64,13 @@ jobs:
         id: source
         run: |
           set -eu
-          bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/source-metadata"
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            git clone --depth=1 --branch main https://github.com/akua-dev/agent-os.git "$RUNNER_TEMP/trusted-agent-os"
+            AGENT_OS_SOURCE_ROOT="$RUNNER_TEMP/trusted-agent-os" \
+              bin/agent-os-source-bundle.sh "$GITHUB_WORKSPACE/image" > "$RUNNER_TEMP/source-metadata"
+          else
+            bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/source-metadata"
+          fi
           cat "$RUNNER_TEMP/source-metadata" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130

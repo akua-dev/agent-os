@@ -106,25 +106,26 @@ assert_grep 'AGENT_OS_CREWMATE_TEMPLATE' "$ROOT/bin/agent-os-crewmate.sh" \
   "mate runtime must render the canonical package template"
 assert_absent "$ROOT/tools/agent-os/packages/mate/package.k" \
   "mate creation must not remain a separately installable package"
-assert_grep '.git' "$ROOT/.dockerignore" "git metadata must stay out of the build context"
-assert_grep '.pi' "$ROOT/.dockerignore" "Pi credentials must stay out of the build context"
-assert_grep '.codex' "$ROOT/.dockerignore" "Codex credentials must stay out of the build context"
-assert_grep 'node_modules' "$ROOT/.dockerignore" "host dependencies must stay out of the build context"
-assert_grep '.repos' "$ROOT/.dockerignore" "development source checkouts must stay out of the build context"
-assert_grep '!.pi/extensions/fm-primary-pi-watch.ts' "$ROOT/.dockerignore" "tracked Pi supervision controls must enter the image"
-assert_grep '!.codex/hooks.json' "$ROOT/.dockerignore" "tracked Codex supervision controls must enter the image"
-assert_grep '!.opencode/plugins/fm-primary-watch-arm.js' "$ROOT/.dockerignore" "tracked OpenCode supervision controls must enter the image"
-assert_grep '.pi/extensions/*' "$ROOT/.dockerignore" "Pi harness controls must use a nested default-deny rule"
-assert_grep '.grok/hooks/*' "$ROOT/.dockerignore" "Grok harness controls must use a nested default-deny rule"
-assert_grep '.opencode/plugins/*' "$ROOT/.dockerignore" "OpenCode harness controls must use a nested default-deny rule"
-assert_grep 'agent-os-source.bundle' "$ROOT/Dockerfile" "image must bootstrap an exact source commit without host Git metadata"
+assert_grep '**' "$ROOT/.dockerignore" "the Docker context must default-deny every local path"
+assert_grep '!image/agent-os-source.tar' "$ROOT/.dockerignore" "the Docker context must admit only the tracked source export"
+assert_grep '!image/agent-os-bootstrap.tar' "$ROOT/.dockerignore" "the Docker context must admit only the shallow bootstrap export"
+assert_no_grep '!.pi/' "$ROOT/.dockerignore" "local harness homes must never be admitted directly"
+assert_grep 'agent-os-source.tar' "$ROOT/Dockerfile" "image must consume the tracked exact-source export"
+assert_grep 'agent-os-bootstrap.tar' "$ROOT/Dockerfile" "image must consume the shallow sanitized bootstrap"
 assert_grep 'rev-parse "$AGENT_OS_SOURCE_COMMIT^{tree}"' "$ROOT/Dockerfile" "image source bootstrap must verify its exact tree"
-assert_grep 'AS source-bootstrap' "$ROOT/Dockerfile" "source bundle processing must stay in an isolated build stage"
-assert_no_grep 'COPY image/agent-os-source.bundle /opt/agent-os-source.bundle' "$ROOT/Dockerfile" \
-  "the final image must not retain a duplicate source bundle"
+assert_grep 'AS source-bootstrap' "$ROOT/Dockerfile" "source processing must stay in an isolated build stage"
+assert_no_grep 'COPY \. /opt/agent-os' "$ROOT/Dockerfile" "the image must never copy the ambient workspace"
+assert_grep 'fetch --depth=1 --no-tags' "$ROOT/bin/agent-os-source-bundle.sh" \
+  "source preparation must fetch an allowlisted remote ref freshly"
+assert_grep 'status --porcelain --untracked-files=all' "$ROOT/bin/agent-os-source-bundle.sh" \
+  "source preparation must reject a dirty workspace"
+assert_no_grep 'bundle create.*HEAD' "$ROOT/bin/agent-os-source-bundle.sh" \
+  "source bootstrap must not retain reachable deleted history"
 assert_grep 'merge --ff-only' "$ROOT/bin/agent-os-container-entrypoint.sh" "persistent source transitions must be fast-forward only"
-assert_grep 'TRUSTED_REF="refs/remotes/origin/$SOURCE_BRANCH"' "$ROOT/bin/agent-os-container-entrypoint.sh" \
-  "canonical runtime source must match the declared trusted remote branch"
+assert_grep 'refs/remotes/agent-os-verified' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "canonical runtime source must use a freshly fetched verification ref"
+assert_grep 'fetch --no-tags --prune origin' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "runtime provenance must fail closed unless the trusted remote is reachable"
 assert_no_grep 'checkout --detach' "$ROOT/bin/agent-os-container-entrypoint.sh" \
   "canonical runtime source must remain on the declared default branch"
 assert_grep 'FM_ROOT_OVERRIDE=' "$ROOT/bin/agent-os-container-entrypoint.sh" "runtime must use the persistent canonical Firstmate repository"

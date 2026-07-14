@@ -5,6 +5,23 @@ set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+assert_grep 'configure_control_lock' "$ROOT/bin/agent-os-crewmate.sh" \
+  "crewmate mutations must acquire the stable installation control lock"
+assert_grep 'CONTROL_LOCK_UID' "$ROOT/bin/agent-os-crewmate.sh" \
+  "crewmate mutations must retain control-lock CAS evidence"
+assert_grep 'configure_control_lock' "$ROOT/bin/agent-os-akua-auth.sh" \
+  "authorization mutations must acquire the stable installation control lock"
+assert_grep 'agent-os-firstmate-lifecycle' "$ROOT/bin/agent-os-akua-auth.sh" \
+  "authorization mutations must also acquire the namespace fleet lock"
+assert_grep 'current=absent' "$ROOT/bin/agent-os-kubernetes.sh" \
+  "upgrade snapshots must represent an absent authorization overlay explicitly"
+assert_grep 'transfer_runtime_authority' "$ROOT/bin/agent-os-kubernetes.sh" \
+  "rollback must transactionally transfer runtime authority"
+assert_grep 'compensate_rollback' "$ROOT/bin/agent-os-kubernetes.sh" \
+  "failed rollback must restore the current revision and authority"
+assert_grep 'wait_for_revision_history_absence' "$ROOT/bin/agent-os-kubernetes.sh" \
+  "uninstall must retire historical ServiceAccounts only after revision history"
+
 LAUNCHER="$ROOT/bin/agent-os-crewmate.sh"
 TMP=$(fm_test_tmproot agent-os-kubernetes)
 FAKEBIN=$(fm_fakebin "$TMP")
@@ -59,7 +76,10 @@ if [ "${*: -2}" = "-f -" ]; then
   stdin_data=$(cat)
   printf '%s\n' "$stdin_data" >> "${AGENT_OS_STDIN_LOG:-$AGENT_OS_TEST_LOG.stdin}"
   stdin_kind=$(printf '%s\n' "$stdin_data" | awk '$1 == "kind:" { print $2; exit }')
+  [ -n "$stdin_kind" ] || stdin_kind=$(printf '%s' "$stdin_data" | jq -r '.kind // empty' 2>/dev/null || true)
   printf 'stdin-kind %s\n' "$stdin_kind" >> "$AGENT_OS_TEST_LOG"
+  stdin_name=$(printf '%s' "$stdin_data" | jq -r '.metadata.name // empty' 2>/dev/null || true)
+  [ -z "$stdin_name" ] || printf 'stdin-resource %s %s\n' "$stdin_kind" "$stdin_name" >> "$AGENT_OS_TEST_LOG"
   if [ "$stdin_kind" = Lease ]; then
     stdin_name=$(printf '%s\n' "$stdin_data" | awk '$1 == "name:" { print $2; exit }')
     printf 'stdin-lease %s\n' "$stdin_name" >> "$AGENT_OS_TEST_LOG"
@@ -116,6 +136,24 @@ if [ -n "${AGENT_OS_TEST_READY_DELAY:-}" ] && [[ " $* " = *" wait --for=conditio
 fi
 if [ -n "${AGENT_OS_TEST_ROLLOUT_DELAY:-}" ] && [[ " $* " = *" rollout status statefulset/agent-os-firstmate "* ]]; then
   sleep "$AGENT_OS_TEST_ROLLOUT_DELAY"
+fi
+if [[ " $* " = *" get Role agent-os-lifecycle-"*" -o json "* ]] || \
+  [[ " $* " = *" get role agent-os-lifecycle-"*" -o json "* ]]; then
+  control_name=$(printf '%s\n' "$*" | sed -n 's/.* get [Rr]ole \([^ ]*\) .*/\1/p')
+  if ! grep -Fq "/roles/$control_name" "$AGENT_OS_TEST_LOG"; then
+    printf '{"metadata":{"name":"%s","uid":"uid-control-role","resourceVersion":"rv-control-role","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}},"rules":[{"apiGroups":["coordination.k8s.io"],"resources":["leases"],"resourceNames":["%s"],"verbs":["get","update"]}]}\n' "$control_name" "$control_name"
+  fi
+  exit 0
+fi
+if [[ " $* " = *" get RoleBinding agent-os-lifecycle-"*" -o json "* ]] || \
+  [[ " $* " = *" get rolebinding agent-os-lifecycle-"*" -o json "* ]]; then
+  control_name=$(printf '%s\n' "$*" | sed -n 's/.* get [Rr]ole[Bb]inding \([^ ]*\) .*/\1/p')
+  if ! grep -Fq "/rolebindings/$control_name" "$AGENT_OS_TEST_LOG"; then
+    control_account=$(grep 'akua-input-service-account ' "$AGENT_OS_TEST_LOG" | tail -n 1 | awk '{print $2}')
+    [ -n "$control_account" ] || control_account=agent-os-firstmate
+    printf '{"metadata":{"name":"%s","uid":"uid-control-binding","resourceVersion":"rv-control-binding","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}},"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"%s"},"subjects":[{"kind":"ServiceAccount","name":"%s","namespace":"portable-agent-os"}]}\n' "$control_name" "$control_name" "$control_account"
+  fi
+  exit 0
 fi
 case " $* " in
   *" get pod agent-os-crewmate-"*" --ignore-not-found -o jsonpath="*)
@@ -253,10 +291,12 @@ case " $* " in
       lock_holder=$(awk '/holderIdentity:/ { holder=$2 } END { print holder }' "$lock_stdin")
       lock_acquired=$(awk '/acquireTime:/ { value=$2 } END { print value }' "$lock_stdin")
       lock_renewed=$(awk '/renewTime:/ { value=$2 } END { print value }' "$lock_stdin")
-      lock_rv=${AGENT_OS_TEST_PRIMARY_LOCK_RV:-rv-primary-lock}
-      if grep -F ' replace -f -' "$AGENT_OS_TEST_LOG" >/dev/null; then
-        lock_rv=rv-primary-lock-renewed
-      fi
+      lock_replace_count=$(awk -v name="$lock_name" '
+        /kubectl .* replace -f -/ { replacing=1; next }
+        /^stdin-lease / { if (replacing && $2 == name) count++; replacing=0 }
+        END { print count+0 }
+      ' "$AGENT_OS_TEST_LOG")
+      lock_rv="${AGENT_OS_TEST_PRIMARY_LOCK_RV:-rv-primary-lock}-$lock_replace_count"
       printf '%s\tagent-os\tprimary\t%s\t%s\t%s\t%s\t%s\tuid-primary-lock\t%s' \
         "$lock_name" "$lock_installation" "$lock_holder" "$lock_acquired" "$lock_renewed" \
         "${AGENT_OS_LOCK_DURATION_SECONDS:-300}" "$lock_rv"
@@ -379,14 +419,18 @@ case " $* " in
       akua_volume=$(printf ',{"name":"akua-auth","secret":{"secretName":"%s","defaultMode":256}}' "$AGENT_OS_TEST_AKUA_OVERLAY_SECRET")
     fi
     if [ -n "${AGENT_OS_TEST_ROLLBACK_CHECKPOINT_DIGEST:-}" ]; then
-      checkpoint_annotations=$(printf ',"agent-os.dev/rollback-operation":"checkpoint-operation","agent-os.dev/rollback-target-name":"agent-os-firstmate-previous","agent-os.dev/rollback-target-uid":"uid-revision-previous","agent-os.dev/rollback-target-digest":"%s"' "$AGENT_OS_TEST_ROLLBACK_CHECKPOINT_DIGEST")
+      checkpoint_source_digest=$(printf '%s' '{"metadata":{"labels":{"rollback":"current"}},"spec":{"serviceAccountName":"agent-os-firstmate"}}' | jq -cS . | shasum -a 256 | awk '{print $1}')
+      checkpoint_annotations=$(printf ',"agent-os.dev/rollback-operation":"checkpoint-operation","agent-os.dev/rollback-target-name":"agent-os-firstmate-previous","agent-os.dev/rollback-target-uid":"uid-revision-previous","agent-os.dev/rollback-target-digest":"%s","agent-os.dev/rollback-source-name":"agent-os-firstmate-current","agent-os.dev/rollback-source-uid":"uid-revision-current","agent-os.dev/rollback-source-digest":"%s"' "$AGENT_OS_TEST_ROLLBACK_CHECKPOINT_DIGEST" "$checkpoint_source_digest")
     elif checkpoint_call=$(grep 'patch StatefulSet agent-os-firstmate --type=merge' "$AGENT_OS_TEST_LOG" | grep 'rollback-target-digest' | head -n 1); then
       checkpoint_operation=$(printf '%s' "$checkpoint_call" | sed -n 's/.*rollback-operation":"\([^"]*\).*/\1/p')
       checkpoint_name=$(printf '%s' "$checkpoint_call" | sed -n 's/.*rollback-target-name":"\([^"]*\).*/\1/p')
       checkpoint_uid=$(printf '%s' "$checkpoint_call" | sed -n 's/.*rollback-target-uid":"\([^"]*\).*/\1/p')
       checkpoint_digest=$(printf '%s' "$checkpoint_call" | sed -n 's/.*rollback-target-digest":"\([0-9a-f]*\).*/\1/p')
-      checkpoint_annotations=$(printf ',"agent-os.dev/rollback-operation":"%s","agent-os.dev/rollback-target-name":"%s","agent-os.dev/rollback-target-uid":"%s","agent-os.dev/rollback-target-digest":"%s"' \
-        "$checkpoint_operation" "$checkpoint_name" "$checkpoint_uid" "$checkpoint_digest")
+      checkpoint_source_name=$(printf '%s' "$checkpoint_call" | sed -n 's/.*rollback-source-name":"\([^"]*\).*/\1/p')
+      checkpoint_source_uid=$(printf '%s' "$checkpoint_call" | sed -n 's/.*rollback-source-uid":"\([^"]*\).*/\1/p')
+      checkpoint_source_digest=$(printf '%s' "$checkpoint_call" | sed -n 's/.*rollback-source-digest":"\([0-9a-f]*\).*/\1/p')
+      checkpoint_annotations=$(printf ',"agent-os.dev/rollback-operation":"%s","agent-os.dev/rollback-target-name":"%s","agent-os.dev/rollback-target-uid":"%s","agent-os.dev/rollback-target-digest":"%s","agent-os.dev/rollback-source-name":"%s","agent-os.dev/rollback-source-uid":"%s","agent-os.dev/rollback-source-digest":"%s"' \
+        "$checkpoint_operation" "$checkpoint_name" "$checkpoint_uid" "$checkpoint_digest" "$checkpoint_source_name" "$checkpoint_source_uid" "$checkpoint_source_digest")
     fi
     if [ "${AGENT_OS_TEST_ROLLBACK_CHECKPOINT_MUTATE:-0}" = 1 ] && \
       grep -F 'rollout status statefulset/agent-os-firstmate' "$AGENT_OS_TEST_LOG" >/dev/null; then
@@ -408,10 +452,30 @@ case " $* " in
     fi
     ;;
   *" get controllerrevisions.apps -o json "*)
-    if [ "${AGENT_OS_TEST_ROLLBACK_RENUMBERED:-0}" = 1 ]; then
+    if grep -Fq '/statefulsets/agent-os-firstmate' "$AGENT_OS_TEST_LOG" && grep -Fq 'delete --raw' "$AGENT_OS_TEST_LOG"; then
+      printf '%s\n' '{"items":[]}'
+    elif [ "${AGENT_OS_TEST_ROLLBACK_RENUMBERED:-0}" = 1 ]; then
       printf '%s\n' '{"items":[{"metadata":{"name":"agent-os-firstmate-previous","uid":"uid-revision-previous","ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"agent-os-firstmate","uid":"uid-statefulset","controller":true}]},"revision":1,"data":{"spec":{"template":{"metadata":{"labels":{"rollback":"previous"}},"spec":{"serviceAccountName":"agent-os-firstmate"}}}}},{"metadata":{"name":"agent-os-firstmate-current","uid":"uid-revision-current","ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"agent-os-firstmate","uid":"uid-statefulset","controller":true}]},"revision":2,"data":{"spec":{"template":{"metadata":{"labels":{"rollback":"current"}},"spec":{"serviceAccountName":"agent-os-firstmate"}}}}},{"metadata":{"name":"agent-os-firstmate-renumbered","uid":"uid-revision-renumbered","ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"agent-os-firstmate","uid":"uid-statefulset","controller":true}]},"revision":3,"data":{"spec":{"template":{"metadata":{"labels":{"rollback":"previous"}},"spec":{"serviceAccountName":"agent-os-firstmate"}}}}}]}'
     else
       printf '%s\n' '{"items":[{"metadata":{"name":"agent-os-firstmate-previous","uid":"uid-revision-previous","ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"agent-os-firstmate","uid":"uid-statefulset","controller":true}]},"revision":1,"data":{"spec":{"template":{"metadata":{"labels":{"rollback":"previous"}},"spec":{"serviceAccountName":"agent-os-firstmate"}}}}},{"metadata":{"name":"agent-os-firstmate-current","uid":"uid-revision-current","ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"agent-os-firstmate","uid":"uid-statefulset","controller":true}]},"revision":2,"data":{"spec":{"template":{"metadata":{"labels":{"rollback":"current"}},"spec":{"serviceAccountName":"agent-os-firstmate"}}}}}]}'
+    fi
+    ;;
+  *" get Role agent-os-lifecycle-"*" --ignore-not-found -o json "*|\
+  *" get RoleBinding agent-os-lifecycle-"*" --ignore-not-found -o json "*|\
+  *" get role agent-os-lifecycle-"*" --ignore-not-found -o json "*|\
+  *" get rolebinding agent-os-lifecycle-"*" --ignore-not-found -o json "*|\
+  *" get rolebinding agent-os-lifecycle-"*" -o json "*)
+    control_name=$(printf '%s\n' "$*" | sed -n 's/.* get \([Rr]ole\|[Rr]ole[Bb]inding\) \([^ ]*\) .*/\2/p')
+    control_kind=$(printf '%s\n' "$*" | sed -n 's/.* get \([Rr]ole\|[Rr]ole[Bb]inding\) .*/\1/p')
+    case "$control_kind" in role) control_kind=Role ;; rolebinding) control_kind=RoleBinding ;; esac
+    if ! grep -Fq "/$([ "$control_kind" = Role ] && printf roles || printf rolebindings)/$control_name" "$AGENT_OS_TEST_LOG"; then
+      control_account=$(grep 'akua-input-service-account ' "$AGENT_OS_TEST_LOG" | tail -n 1 | awk '{print $2}')
+      [ -n "$control_account" ] || control_account=agent-os-firstmate
+      if [ "$control_kind" = Role ]; then
+        printf '{"metadata":{"name":"%s","uid":"uid-control-role","resourceVersion":"rv-control-role","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}},"rules":[{"apiGroups":["coordination.k8s.io"],"resources":["leases"],"resourceNames":["%s"],"verbs":["get","update"]}]}\n' "$control_name" "$control_name"
+      else
+        printf '{"metadata":{"name":"%s","uid":"uid-control-binding","resourceVersion":"rv-control-binding","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}},"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"%s"},"subjects":[{"kind":"ServiceAccount","name":"%s","namespace":"portable-agent-os"}]}\n' "$control_name" "$control_name" "$control_account"
+      fi
     fi
     ;;
   *" get role agent-os-firstmate-runtime -o json "*)
@@ -1148,7 +1212,7 @@ generated_service_account=$(grep 'akua-input-service-account ' "$CALLS" | tail -
 case "$generated_service_account" in agent-os-firstmate-[a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9]) ;; \
   *) fail "install must use a fresh non-legacy ServiceAccount identity" ;; esac
 grep -Fqx 'kubectl --context kind-agent-os -n portable-agent-os rollout status statefulset/agent-os-firstmate --timeout=180s' "$CALLS" || \
-  fail "generic install must wait for the rendered Firstmate StatefulSet"
+  fail "generic install must wait for the rendered Firstmate StatefulSet: $(tail -n 20 "$CALLS" | tr '\n' ';')"
 if grep -F 'delete clusterrolebinding' "$CALLS" >/dev/null; then
   fail "fresh namespace-scoped install must not require cluster RBAC deletion authority"
 fi
@@ -1622,8 +1686,8 @@ renumbered_out=$(AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_RESOURCE_STAT
   AGENT_OS_TEST_ROLLBACK_CHECKPOINT_DIGEST="$previous_template_digest" \
   AGENT_OS_TEST_FAIL_ROLLOUT=1 run_generic rollback 2>&1) || renumbered_rc=$?
 [ "$renumbered_rc" -eq 3 ] || fail "renumbered rollback retry must remain incomplete: $renumbered_out"
-assert_no_grep '"rollback":"current"' "$CALLS" \
-  "rollback retry must never reverse to the post-patch current template"
+assert_grep '"rollback":"current"' "$CALLS" \
+  "rollback retry must compensate to its immutable checkpoint source template"
 assert_contains "$renumbered_out" 'target-digest=' \
   "rollback retry must preserve the immutable checkpoint digest"
 assert_contains "$renumbered_out" 'target=agent-os-firstmate-renumbered' \
@@ -1639,7 +1703,7 @@ verification_out=$(AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_RESOURCE_ST
   AGENT_OS_TEST_WORKLOAD_STATE=namespace AGENT_OS_TEST_ROLLBACK_VERIFY_MISMATCH=1 \
   run_generic rollback 2>&1) || verification_rc=$?
 [ "$verification_rc" -eq 3 ] || fail "rollback must fail closed when completed revisions do not match its checkpoint: $verification_out"
-assert_contains "$verification_out" 'rollback verification mismatch' \
+assert_contains "$verification_out" "rollback revision 'agent-os-firstmate-current' content differs" \
   "rollback must retain explicit evidence when another revision completes"
 pass "rollback success verifies both revision targets by content"
 

@@ -17,6 +17,10 @@ INSTALLATION_ID="agent-os-firstmate:$NAMESPACE"
 OPERATION_ID=${AGENT_OS_OPERATION_ID:-"$(date -u '+%Y%m%d%H%M%S')-$$-$RANDOM"}
 LOCK_NONCE=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
 LOCK_HOLDER_ID="$OPERATION_ID.$LOCK_NONCE"
+CONTROL_LOCK_UID=
+CONTROL_LOCK_RV=
+CONTROL_LOCK_RENEW_PID=
+CONTROL_LOCK_VALID_UNTIL=
 
 [ -f "$TEMPLATE" ] || { echo "error: crewmate template is unavailable in canonical source" >&2; exit 2; }
 
@@ -51,6 +55,7 @@ EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"$ID"$'\t'"$INSTALLATION_ID"
 LOCK_UID=
 LOCK_RV=
 LOCK_RENEW_PID=
+LOCK_PERSISTENT=0
 LOCK_DURATION_SECONDS=${AGENT_OS_LOCK_DURATION_SECONDS:-300}
 LOCK_CLOCK_SKEW_SECONDS=${AGENT_OS_LOCK_CLOCK_SKEW_SECONDS:-5}
 LOCK_ACQUIRE_SECONDS=${AGENT_OS_LOCK_ACQUIRE_SECONDS:-30}
@@ -69,7 +74,7 @@ done
 [ "$RESOURCE_REQUEST_CEILING_SECONDS" -ge 1 ] || { echo "error: resource request ceiling must be at least 1 second" >&2; exit 2; }
 
 kube() {
-  "$KUBECTL" "${KUBECTL_ARGS[@]}" -n "$NAMESPACE" "$@"
+  "$KUBECTL" "${KUBECTL_ARGS[@]}" -n "$LOCK_NAMESPACE" "$@"
 }
 
 resource_identity() {
@@ -101,7 +106,7 @@ pvc_record() {
 lock_record() {
   local deadline=${1:-}
   [ -n "$deadline" ] || deadline=$(lock_default_deadline)
-  if [ "$LOCK_SCOPE" = fleet ]; then
+  if [ "$LOCK_SCOPE" != crewmate ]; then
     lock_kube "$deadline" get lease "$LOCK" --ignore-not-found \
       -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/lifecycle}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.spec.holderIdentity}{"\t"}{.spec.acquireTime}{"\t"}{.spec.renewTime}{"\t"}{.spec.leaseDurationSeconds}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}'
     return
@@ -171,13 +176,13 @@ render_lock() {
   local acquired_at=$1 renewed_at=$2 uid=${3:-} rv=${4:-} uid_value='' rv_value=''
   [ -z "$uid" ] || uid_value=$(yaml_string "$uid")
   [ -z "$rv" ] || rv_value=$(yaml_string "$rv")
-  if [ "$LOCK_SCOPE" = fleet ]; then
+  if [ "$LOCK_SCOPE" != crewmate ]; then
     cat <<YAML
 apiVersion: coordination.k8s.io/v1
 kind: Lease
 metadata:
   name: $LOCK
-  namespace: $NAMESPACE
+  namespace: $LOCK_NAMESPACE
 ${uid:+  uid: $uid_value}
 ${rv:+  resourceVersion: $rv_value}
   labels:
@@ -198,7 +203,7 @@ apiVersion: coordination.k8s.io/v1
 kind: Lease
 metadata:
   name: $LOCK
-  namespace: $NAMESPACE
+  namespace: $LOCK_NAMESPACE
 ${uid:+  uid: $uid_value}
 ${rv:+  resourceVersion: $rv_value}
   labels:
@@ -214,14 +219,28 @@ spec:
 YAML
 }
 
+. "$ROOT/bin/agent-os-kubernetes-control.sh"
 . "$ROOT/bin/agent-os-kubernetes-lease.sh"
 
 acquire_lifecycle_locks() {
   CREWMATE_LOCK=$LOCK
   CREWMATE_EXPECTED_LOCK=$EXPECTED_LOCK
+  configure_control_lock
+  LOCK=$CONTROL_LOCK
+  LOCK_NAMESPACE=$CONTROL_NAMESPACE
+  EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"primary"$'\t'"$CONTROL_LOCK_INSTALLATION_ID"
+  LOCK_SCOPE=control
+  LOCK_PERSISTENT=1
+  acquire_lock
+  CONTROL_LOCK_UID=$LOCK_UID
+  CONTROL_LOCK_RV=$LOCK_RV
+  CONTROL_LOCK_RENEW_PID=$LOCK_RENEW_PID
+  CONTROL_LOCK_VALID_UNTIL=$LOCK_VALID_UNTIL
   LOCK=agent-os-firstmate-lifecycle
+  LOCK_NAMESPACE=$NAMESPACE
   EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"primary"$'\t'"$INSTALLATION_ID"
   LOCK_SCOPE=fleet
+  LOCK_PERSISTENT=0
   acquire_lock
   FLEET_LOCK_UID=$LOCK_UID
   FLEET_LOCK_RV=$LOCK_RV
@@ -230,6 +249,7 @@ acquire_lifecycle_locks() {
   LOCK=$CREWMATE_LOCK
   EXPECTED_LOCK=$CREWMATE_EXPECTED_LOCK
   LOCK_SCOPE=crewmate
+  LOCK_PERSISTENT=0
   LOCK_UID=
   LOCK_RV=
   LOCK_RENEW_PID=
@@ -243,11 +263,24 @@ release_lifecycle_locks() {
   LOCK=agent-os-firstmate-lifecycle
   EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"primary"$'\t'"$INSTALLATION_ID"
   LOCK_SCOPE=fleet
+  LOCK_PERSISTENT=0
   LOCK_UID=${FLEET_LOCK_UID:-}
   LOCK_RV=${FLEET_LOCK_RV:-}
   LOCK_RENEW_PID=${FLEET_LOCK_RENEW_PID:-}
   LOCK_VALID_UNTIL=${FLEET_LOCK_VALID_UNTIL:-}
   release_lock || status=$?
+  if [ -n "${CONTROL_LOCK_UID:-}" ]; then
+    LOCK=$CONTROL_LOCK
+    LOCK_NAMESPACE=$CONTROL_NAMESPACE
+    EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"primary"$'\t'"$CONTROL_LOCK_INSTALLATION_ID"
+    LOCK_SCOPE=control
+    LOCK_PERSISTENT=1
+    LOCK_UID=$CONTROL_LOCK_UID
+    LOCK_RV=${CONTROL_LOCK_RV:-}
+    LOCK_RENEW_PID=${CONTROL_LOCK_RENEW_PID:-}
+    LOCK_VALID_UNTIL=${CONTROL_LOCK_VALID_UNTIL:-}
+    release_lock || status=$?
+  fi
   return "$status"
 }
 

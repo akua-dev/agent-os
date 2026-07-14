@@ -29,6 +29,7 @@ Load this skill only when the current firstmate is running in Kubernetes or is e
 - Give every launched Herdr agent a task-unique name, close only a confirmed dead restored pane before reuse, and never replace a live agent.
 - Grade completion by the promised artifact or delivered Git state; Herdr `idle` alone is not a completion signal.
 - Use `bin/agent-os-crewmate.sh create <id>` to create a separate Pod and persistent home.
+- Every mutating crewmate operation acquires the stable control Lease, namespace fleet Lease, and per-crewmate Lease in that order and releases them in reverse order.
 - Use `status` to inspect it, `stop` to remove only the Pod, and `restart` to replace only the Pod on its retained PVC.
 - The ambiguous `delete` command is rejected.
 - `purge <id> --yes` is the only operation that destroys a persistent home.

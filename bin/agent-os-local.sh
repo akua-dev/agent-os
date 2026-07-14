@@ -62,7 +62,7 @@ case "$COMMAND" in
     source_branch=$(printf '%s\n' "$source_metadata" | awk -F= '$1 == "branch" { print $2 }')
     source_origin=$(printf '%s\n' "$source_metadata" | awk -F= '$1 == "origin" { sub(/^[^=]*=/, ""); print }')
     [ -n "$source_commit" ] && [ -n "$source_tree" ] && [ -n "$source_branch" ] && [ -n "$source_origin" ] || {
-      echo "error: exact-source bundle metadata is incomplete" >&2
+      echo "error: exact-source bootstrap metadata is incomplete" >&2
       exit 2
     }
     docker build \

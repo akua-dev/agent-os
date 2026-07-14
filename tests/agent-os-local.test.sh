@@ -22,6 +22,24 @@ SH
 }
 
 make_fake docker
+cat > "$FAKEBIN/git" <<'SH'
+#!/usr/bin/env bash
+case " $* " in
+  *" remote get-url origin "*) printf 'https://github.com/akua-dev/agent-os.git\n' ;;
+  *" status --porcelain --untracked-files=all "*) ;;
+  *" init --bare "*) destination=${!#}; mkdir -p "$destination"; printf 'shallow\n' > "$destination/shallow" ;;
+  *" fetch --depth=1 --no-tags "*) ;;
+  *" rev-parse --verify "*"^{tree}"*) printf '2222222222222222222222222222222222222222\n' ;;
+  *" rev-parse --verify "*) printf '1111111111111111111111111111111111111111\n' ;;
+  *" archive --format=tar --output="*)
+    for arg in "$@"; do
+      case "$arg" in --output=*) : > "${arg#--output=}" ;; esac
+    done
+    ;;
+  *) ;;
+esac
+SH
+chmod +x "$FAKEBIN/git"
 cat > "$FAKEBIN/docker" <<'SH'
 #!/usr/bin/env bash
 printf '%s' "$(basename "$0")" >> "$AGENT_OS_TEST_LOG"
@@ -83,6 +101,16 @@ if { [[ " $* " = *" get statefulset agent-os-firstmate --ignore-not-found -o jso
     printf 'agent-os-firstmate\tagent-os\tagent-os-firstmate:%s' "$namespace"
   fi
 fi
+if [[ " $* " = *" get statefulset agent-os-firstmate -o json "* ]] && [ "$stateful_present" -eq 1 ]; then
+  printf '{"metadata":{"name":"agent-os-firstmate","uid":"uid-statefulset","resourceVersion":"rv-statefulset","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:%s"}},"spec":{"template":{"spec":{"serviceAccountName":"agent-os-firstmate","containers":[{"name":"firstmate","env":[],"volumeMounts":[]}],"volumes":[]}}},"status":{"currentRevision":"revision-current","updateRevision":"revision-current"}}\n' "$namespace"
+fi
+if [[ " $* " = *" get controllerrevisions.apps -o json "* ]]; then
+  printf '%s\n' '{"items":[]}'
+fi
+if [[ " $* " = *" get ServiceAccount agent-os-firstmate --ignore-not-found -o jsonpath="* ]] && [ "$stateful_present" -eq 1 ]; then
+  printf 'agent-os-firstmate\tagent-os\tagent-os-firstmate:%s' "$namespace"
+  [[ " $* " != *'.metadata.resourceVersion'* ]] || printf '\tuid-serviceaccount\trv-serviceaccount\t%s' "$operation"
+fi
 if { [[ " $* " = *" get clusterrolebinding agent-os-firstmate-"*" --ignore-not-found -o jsonpath="* ]] ||
      [[ " $* " = *" get ClusterRoleBinding agent-os-firstmate-"*" --ignore-not-found -o jsonpath="* ]]; }; then
   if [ "${AGENT_OS_TEST_LOCAL_WORKLOAD:-absent}" = present ] || grep -F 'clusterrolebinding.yaml' "$AGENT_OS_TEST_LOG" | grep -E ' create | patch ' >/dev/null; then
@@ -105,7 +133,9 @@ if [[ " $* " = *" get lease agent-os-firstmate-lifecycle --ignore-not-found -o j
     lock_holder=$(grep '^stdin-holder ' "$AGENT_OS_TEST_LOG" | tail -n 1 | cut -d' ' -f2-)
     lock_acquired=$(grep '^stdin-acquired ' "$AGENT_OS_TEST_LOG" | tail -n 1 | cut -d' ' -f2-)
     lock_renewed=$(grep '^stdin-renewed ' "$AGENT_OS_TEST_LOG" | tail -n 1 | cut -d' ' -f2-)
-    printf '%s\tagent-os\tprimary\t%s\t%s\t%s\t%s\t300\tuid-lock\trv-lock' "$lock_name" "$lock_installation" "$lock_holder" "$lock_acquired" "$lock_renewed"
+    lock_rv=rv-lock
+    grep -Fq ' replace -f -' "$AGENT_OS_TEST_LOG" && lock_rv=rv-lock-renewed
+    printf '%s\tagent-os\tprimary\t%s\t%s\t%s\t%s\t300\tuid-lock\t%s' "$lock_name" "$lock_installation" "$lock_holder" "$lock_acquired" "$lock_renewed" "$lock_rv"
   fi
 fi
 SH
@@ -282,7 +312,7 @@ test_destroy_requires_exact_confirmation() {
   cleanup_out=$(AGENT_OS_TEST_LOCAL_WORKLOAD=present run_cli destroy --yes 2>&1) || cleanup_rc=$?
   [ "$cleanup_rc" -eq 3 ] || \
     fail "cluster-admin demo destroy must stop for separate privileged cleanup, got $cleanup_rc: $cleanup_out"
-  grep -Fq 'kubectl --context orbstack delete --raw /apis/apps/v1/namespaces/agent-os-demo/statefulsets/agent-os-firstmate -f -' "$LOG" || \
+  grep -F 'delete --raw /apis/apps/v1/namespaces/agent-os-demo/statefulsets/agent-os-firstmate -f -' "$LOG" >/dev/null || \
     fail "confirmed destroy must UID-delete the rendered OrbStack workload"
   if grep -E 'kubectl .* (get|delete) clusterrolebinding' "$LOG" >/dev/null; then
     fail "routine demo destroy must not inspect or delete cluster-scoped RBAC"

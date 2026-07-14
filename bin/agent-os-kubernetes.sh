@@ -33,10 +33,12 @@ EXPECTED_LOCK=
 LOCK_UID=
 LOCK_RV=
 LOCK_RENEW_PID=
+LOCK_PERSISTENT=0
 CONTROL_LOCK_UID=
 CONTROL_LOCK_RV=
 CONTROL_LOCK_RENEW_PID=
 CONTROL_LOCK_VALID_UNTIL=
+REMOVE_CONTROL_ACCESS=0
 LOCK_DURATION_SECONDS=${AGENT_OS_LOCK_DURATION_SECONDS:-300}
 LOCK_CLOCK_SKEW_SECONDS=${AGENT_OS_LOCK_CLOCK_SKEW_SECONDS:-5}
 LOCK_ACQUIRE_SECONDS=${AGENT_OS_LOCK_ACQUIRE_SECONDS:-30}
@@ -58,6 +60,9 @@ cleanup() {
   local status=$?
   trap - EXIT
   if ! release_primary_locks && [ "$status" -eq 0 ]; then
+    status=3
+  fi
+  if [ "$REMOVE_CONTROL_ACCESS" -eq 1 ] && ! delete_control_lock_access && [ "$status" -eq 0 ]; then
     status=3
   fi
   rm -rf "$OUT" "$RENDER_INPUTS"
@@ -219,6 +224,7 @@ acquire_primary_lock() {
   LOCK_NAMESPACE=$CONTROL_NAMESPACE
   LOCK=$CONTROL_LOCK
   LOCK_INSTALLATION_ID=$CONTROL_LOCK_INSTALLATION_ID
+  LOCK_PERSISTENT=1
   EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"primary"$'\t'"$LOCK_INSTALLATION_ID"
   acquire_lock
   CONTROL_LOCK_UID=$LOCK_UID
@@ -240,13 +246,17 @@ acquire_namespace_lock() {
   LOCK_RV=
   LOCK_RENEW_PID=
   LOCK_VALID_UNTIL=
+  LOCK_PERSISTENT=0
   acquire_lock
   NAMESPACE_LOCK_UID=$LOCK_UID
 }
 
 release_primary_locks() {
   local status=0
-  release_lock || status=$?
+  if [ -n "${NAMESPACE_LOCK_UID:-}" ]; then
+    release_lock || status=$?
+    NAMESPACE_LOCK_UID=
+  fi
   if [ -n "$CONTROL_LOCK_UID" ]; then
     LOCK_NAMESPACE=$CONTROL_NAMESPACE
     LOCK=$CONTROL_LOCK
@@ -256,6 +266,7 @@ release_primary_locks() {
     LOCK_RV=$CONTROL_LOCK_RV
     LOCK_RENEW_PID=$CONTROL_LOCK_RENEW_PID
     LOCK_VALID_UNTIL=$CONTROL_LOCK_VALID_UNTIL
+    LOCK_PERSISTENT=1
     release_lock || status=$?
     CONTROL_LOCK_UID=
   fi
@@ -346,7 +357,7 @@ preflight_legacy_cluster_binding() {
 }
 
 verify_revision_service_account() {
-  local revision=$1 account identity expected
+  local revision=$1 account identity expected record
   account=$(printf '%s' "$revision" | jq -er '.data.spec.template.spec.serviceAccountName') || {
     echo "error: rollback target ServiceAccount dependency is unavailable" >&2
     exit 3
@@ -358,6 +369,170 @@ verify_revision_service_account() {
     echo "error: rollback target ServiceAccount dependency is missing or changed" >&2
     exit 3
   }
+  record=$(live_resource_record namespaced ServiceAccount "$account")
+  [ "$(printf '%s' "$record" | cut -f1-3)" = "$expected" ] && \
+    [ -n "$(printf '%s' "$record" | cut -f4)" ] && [ -n "$(printf '%s' "$record" | cut -f5)" ] || {
+    echo "error: rollback target ServiceAccount dependency metadata is unavailable" >&2
+    exit 3
+  }
+}
+
+runtime_binding_json() {
+  local mode=$1
+  case "$mode" in
+    namespace) "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get rolebinding agent-os-firstmate-runtime -o json ;;
+    cluster-admin) "$KUBECTL" --context "$CONTEXT" get clusterrolebinding "agent-os-firstmate-$NAMESPACE" -o json ;;
+    none) printf '{}' ;;
+    *) echo "error: rollback runtime authority mode is invalid" >&2; return 3 ;;
+  esac
+}
+
+transfer_runtime_authority() {
+  local mode=$1 from=$2 to=$3 binding kind scope json uid rv current patch verified
+  [ "$from" != "$to" ] || return 0
+  [ "$mode" != none ] || return 0
+  if [ "$mode" = namespace ]; then
+    binding=agent-os-firstmate-runtime
+    kind=rolebinding
+    scope=(-n "$NAMESPACE")
+  else
+    binding="agent-os-firstmate-$NAMESPACE"
+    kind=clusterrolebinding
+    scope=()
+  fi
+  json=$(runtime_binding_json "$mode") || return 3
+  if [ "$mode" = namespace ]; then
+    printf '%s' "$json" | jq -e '.roleRef == {apiGroup:"rbac.authorization.k8s.io",kind:"Role",name:"agent-os-firstmate-runtime"}' >/dev/null || return 3
+  else
+    printf '%s' "$json" | jq -e '.roleRef == {apiGroup:"rbac.authorization.k8s.io",kind:"ClusterRole",name:"cluster-admin"}' >/dev/null || return 3
+  fi
+  current=$(printf '%s' "$json" | jq -er --arg installation "$INSTALLATION_ID" --arg namespace "$NAMESPACE" --arg binding "$binding" '
+    select(.metadata.name == $binding)
+    | select(.metadata.labels["app.kubernetes.io/managed-by"] == "agent-os")
+    | select(.metadata.annotations["agent-os.dev/installation-id"] == $installation)
+    | select(.subjects | type == "array" and length == 1)
+    | select(.subjects[0].kind == "ServiceAccount" and .subjects[0].namespace == $namespace)
+    | .subjects[0].name') || { echo "error: rollback runtime authority ownership is unverifiable" >&2; return 3; }
+  if [ "$current" = "$to" ]; then
+    [ "$mode" != namespace ] || transfer_control_authority "$from" "$to"
+    return $?
+  fi
+  [ "$current" = "$from" ] || { echo "error: rollback runtime authority is assigned to an unexpected ServiceAccount" >&2; return 3; }
+  uid=$(printf '%s' "$json" | jq -er '.metadata.uid') || return 3
+  rv=$(printf '%s' "$json" | jq -er '.metadata.resourceVersion') || return 3
+  patch=$(jq -cn --arg uid "$uid" --arg rv "$rv" --arg namespace "$NAMESPACE" --arg account "$to" \
+    '{metadata:{uid:$uid,resourceVersion:$rv},subjects:[{kind:"ServiceAccount",name:$account,namespace:$namespace}]}')
+  "$KUBECTL" --context "$CONTEXT" "${scope[@]}" patch "$kind" "$binding" --type=merge -p "$patch" >/dev/null || return 3
+  verified=$(runtime_binding_json "$mode") || return 3
+  printf '%s' "$verified" | jq -e --arg uid "$uid" --arg namespace "$NAMESPACE" --arg account "$to" '
+    .metadata.uid == $uid and .subjects == [{kind:"ServiceAccount",name:$account,namespace:$namespace}]' >/dev/null || {
+    echo "error: rollback runtime authority transfer did not verify exactly" >&2
+    return 3
+  }
+  [ "$mode" != namespace ] || transfer_control_authority "$from" "$to"
+}
+
+control_binding_json() {
+  "$KUBECTL" --context "$CONTEXT" -n "$CONTROL_NAMESPACE" get rolebinding "$CONTROL_LOCK" -o json
+}
+
+transfer_control_authority() {
+  local from=$1 to=$2 json current uid rv patch verified
+  json=$(control_binding_json) || return 3
+  current=$(printf '%s' "$json" | jq -er --arg installation "$INSTALLATION_ID" --arg namespace "$NAMESPACE" --arg name "$CONTROL_LOCK" '
+    select(.metadata.name == $name)
+    | select(.metadata.labels["app.kubernetes.io/managed-by"] == "agent-os")
+    | select(.metadata.annotations["agent-os.dev/installation-id"] == $installation)
+    | select(.subjects | type == "array" and length == 1)
+    | select(.subjects[0].kind == "ServiceAccount" and .subjects[0].namespace == $namespace)
+    | .subjects[0].name') || return 3
+  [ "$current" != "$to" ] || return 0
+  [ "$current" = "$from" ] || return 3
+  uid=$(printf '%s' "$json" | jq -er '.metadata.uid') || return 3
+  rv=$(printf '%s' "$json" | jq -er '.metadata.resourceVersion') || return 3
+  patch=$(jq -cn --arg uid "$uid" --arg rv "$rv" --arg namespace "$NAMESPACE" --arg account "$to" \
+    '{metadata:{uid:$uid,resourceVersion:$rv},subjects:[{kind:"ServiceAccount",name:$account,namespace:$namespace}]}')
+  "$KUBECTL" --context "$CONTEXT" -n "$CONTROL_NAMESPACE" patch rolebinding "$CONTROL_LOCK" --type=merge -p "$patch" >/dev/null || return 3
+  verified=$(control_binding_json) || return 3
+  printf '%s' "$verified" | jq -e --arg uid "$uid" --arg namespace "$NAMESPACE" --arg account "$to" '
+    .metadata.uid == $uid and .subjects == [{kind:"ServiceAccount",name:$account,namespace:$namespace}]' >/dev/null
+}
+
+ensure_control_lock_access() {
+  local role binding live uid rv desired kind
+  [ "$DESIRED_RBAC" = namespace ] || return 0
+  configure_control_lock
+  role=$(jq -cn --arg name "$CONTROL_LOCK" --arg namespace "$CONTROL_NAMESPACE" --arg installation "$INSTALLATION_ID" '
+    {apiVersion:"rbac.authorization.k8s.io/v1",kind:"Role",metadata:{name:$name,namespace:$namespace,labels:{"app.kubernetes.io/managed-by":"agent-os"},annotations:{"agent-os.dev/installation-id":$installation}},rules:[{apiGroups:["coordination.k8s.io"],resources:["leases"],resourceNames:[$name],verbs:["get","update"]}]}')
+  binding=$(jq -cn --arg name "$CONTROL_LOCK" --arg controlNamespace "$CONTROL_NAMESPACE" --arg installation "$INSTALLATION_ID" --arg namespace "$NAMESPACE" --arg account "$SERVICE_ACCOUNT_NAME" '
+    {apiVersion:"rbac.authorization.k8s.io/v1",kind:"RoleBinding",metadata:{name:$name,namespace:$controlNamespace,labels:{"app.kubernetes.io/managed-by":"agent-os"},annotations:{"agent-os.dev/installation-id":$installation}},roleRef:{apiGroup:"rbac.authorization.k8s.io",kind:"Role",name:$name},subjects:[{kind:"ServiceAccount",name:$account,namespace:$namespace}]}')
+  for desired in "$role" "$binding"; do
+    kind=$(printf '%s' "$desired" | jq -r '.kind')
+    live=$("$KUBECTL" --context "$CONTEXT" -n "$CONTROL_NAMESPACE" get "$kind" "$CONTROL_LOCK" --ignore-not-found -o json)
+    if [ -z "$live" ]; then
+      printf '%s' "$desired" | "$KUBECTL" --context "$CONTEXT" create -f - >/dev/null || return 3
+    else
+      printf '%s' "$live" | jq -e --arg installation "$INSTALLATION_ID" --arg name "$CONTROL_LOCK" '
+        .metadata.name == $name and .metadata.labels["app.kubernetes.io/managed-by"] == "agent-os" and .metadata.annotations["agent-os.dev/installation-id"] == $installation' >/dev/null || return 3
+      uid=$(printf '%s' "$live" | jq -er '.metadata.uid') || return 3
+      rv=$(printf '%s' "$live" | jq -er '.metadata.resourceVersion') || return 3
+      desired=$(printf '%s' "$desired" | jq -c --arg uid "$uid" --arg rv "$rv" '.metadata.uid=$uid | .metadata.resourceVersion=$rv')
+      printf '%s' "$desired" | "$KUBECTL" --context "$CONTEXT" replace -f - >/dev/null || return 3
+    fi
+  done
+  live=$(control_binding_json) || return 3
+  printf '%s' "$live" | jq -e --arg namespace "$NAMESPACE" --arg account "$SERVICE_ACCOUNT_NAME" --arg name "$CONTROL_LOCK" '
+    .roleRef == {apiGroup:"rbac.authorization.k8s.io",kind:"Role",name:$name} and .subjects == [{kind:"ServiceAccount",name:$account,namespace:$namespace}]' >/dev/null
+}
+
+delete_control_lock_access() {
+  local kind resource plural live uid rv after
+  [ -n "${CONTROL_LOCK:-}" ] || configure_control_lock
+  for kind in RoleBinding Role; do
+    resource=$(printf '%s' "$kind" | tr '[:upper:]' '[:lower:]')
+    plural="${resource}s"
+    live=$("$KUBECTL" --context "$CONTEXT" -n "$CONTROL_NAMESPACE" get "$kind" "$CONTROL_LOCK" --ignore-not-found -o json) || return 3
+    [ -n "$live" ] || continue
+    printf '%s' "$live" | jq -e --arg name "$CONTROL_LOCK" --arg installation "$INSTALLATION_ID" '
+      .metadata.name == $name and .metadata.labels["app.kubernetes.io/managed-by"] == "agent-os" and .metadata.annotations["agent-os.dev/installation-id"] == $installation' >/dev/null || return 3
+    uid=$(printf '%s' "$live" | jq -er '.metadata.uid') || return 3
+    rv=$(printf '%s' "$live" | jq -er '.metadata.resourceVersion') || return 3
+    printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s","resourceVersion":"%s"}}\n' "$uid" "$rv" | \
+      "$KUBECTL" --context "$CONTEXT" delete --raw "/apis/rbac.authorization.k8s.io/v1/namespaces/$CONTROL_NAMESPACE/$plural/$CONTROL_LOCK" -f - >/dev/null || return 3
+    after=$("$KUBECTL" --context "$CONTEXT" -n "$CONTROL_NAMESPACE" get "$kind" "$CONTROL_LOCK" --ignore-not-found -o json) || return 3
+    [ -z "$after" ] || return 3
+  done
+}
+
+compensate_rollback() {
+  local source_template=$1 current_account=$2 target_account=$3 mode=$4 state uid rv patch
+  transfer_runtime_authority "$mode" "$target_account" "$current_account" || return 3
+  state=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" \
+    --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get statefulset agent-os-firstmate -o json) || return 3
+  uid=$(printf '%s' "$state" | jq -er --arg expected "$rollback_uid" 'select(.metadata.uid == $expected) | .metadata.uid') || return 3
+  rv=$(printf '%s' "$state" | jq -er '.metadata.resourceVersion') || return 3
+  patch=$(jq -cn --arg uid "$uid" --arg rv "$rv" --argjson template "$source_template" \
+    '{metadata:{uid:$uid,resourceVersion:$rv,annotations:{"agent-os.dev/rollback-operation":null,"agent-os.dev/rollback-target-name":null,"agent-os.dev/rollback-target-uid":null,"agent-os.dev/rollback-target-digest":null,"agent-os.dev/rollback-source-name":null,"agent-os.dev/rollback-source-uid":null,"agent-os.dev/rollback-source-digest":null}},spec:{template:$template}}')
+  "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" patch statefulset agent-os-firstmate --type=strategic -p "$patch" >/dev/null || return 3
+  "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" rollout status statefulset/agent-os-firstmate --timeout=180s || return 3
+  [ "$(workload_service_account)" = "$current_account" ] || return 3
+}
+
+wait_for_revision_history_absence() {
+  local workload_uid=$1 deadline revisions count
+  deadline=$(($(date -u '+%s') + 180))
+  while :; do
+    revisions=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" \
+      --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get controllerrevisions.apps -o json) || return 3
+    count=$(printf '%s' "$revisions" | jq -er --arg uid "$workload_uid" \
+      '[.items[] | select(any(.metadata.ownerReferences[]?; .controller == true and .kind == "StatefulSet" and .name == "agent-os-firstmate" and ($uid == "" or .uid == $uid)))] | length') || return 3
+    [ "$count" -eq 0 ] && return 0
+    [ "$(date -u '+%s')" -lt "$deadline" ] || {
+      echo "incomplete: retained ControllerRevision history still references the removed StatefulSet" >&2
+      return 3
+    }
+    sleep 1
+  done
 }
 
 require_no_active_rollback_checkpoint() {
@@ -375,7 +550,10 @@ require_no_active_rollback_checkpoint() {
     | [(.metadata.annotations["agent-os.dev/rollback-operation"] // ""),
        (.metadata.annotations["agent-os.dev/rollback-target-name"] // ""),
        (.metadata.annotations["agent-os.dev/rollback-target-uid"] // ""),
-       (.metadata.annotations["agent-os.dev/rollback-target-digest"] // "")]
+       (.metadata.annotations["agent-os.dev/rollback-target-digest"] // ""),
+       (.metadata.annotations["agent-os.dev/rollback-source-name"] // ""),
+       (.metadata.annotations["agent-os.dev/rollback-source-uid"] // ""),
+       (.metadata.annotations["agent-os.dev/rollback-source-digest"] // "")]
     | @tsv') || { echo "error: StatefulSet rollback checkpoint state is unverifiable" >&2; exit 3; }
   if [ -n "${checkpoint//$'\t'/}" ]; then
     echo "error: active rollback checkpoint blocks upgrade; resume rollback until exact recovery and checkpoint finalization" >&2
@@ -384,8 +562,11 @@ require_no_active_rollback_checkpoint() {
 }
 
 verified_akua_overlay_secret() {
-  local expected_record=${1:-} expected_secret state secret record=''
-  expected_secret=$(printf '%s' "$expected_record" | cut -f1)
+  local expected_supplied=0 expected_record='' state secret record current
+  if [ "$#" -gt 0 ]; then
+    expected_supplied=1
+    expected_record=$1
+  fi
   if ! command -v jq >/dev/null 2>&1; then
     echo "error: jq is required to verify the Akua authorization overlay" >&2
     return 2
@@ -409,10 +590,6 @@ verified_akua_overlay_secret() {
     echo "error: Akua authorization overlay is missing, changed, or unverifiable; upgrade blocked" >&2
     return 3
   }
-  if [ -n "$expected_record" ] && [ "$secret" != "$expected_secret" ]; then
-    echo "error: Akua authorization Secret reference changed during upgrade; upgrade blocked" >&2
-    return 3
-  fi
   if [ -n "$secret" ]; then
     record=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" \
       --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get secret "$secret" --ignore-not-found \
@@ -423,12 +600,15 @@ verified_akua_overlay_secret() {
       echo "error: Akua authorization Secret reference is missing or unverifiable; upgrade blocked" >&2
       return 3
     fi
-    if [ -n "$expected_record" ] && [ "$record" != "$expected_record" ]; then
-      echo "error: Akua authorization Secret UID or resourceVersion changed during upgrade; upgrade blocked" >&2
-      return 3
-    fi
+    current="present"$'\t'"$record"
+  else
+    current=absent
   fi
-  printf '%s' "$record"
+  if [ "$expected_supplied" -eq 1 ] && [ "$current" != "$expected_record" ]; then
+    echo "error: Akua authorization overlay presence or Secret identity changed during upgrade; upgrade blocked" >&2
+    return 3
+  fi
+  printf '%s' "$current"
 }
 
 rendered_resource_field() {
@@ -1255,6 +1435,7 @@ case "$COMMAND" in
       exit 2
     fi
     preflight_legacy_cluster_binding 0
+    ensure_control_lock_access
     apply_rendered
     ;;
   upgrade)
@@ -1277,6 +1458,19 @@ case "$COMMAND" in
         render
         require_namespaced_resource_owned_or_absent ServiceAccount "$SERVICE_ACCOUNT_NAME"
         ;;
+      agent-os-firstmate)
+        [ "$(live_resource_identity ServiceAccount agent-os-firstmate)" = \
+          "agent-os-firstmate"$'\t'"agent-os"$'\t'"$INSTALLATION_ID" ] || {
+          echo "error: retained legacy ServiceAccount dependency is missing or foreign" >&2
+          exit 3
+        }
+        legacy_service_account_record=$(live_resource_record namespaced ServiceAccount agent-os-firstmate)
+        [ -n "$(printf '%s' "$legacy_service_account_record" | cut -f4)" ] && \
+          [ -n "$(printf '%s' "$legacy_service_account_record" | cut -f5)" ] || {
+          echo "error: retained legacy ServiceAccount dependency lacks exact metadata" >&2
+          exit 3
+        }
+        ;;
     esac
     preflight_legacy_cluster_binding 1
     require_no_active_rollback_checkpoint
@@ -1295,6 +1489,7 @@ case "$COMMAND" in
       cleanup_required=1
       patch_workload_annotations '{"agent-os.dev/cluster-rbac-cleanup":"required"}'
     fi
+    ensure_control_lock_access
     apply_rendered
     if ! verified_akua_overlay_secret "$PRESERVED_AKUA_SECRET_RECORD" >/dev/null; then
       echo "incomplete: upgrade applied but Akua authorization postcondition changed" >&2
@@ -1337,8 +1532,10 @@ case "$COMMAND" in
       echo "error: rollback requires exact StatefulSet UID and resourceVersion evidence" >&2
       exit 2
     fi
-    rollback_state=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get statefulset agent-os-firstmate -o json)
-    rollback_revisions=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get controllerrevisions.apps -o json)
+    rollback_state=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" \
+      --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get statefulset agent-os-firstmate -o json)
+    rollback_revisions=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" \
+      --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get controllerrevisions.apps -o json)
     rollback_references=$(printf '%s' "$rollback_state" | jq -er \
       --arg uid "$rollback_uid" --arg rv "$rollback_rv" --arg installation "$INSTALLATION_ID" '
         select(.metadata.name == "agent-os-firstmate")
@@ -1349,7 +1546,10 @@ case "$COMMAND" in
            (.metadata.annotations["agent-os.dev/rollback-operation"] // ""),
            (.metadata.annotations["agent-os.dev/rollback-target-name"] // ""),
            (.metadata.annotations["agent-os.dev/rollback-target-uid"] // ""),
-           (.metadata.annotations["agent-os.dev/rollback-target-digest"] // "")]
+           (.metadata.annotations["agent-os.dev/rollback-target-digest"] // ""),
+           (.metadata.annotations["agent-os.dev/rollback-source-name"] // ""),
+           (.metadata.annotations["agent-os.dev/rollback-source-uid"] // ""),
+           (.metadata.annotations["agent-os.dev/rollback-source-digest"] // "")]
         | select((.[0:2]) | all(.[]; type == "string" and length > 0))
         | @tsv
       ') || { echo "error: StatefulSet changed before rollback revision resolution" >&2; exit 3; }
@@ -1359,12 +1559,21 @@ case "$COMMAND" in
     rollback_checkpoint_name=$(printf '%s' "$rollback_references" | cut -f4)
     rollback_checkpoint_uid=$(printf '%s' "$rollback_references" | cut -f5)
     rollback_checkpoint_digest=$(printf '%s' "$rollback_references" | cut -f6)
-    if [ -n "$rollback_checkpoint_operation$rollback_checkpoint_name$rollback_checkpoint_uid$rollback_checkpoint_digest" ]; then
+    rollback_source_name=$(printf '%s' "$rollback_references" | cut -f7)
+    rollback_source_uid=$(printf '%s' "$rollback_references" | cut -f8)
+    rollback_source_digest=$(printf '%s' "$rollback_references" | cut -f9)
+    if [ -n "$rollback_checkpoint_operation$rollback_checkpoint_name$rollback_checkpoint_uid$rollback_checkpoint_digest$rollback_source_name$rollback_source_uid$rollback_source_digest" ]; then
       if [ -z "$rollback_checkpoint_operation" ] || [ -z "$rollback_checkpoint_name" ] || \
-        [ -z "$rollback_checkpoint_uid" ] || ! [[ "$rollback_checkpoint_digest" =~ ^[0-9a-f]{64}$ ]]; then
+        [ -z "$rollback_checkpoint_uid" ] || ! [[ "$rollback_checkpoint_digest" =~ ^[0-9a-f]{64}$ ]] || \
+        [ -z "$rollback_source_name" ] || [ -z "$rollback_source_uid" ] || ! [[ "$rollback_source_digest" =~ ^[0-9a-f]{64}$ ]]; then
         echo "error: rollback checkpoint is incomplete or malformed; retained" >&2
         exit 3
       fi
+      rollback_source=$(owned_revision_by_digest "$rollback_revisions" "$rollback_uid" \
+        "$rollback_source_digest" "$rollback_source_uid") || {
+        echo "error: rollback checkpoint source content is unavailable; retained" >&2
+        exit 3
+      }
       rollback_target=$(printf '%s' "$rollback_revisions" | jq -ce --arg name "$rollback_update_revision" --arg uid "$rollback_uid" '
         [.items[] | select(.metadata.name == $name) | select(any(.metadata.ownerReferences[]?;
           .apiVersion == "apps/v1" and .kind == "StatefulSet" and .name == "agent-os-firstmate" and .uid == $uid and .controller == true))]
@@ -1390,6 +1599,13 @@ case "$COMMAND" in
         rollback_mode=resume
       fi
     else
+      rollback_source=$(printf '%s' "$rollback_revisions" | jq -ce --arg name "$rollback_update_revision" --arg uid "$rollback_uid" '
+        [.items[] | select(.metadata.name == $name) | select(any(.metadata.ownerReferences[]?;
+          .apiVersion == "apps/v1" and .kind == "StatefulSet" and .name == "agent-os-firstmate" and .uid == $uid and .controller == true))]
+        | select(length == 1) | .[0]') || { echo "error: current rollback source revision is unavailable" >&2; exit 3; }
+      rollback_source_name=$(printf '%s' "$rollback_source" | jq -r '.metadata.name')
+      rollback_source_uid=$(printf '%s' "$rollback_source" | jq -r '.metadata.uid')
+      rollback_source_digest=$(printf '%s' "$rollback_source" | jq -cS '.data.spec.template' | template_digest)
       rollback_selection=$(printf '%s' "$rollback_revisions" | jq -ce \
         --arg current "$rollback_current_revision" --arg update "$rollback_update_revision" \
         --arg uid "$rollback_uid" '
@@ -1426,7 +1642,8 @@ case "$COMMAND" in
       rollback_checkpoint_patch=$(jq -cn \
         --arg uid "$rollback_uid" --arg rv "$rollback_rv" --arg operation "$rollback_checkpoint_operation" \
         --arg name "$rollback_target_name" --arg targetUid "$rollback_target_uid" --arg digest "$rollback_target_digest" \
-        '{metadata:{uid:$uid,resourceVersion:$rv,annotations:{"agent-os.dev/rollback-operation":$operation,"agent-os.dev/rollback-target-name":$name,"agent-os.dev/rollback-target-uid":$targetUid,"agent-os.dev/rollback-target-digest":$digest}}}')
+        --arg sourceName "$rollback_source_name" --arg sourceUid "$rollback_source_uid" --arg sourceDigest "$rollback_source_digest" \
+        '{metadata:{uid:$uid,resourceVersion:$rv,annotations:{"agent-os.dev/rollback-operation":$operation,"agent-os.dev/rollback-target-name":$name,"agent-os.dev/rollback-target-uid":$targetUid,"agent-os.dev/rollback-target-digest":$digest,"agent-os.dev/rollback-source-name":$sourceName,"agent-os.dev/rollback-source-uid":$sourceUid,"agent-os.dev/rollback-source-digest":$sourceDigest}}}')
       if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" patch StatefulSet agent-os-firstmate \
         --type=merge -p "$rollback_checkpoint_patch" >/dev/null; then
         echo "error: rollback checkpoint CAS conflicted; no template mutation attempted" >&2
@@ -1438,20 +1655,48 @@ case "$COMMAND" in
       rollback_rv=$(printf '%s' "$rollback_state" | jq -er \
         --arg uid "$rollback_uid" --arg operation "$rollback_checkpoint_operation" \
         --arg name "$rollback_checkpoint_name" --arg targetUid "$rollback_checkpoint_uid" \
-        --arg digest "$rollback_target_digest" '
+        --arg digest "$rollback_target_digest" --arg sourceName "$rollback_source_name" \
+        --arg sourceUid "$rollback_source_uid" --arg sourceDigest "$rollback_source_digest" '
         select(.metadata.uid == $uid)
         | select(.metadata.annotations["agent-os.dev/rollback-operation"] == $operation)
         | select(.metadata.annotations["agent-os.dev/rollback-target-name"] == $name)
         | select(.metadata.annotations["agent-os.dev/rollback-target-uid"] == $targetUid)
         | select(.metadata.annotations["agent-os.dev/rollback-target-digest"] == $digest)
+        | select(.metadata.annotations["agent-os.dev/rollback-source-name"] == $sourceName)
+        | select(.metadata.annotations["agent-os.dev/rollback-source-uid"] == $sourceUid)
+        | select(.metadata.annotations["agent-os.dev/rollback-source-digest"] == $sourceDigest)
         | .metadata.resourceVersion') || { echo "error: rollback checkpoint did not persist exactly" >&2; exit 3; }
+    fi
+    verify_revision_service_account "$rollback_source"
+    rollback_source_template=$(printf '%s' "$rollback_source" | jq -c '.data.spec.template')
+    rollback_source_account=$(printf '%s' "$rollback_source" | jq -er '.data.spec.template.spec.serviceAccountName') || {
+      echo "error: rollback source ServiceAccount dependency is unavailable" >&2
+      exit 3
+    }
+    rollback_target_account=$(printf '%s' "$rollback_target" | jq -er '.data.spec.template.spec.serviceAccountName') || {
+      echo "error: rollback target ServiceAccount dependency is unavailable" >&2
+      exit 3
+    }
+    rollback_authority_mode=$(printf '%s' "$previous" | cut -f2)
+    case "$rollback_authority_mode" in namespace|cluster-admin|none) ;; *) echo "error: rollback RBAC mode is unavailable" >&2; exit 3 ;; esac
+    if ! transfer_runtime_authority "$rollback_authority_mode" "$rollback_source_account" "$rollback_target_account"; then
+      transfer_runtime_authority "$rollback_authority_mode" "$rollback_target_account" "$rollback_source_account" || {
+        echo "incomplete: rollback authority transfer failed and compensation is unverified" >&2
+        exit 3
+      }
+      echo "error: rollback authority transfer failed before revision activation; current authority restored" >&2
+      exit 3
     fi
     if [ "$rollback_mode" = patch ]; then
       rollback_patch=$(printf '%s' "$rollback_target" | jq -c --arg uid "$rollback_uid" --arg rv "$rollback_rv" \
         '.data * {metadata:{uid:$uid,resourceVersion:$rv}}')
       if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" patch StatefulSet agent-os-firstmate \
         --type=strategic -p "$rollback_patch" >/dev/null; then
-        echo "error: StatefulSet rollback CAS conflicted; no rollout-undo fallback attempted" >&2
+        compensate_rollback "$rollback_source_template" "$rollback_source_account" "$rollback_target_account" "$rollback_authority_mode" || {
+          echo "incomplete: StatefulSet rollback CAS conflicted and compensation is unverified" >&2
+          exit 3
+        }
+        echo "error: StatefulSet rollback CAS conflicted; current revision and authority restored" >&2
         exit 3
       fi
       rollback_current=$(live_resource_record namespaced StatefulSet agent-os-firstmate)
@@ -1462,19 +1707,28 @@ case "$COMMAND" in
       fi
     fi
     if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" rollout status statefulset/agent-os-firstmate --timeout=180s; then
+      if compensate_rollback "$rollback_source_template" "$rollback_source_account" "$rollback_target_account" "$rollback_authority_mode"; then
+        echo "incomplete: rollback readiness failed; current revision and authority restored" >&2
+        exit 3
+      fi
       report_rollback_failure "$rollback_target_name" "$rollback_target_revision" "$rollback_target_uid" "$rollback_target_digest" \
         "$rollback_checkpoint_operation" "$rollback_checkpoint_name" "$rollback_checkpoint_uid"
       exit 3
     fi
     rollback_verify_state=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" \
       --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get statefulset agent-os-firstmate -o json) || {
-      echo "error: rollback verification StatefulSet evidence unavailable; checkpoint retained target-digest=$rollback_target_digest" >&2
+      compensate_rollback "$rollback_source_template" "$rollback_source_account" "$rollback_target_account" "$rollback_authority_mode" || {
+        echo "error: rollback verification evidence and compensation are unavailable; checkpoint retained target-digest=$rollback_target_digest" >&2
+        exit 3
+      }
+      echo "incomplete: rollback verification evidence was unavailable; current revision and authority restored" >&2
       exit 3
     }
     rollback_verify_refs=$(printf '%s' "$rollback_verify_state" | jq -er \
       --arg uid "$rollback_uid" --arg installation "$INSTALLATION_ID" \
       --arg operation "$rollback_checkpoint_operation" --arg name "$rollback_checkpoint_name" \
-      --arg targetUid "$rollback_checkpoint_uid" --arg digest "$rollback_target_digest" '
+      --arg targetUid "$rollback_checkpoint_uid" --arg digest "$rollback_target_digest" \
+      --arg sourceName "$rollback_source_name" --arg sourceUid "$rollback_source_uid" --arg sourceDigest "$rollback_source_digest" '
       select(.metadata.uid == $uid)
       | select(.metadata.labels["app.kubernetes.io/managed-by"] == "agent-os")
       | select(.metadata.annotations["agent-os.dev/installation-id"] == $installation)
@@ -1482,13 +1736,24 @@ case "$COMMAND" in
       | select(.metadata.annotations["agent-os.dev/rollback-target-name"] == $name)
       | select(.metadata.annotations["agent-os.dev/rollback-target-uid"] == $targetUid)
       | select(.metadata.annotations["agent-os.dev/rollback-target-digest"] == $digest)
+      | select(.metadata.annotations["agent-os.dev/rollback-source-name"] == $sourceName)
+      | select(.metadata.annotations["agent-os.dev/rollback-source-uid"] == $sourceUid)
+      | select(.metadata.annotations["agent-os.dev/rollback-source-digest"] == $sourceDigest)
       | [.status.currentRevision,.status.updateRevision,.metadata.resourceVersion] | @tsv') || {
-      echo "error: rollback verification mismatch: StatefulSet identity or checkpoint changed; retained target-digest=$rollback_target_digest" >&2
+      compensate_rollback "$rollback_source_template" "$rollback_source_account" "$rollback_target_account" "$rollback_authority_mode" || {
+        echo "error: rollback verification mismatch and compensation failed; retained target-digest=$rollback_target_digest" >&2
+        exit 3
+      }
+      echo "incomplete: rollback verification mismatch; current revision and authority restored" >&2
       exit 3
     }
     rollback_revisions=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" \
       --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get controllerrevisions.apps -o json) || {
-      echo "error: rollback verification revision evidence unavailable; checkpoint retained target-digest=$rollback_target_digest" >&2
+      compensate_rollback "$rollback_source_template" "$rollback_source_account" "$rollback_target_account" "$rollback_authority_mode" || {
+        echo "error: rollback revision evidence and compensation are unavailable; checkpoint retained target-digest=$rollback_target_digest" >&2
+        exit 3
+      }
+      echo "incomplete: rollback revision evidence was unavailable; current revision and authority restored" >&2
       exit 3
     }
     for rollback_verify_name in "$(printf '%s' "$rollback_verify_refs" | cut -f1)" "$(printf '%s' "$rollback_verify_refs" | cut -f2)"; do
@@ -1496,17 +1761,29 @@ case "$COMMAND" in
         [.items[] | select(.metadata.name == $name) | select(any(.metadata.ownerReferences[]?;
           .apiVersion == "apps/v1" and .kind == "StatefulSet" and .name == "agent-os-firstmate" and .uid == $uid and .controller == true))]
         | select(length == 1) | .[0]') || {
-        echo "error: rollback verification mismatch: revision '$rollback_verify_name' is unavailable or foreign; retained target-digest=$rollback_target_digest" >&2
+        compensate_rollback "$rollback_source_template" "$rollback_source_account" "$rollback_target_account" "$rollback_authority_mode" || {
+          echo "error: rollback revision '$rollback_verify_name' is unavailable and compensation failed" >&2
+          exit 3
+        }
+        echo "incomplete: rollback revision '$rollback_verify_name' is unavailable; current revision and authority restored" >&2
         exit 3
       }
       rollback_verify_digest=$(printf '%s' "$rollback_verify_revision" | jq -cS '.data.spec.template' | template_digest)
       if [ "$rollback_verify_digest" != "$rollback_target_digest" ]; then
-        echo "error: rollback verification mismatch: revision '$rollback_verify_name' content differs; retained target-digest=$rollback_target_digest" >&2
+        compensate_rollback "$rollback_source_template" "$rollback_source_account" "$rollback_target_account" "$rollback_authority_mode" || {
+          echo "error: rollback revision '$rollback_verify_name' content differs and compensation failed" >&2
+          exit 3
+        }
+        echo "incomplete: rollback revision '$rollback_verify_name' content differs; current revision and authority restored" >&2
         exit 3
       fi
     done
+    transfer_runtime_authority "$rollback_authority_mode" "$rollback_source_account" "$rollback_target_account" || {
+      echo "error: rollback completed but runtime authority postcondition changed" >&2
+      exit 3
+    }
     rollback_clear_patch=$(jq -cn --arg uid "$rollback_uid" --arg rv "$(printf '%s' "$rollback_verify_refs" | cut -f3)" \
-      '{metadata:{uid:$uid,resourceVersion:$rv,annotations:{"agent-os.dev/rollback-operation":null,"agent-os.dev/rollback-target-name":null,"agent-os.dev/rollback-target-uid":null,"agent-os.dev/rollback-target-digest":null}}}')
+      '{metadata:{uid:$uid,resourceVersion:$rv,annotations:{"agent-os.dev/rollback-operation":null,"agent-os.dev/rollback-target-name":null,"agent-os.dev/rollback-target-uid":null,"agent-os.dev/rollback-target-digest":null,"agent-os.dev/rollback-source-name":null,"agent-os.dev/rollback-source-uid":null,"agent-os.dev/rollback-source-digest":null}}}')
     if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" patch StatefulSet agent-os-firstmate \
       --type=merge -p "$rollback_clear_patch" >/dev/null; then
       echo "error: rollback completed but checkpoint clear CAS conflicted; retained target-digest=$rollback_target_digest" >&2
@@ -1530,16 +1807,40 @@ case "$COMMAND" in
     previous=$(workload_state)
     require_workload_owned "$previous" optional
     previous_service_account=
+    previous_workload_uid=
+    retained_legacy_service_account=
     if [ -n "$previous" ]; then
       previous_service_account=$(workload_service_account)
+      previous_workload_record=$(live_resource_record namespaced StatefulSet agent-os-firstmate)
+      previous_workload_uid=$(printf '%s' "$previous_workload_record" | cut -f4)
+      [ -n "$previous_workload_uid" ] || { echo "error: uninstall requires exact StatefulSet UID evidence" >&2; exit 3; }
+    fi
+    legacy_identity=$(live_resource_identity ServiceAccount agent-os-firstmate)
+    if [ -n "$legacy_identity" ]; then
+      [ "$legacy_identity" = "agent-os-firstmate"$'\t'"agent-os"$'\t'"$INSTALLATION_ID" ] || {
+        echo "error: retained legacy ServiceAccount is foreign" >&2
+        exit 3
+      }
+      retained_legacy_service_account=agent-os-firstmate
     fi
     previous_mode=$(printf '%s' "$previous" | cut -f2)
     previous_cleanup=$(printf '%s' "$previous" | cut -f3)
     delete_rendered_namespaced_resources
+    if [ -n "$previous_workload_uid" ] || [ -n "$retained_legacy_service_account" ]; then
+      wait_for_revision_history_absence "$previous_workload_uid"
+    fi
     if [ -n "$previous_service_account" ] && [ "$previous_service_account" != "$SERVICE_ACCOUNT_NAME" ]; then
       delete_owned_resource namespaced ServiceAccount "$previous_service_account" 180
     fi
+    if [ -n "$retained_legacy_service_account" ] && \
+      [ "$retained_legacy_service_account" != "$previous_service_account" ] && \
+      [ "$retained_legacy_service_account" != "$SERVICE_ACCOUNT_NAME" ]; then
+      delete_owned_resource namespaced ServiceAccount "$retained_legacy_service_account" 180
+    fi
     delete_namespace_rbac
+    if [ "$DESIRED_RBAC" = namespace ] || [ "$previous_mode" = namespace ]; then
+      REMOVE_CONTROL_ACCESS=1
+    fi
     if [ "$DELETE_NAMESPACE" -eq 1 ]; then
       delete_owned_empty_namespace
     fi

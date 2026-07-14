@@ -9,27 +9,33 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends git \
   && rm -rf /var/lib/apt/lists/*
 
-COPY . /opt/agent-os
+COPY image/agent-os-source.tar image/agent-os-bootstrap.tar image/agent-os-source.attestation /tmp/
 
 RUN set -eu; \
   test -n "$AGENT_OS_SOURCE_COMMIT"; \
   test -n "$AGENT_OS_SOURCE_TREE"; \
   test "$AGENT_OS_SOURCE_BRANCH" = main; \
   test "$AGENT_OS_SOURCE_ORIGIN" = https://github.com/akua-dev/agent-os.git; \
-  git init --bare /opt/agent-os-bootstrap.git; \
-  git --git-dir=/opt/agent-os-bootstrap.git bundle verify /opt/agent-os/image/agent-os-source.bundle; \
-  git --git-dir=/opt/agent-os-bootstrap.git fetch --no-tags /opt/agent-os/image/agent-os-source.bundle \
-    "$AGENT_OS_SOURCE_COMMIT:refs/heads/$AGENT_OS_SOURCE_BRANCH"; \
+  grep -Fx "commit=$AGENT_OS_SOURCE_COMMIT" /tmp/agent-os-source.attestation; \
+  grep -Fx "tree=$AGENT_OS_SOURCE_TREE" /tmp/agent-os-source.attestation; \
+  grep -Fx "branch=$AGENT_OS_SOURCE_BRANCH" /tmp/agent-os-source.attestation; \
+  grep -Fx "origin=$AGENT_OS_SOURCE_ORIGIN" /tmp/agent-os-source.attestation; \
+  grep -Fx "ref=refs/heads/$AGENT_OS_SOURCE_BRANCH" /tmp/agent-os-source.attestation; \
+  source_sha=$(sha256sum /tmp/agent-os-source.tar | awk '{print $1}'); \
+  bootstrap_sha=$(sha256sum /tmp/agent-os-bootstrap.tar | awk '{print $1}'); \
+  grep -Fx "source_sha256=$source_sha" /tmp/agent-os-source.attestation; \
+  grep -Fx "bootstrap_sha256=$bootstrap_sha" /tmp/agent-os-source.attestation; \
+  mkdir -p /opt/agent-os; \
+  tar -xf /tmp/agent-os-source.tar -C /opt/agent-os; \
+  tar -xf /tmp/agent-os-bootstrap.tar -C /opt; \
+  mv /opt/bootstrap.git /opt/agent-os-bootstrap.git; \
   test "$(git --git-dir=/opt/agent-os-bootstrap.git rev-parse "$AGENT_OS_SOURCE_COMMIT")" = "$AGENT_OS_SOURCE_COMMIT"; \
   test "$(git --git-dir=/opt/agent-os-bootstrap.git rev-parse "$AGENT_OS_SOURCE_COMMIT^{tree}")" = "$AGENT_OS_SOURCE_TREE"; \
-  git --git-dir=/opt/agent-os-bootstrap.git update-ref "refs/heads/$AGENT_OS_SOURCE_BRANCH" "$AGENT_OS_SOURCE_COMMIT"; \
-  git --git-dir=/opt/agent-os-bootstrap.git update-ref "refs/remotes/origin/$AGENT_OS_SOURCE_BRANCH" "$AGENT_OS_SOURCE_COMMIT"; \
-  git --git-dir=/opt/agent-os-bootstrap.git symbolic-ref HEAD "refs/heads/$AGENT_OS_SOURCE_BRANCH"; \
-  git --git-dir=/opt/agent-os-bootstrap.git remote add origin "$AGENT_OS_SOURCE_ORIGIN"; \
+  test -s /opt/agent-os-bootstrap.git/shallow; \
   test "$(git --git-dir=/opt/agent-os-bootstrap.git remote get-url origin)" = "$AGENT_OS_SOURCE_ORIGIN"; \
   test -z "$(git --git-dir=/opt/agent-os-bootstrap.git ls-tree -r --name-only "$AGENT_OS_SOURCE_COMMIT" -- config data projects state .no-mistakes)"; \
-  rm -rf /opt/agent-os-bootstrap.git/hooks; \
-  rm -f /opt/agent-os/image/agent-os-source.bundle; \
+  test ! -e /opt/agent-os-bootstrap.git/hooks; \
+  rm -f /tmp/agent-os-source.tar /tmp/agent-os-bootstrap.tar /tmp/agent-os-source.attestation; \
   printf '%s\n' "$AGENT_OS_SOURCE_COMMIT" > /opt/agent-os-source.commit; \
   printf '%s\n' "$AGENT_OS_SOURCE_TREE" > /opt/agent-os-source.tree; \
   printf '%s\n' "$AGENT_OS_SOURCE_BRANCH" > /opt/agent-os-source.branch; \

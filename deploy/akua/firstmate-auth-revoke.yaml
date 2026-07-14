@@ -1,6 +1,7 @@
 metadata:
   annotations:
     agent-os.dev/akua-auth-secret: null
+    agent-os.dev/akua-auth-rejected-record: null
 spec:
   template:
     spec:

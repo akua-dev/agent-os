@@ -11,7 +11,7 @@ SOURCE_TREE=$(cat /opt/agent-os-source.tree)
 SOURCE_BRANCH=$(cat /opt/agent-os-source.branch)
 SOURCE_ORIGIN=$(cat /opt/agent-os-source.origin)
 case "$SOURCE_BRANCH" in ''|*[!A-Za-z0-9._/-]*|/*|*/|*..*) echo "error: image source branch provenance is invalid" >&2; exit 2 ;; esac
-TRUSTED_REF="refs/remotes/origin/$SOURCE_BRANCH"
+TRUSTED_REF="refs/remotes/agent-os-verified/$SOURCE_BRANCH"
 IMAGE_REF="refs/remotes/agent-os-image/$SOURCE_BRANCH"
 
 mkdir -p \
@@ -74,7 +74,6 @@ else
   }
   if git -C "$FM_ROOT" merge-base --is-ancestor HEAD "$IMAGE_REF"; then
     git -C "$FM_ROOT" merge --ff-only "$IMAGE_REF"
-    git -C "$FM_ROOT" update-ref "$TRUSTED_REF" "$SOURCE_COMMIT"
   elif ! git -C "$FM_ROOT" merge-base --is-ancestor "$SOURCE_COMMIT" HEAD; then
     echo "error: canonical FM_ROOT source transition is not fast-forward compatible" >&2
     exit 2
@@ -86,14 +85,33 @@ fi
   echo "error: canonical FM_ROOT is not on the declared default branch" >&2
   exit 2
 }
-[ "$(git -C "$FM_ROOT" rev-parse HEAD)" = "$(git -C "$FM_ROOT" rev-parse "$TRUSTED_REF")" ] || {
-  echo "error: canonical FM_ROOT HEAD is not the exact trusted remote ref" >&2
-  exit 2
-}
 [ "$(git -C "$FM_ROOT" rev-parse "$SOURCE_COMMIT^{tree}")" = "$SOURCE_TREE" ] || {
   echo "error: canonical FM_ROOT image source tree provenance failed" >&2
   exit 2
 }
+[ "$(git -C "$FM_ROOT" remote get-url origin)" = "$SOURCE_ORIGIN" ] || {
+  echo "error: canonical FM_ROOT origin provenance changed" >&2
+  exit 2
+}
+GIT_TERMINAL_PROMPT=0 git -c credential.helper= -C "$FM_ROOT" fetch --no-tags --prune origin \
+  "refs/heads/$SOURCE_BRANCH:$TRUSTED_REF" || {
+  echo "error: fresh trusted source provenance is unavailable" >&2
+  exit 3
+}
+git -C "$FM_ROOT" merge-base --is-ancestor "$SOURCE_COMMIT" "$TRUSTED_REF" || {
+  echo "error: image source commit is not reachable from the fresh trusted ref" >&2
+  exit 2
+}
+git -C "$FM_ROOT" merge-base --is-ancestor HEAD "$TRUSTED_REF" || {
+  echo "error: canonical FM_ROOT contains source not reachable from the fresh trusted ref" >&2
+  exit 2
+}
+git -C "$FM_ROOT" merge --ff-only "$TRUSTED_REF"
+[ "$(git -C "$FM_ROOT" rev-parse HEAD)" = "$(git -C "$FM_ROOT" rev-parse "$TRUSTED_REF")" ] || {
+  echo "error: canonical FM_ROOT HEAD is not the exact fresh trusted remote ref" >&2
+  exit 2
+}
+git -C "$FM_ROOT" update-ref "refs/remotes/origin/$SOURCE_BRANCH" "$TRUSTED_REF"
 [ -z "$(git -C "$FM_ROOT" status --porcelain)" ] || { echo "error: canonical FM_ROOT is not clean" >&2; exit 2; }
 [ -z "$(git -C "$FM_ROOT" ls-files -- config data projects state .no-mistakes)" ] || {
   echo "error: canonical FM_ROOT contains operational state" >&2
