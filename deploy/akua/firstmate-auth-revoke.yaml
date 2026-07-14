@@ -1,3 +1,6 @@
+metadata:
+  annotations:
+    agent-os.dev/akua-auth-secret: null
 spec:
   template:
     spec:

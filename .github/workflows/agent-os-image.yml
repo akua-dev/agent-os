@@ -18,12 +18,55 @@ env:
   IMAGE: ghcr.io/akua-dev/agent-os
 
 jobs:
+  behavior:
+    name: Exact-source behavior gate
+    uses: ./.github/workflows/ci.yml
+
+  provenance:
+    if: github.event_name == 'push'
+    name: Protected-main source provenance
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          fetch-depth: 0
+      - name: Verify publication source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          set -eu
+          if [ "$GITHUB_REF" = refs/heads/main ]; then
+            [ "$REF_PROTECTED" = true ] || { echo "::error::main is not reported protected"; exit 1; }
+          elif [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+            [ "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA" ] || {
+              echo "::error::release tag must point at the exact protected-main head"
+              exit 1
+            }
+            gh api "repos/$GITHUB_REPOSITORY/branches/main/protection" >/dev/null
+          else
+            echo "::error::unsupported publication ref $GITHUB_REF"
+            exit 1
+          fi
+
   validate:
-    if: github.event_name == 'pull_request'
     name: Validate linux/amd64 and linux/arm64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          fetch-depth: 0
+
+      - name: Prepare exact source bundle
+        id: source
+        run: |
+          set -eu
+          git bundle create image/agent-os-source.bundle HEAD
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tree=$(git rev-parse HEAD^{tree})" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
 
@@ -39,9 +82,13 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: mode=max
           sbom: true
+          build-args: |
+            AGENT_OS_SOURCE_COMMIT=${{ steps.source.outputs.commit }}
+            AGENT_OS_SOURCE_TREE=${{ steps.source.outputs.tree }}
 
   publish:
     if: github.event_name == 'push'
+    needs: [behavior, provenance, validate]
     name: Publish linux/amd64 and linux/arm64
     runs-on: ubuntu-latest
     permissions:
@@ -49,6 +96,16 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          fetch-depth: 0
+
+      - name: Prepare exact source bundle
+        id: source
+        run: |
+          set -eu
+          git bundle create image/agent-os-source.bundle HEAD
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tree=$(git rev-parse HEAD^{tree})" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
 
@@ -84,6 +141,9 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: mode=max
           sbom: true
+          build-args: |
+            AGENT_OS_SOURCE_COMMIT=${{ steps.source.outputs.commit }}
+            AGENT_OS_SOURCE_TREE=${{ steps.source.outputs.tree }}
 
       - name: Record published image digest
         run: |

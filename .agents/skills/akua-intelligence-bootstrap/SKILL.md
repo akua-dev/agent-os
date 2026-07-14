@@ -49,26 +49,21 @@ The public Firstmate package never accepts an Akua credential input or renders a
 Akua authorization belongs to the separate namespace-local integration overlay under `deploy/akua/`.
 The grant patch mounts only the selected Secret at `/var/run/secrets/agent-os/akua` and sets `AKUA_AUTH_HEADER_FILE=/var/run/secrets/agent-os/akua/authorization`.
 The Secret must contain one `authorization` key with the complete header and must live in the same namespace as the Firstmate StatefulSet.
-Render `__AKUA_AUTH_SECRET__` into a mode-`0600` temporary copy of `firstmate-auth-grant.yaml` and keep its path in `grant_patch`.
-Reject a Secret name that is not a Kubernetes DNS subdomain before substituting it.
 Never put the Secret value into the overlay, package inputs, or command arguments.
 
-Set `context` and `namespace` from the separately approved target and grant the overlay with this exact context-pinned strategic patch command:
+Set `context` and `namespace` from the separately approved target and grant the overlay through the serialized integration helper:
 
 ```sh
-kubectl --context "$context" -n "$namespace" patch statefulset agent-os-firstmate --type=strategic --patch-file "$grant_patch"
-kubectl --context "$context" -n "$namespace" rollout status statefulset/agent-os-firstmate --timeout=180s
+AGENT_OS_CONTEXT="$context" AGENT_OS_NAMESPACE="$namespace" bin/agent-os-akua-auth.sh grant "$secret_name"
 ```
 
-Destroy the temporary grant patch after rollout.
+The helper holds the installation-wide lifecycle Lease, validates exact StatefulSet UID and resourceVersion, verifies the named Secret reference without reading Secret bytes, applies one CAS strategic patch, and verifies both the retained StatefulSet overlay and its exact-owned Pod.
 
 Revocation is owned by the same integration boundary.
-Keep the path to `firstmate-auth-revoke.yaml` in `revoke_patch`.
-Revoke the Akua API token and prove it fails first, then revoke the overlay with the same exact target and patch type:
+Revoke the Akua API token and prove it fails first, then revoke the overlay through the same serialized helper:
 
 ```sh
-kubectl --context "$context" -n "$namespace" patch statefulset agent-os-firstmate --type=strategic --patch-file "$revoke_patch"
-kubectl --context "$context" -n "$namespace" rollout status statefulset/agent-os-firstmate --timeout=180s
+AGENT_OS_CONTEXT="$context" AGENT_OS_NAMESPACE="$namespace" bin/agent-os-akua-auth.sh revoke "$secret_name"
 ```
 
 Delete only the named namespace-local Secret after explicit cleanup approval.

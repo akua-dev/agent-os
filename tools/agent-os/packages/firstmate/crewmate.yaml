@@ -76,9 +76,6 @@ spec:
       volumeMounts:
         - name: home
           mountPath: /home/agent
-        - name: home
-          mountPath: /usr/local
-          subPath: usr-local
         - name: ai-auth
           mountPath: /var/run/secrets/agent-os/pi
           readOnly: true

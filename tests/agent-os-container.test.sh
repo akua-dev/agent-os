@@ -62,10 +62,12 @@ assert_grep 'never create or read operational state through repo-relative' "$ROO
 assert_grep 'pass a provider-qualified model id' "$ROOT/.agents/skills/harness-adapters/SKILL.md" \
   "Pi dispatch must preserve the selected provider route"
 assert_grep 'XDG_CONFIG_HOME=/home/agent/.config' "$ROOT/Dockerfile" "image must persist XDG configuration"
-assert_grep 'NPM_CONFIG_PREFIX=/usr/local' "$ROOT/Dockerfile" "global npm installs must use persistent /usr/local"
+assert_grep 'NPM_CONFIG_PREFIX=/home/agent/.local' "$ROOT/Dockerfile" "global npm installs must use the persistent user prefix"
 assert_grep 'PATH=/home/agent/.local/bin:/home/agent/.bun/bin:/home/agent/.cargo/bin:/usr/local/bin' "$ROOT/Dockerfile" \
   "persistent tool prefixes must lead PATH"
-assert_grep '/opt/image-usr-local' "$ROOT/Dockerfile" "image must retain a seed copy of /usr/local"
+assert_grep 'agent-os-image-usr-local.manifest.sha256' "$ROOT/Dockerfile" "image must authenticate immutable /usr/local ownership"
+assert_no_grep 'mountPath = "/usr/local"' "$ROOT/tools/agent-os/packages/firstmate/package.k" \
+  "image-owned /usr/local must not be overlaid by persistent state"
 # shellcheck disable=SC2016 # Match the literal Docker build argument reference.
 assert_grep 'akua-dev/akua/releases/download/v${AKUA_VERSION}' "$ROOT/Dockerfile" "image must install Akua from its release"
 # shellcheck disable=SC2016 # Match the literal Docker build argument reference.
@@ -109,6 +111,13 @@ assert_grep '.pi' "$ROOT/.dockerignore" "Pi credentials must stay out of the bui
 assert_grep '.codex' "$ROOT/.dockerignore" "Codex credentials must stay out of the build context"
 assert_grep 'node_modules' "$ROOT/.dockerignore" "host dependencies must stay out of the build context"
 assert_grep '.repos' "$ROOT/.dockerignore" "development source checkouts must stay out of the build context"
+assert_grep '!.pi/extensions/fm-primary-pi-watch.ts' "$ROOT/.dockerignore" "tracked Pi supervision controls must enter the image"
+assert_grep '!.codex/hooks.json' "$ROOT/.dockerignore" "tracked Codex supervision controls must enter the image"
+assert_grep '!.opencode/plugins/fm-primary-watch-arm.js' "$ROOT/.dockerignore" "tracked OpenCode supervision controls must enter the image"
+assert_grep 'agent-os-source.bundle' "$ROOT/Dockerfile" "image must bootstrap an exact source commit without host Git metadata"
+assert_grep 'rev-parse HEAD^{tree}' "$ROOT/Dockerfile" "image source bootstrap must verify its exact tree"
+assert_grep 'merge --ff-only' "$ROOT/bin/agent-os-container-entrypoint.sh" "persistent source transitions must be fast-forward only"
+assert_grep 'FM_ROOT_OVERRIDE=' "$ROOT/bin/agent-os-container-entrypoint.sh" "runtime must use the persistent canonical Firstmate repository"
 assert_grep 'https://github.com/ogulcancelik/herdr/tree/v0.7.3' "$ROOT/THIRD_PARTY_NOTICES.md" \
   "Herdr's exact corresponding source must be named"
 assert_present "$ROOT/THIRD_PARTY_SOURCES.md" \
@@ -140,8 +149,12 @@ assert_grep '  validate:' "$IMAGE_WORKFLOW" \
   "pull requests must use a distinct read-only validation job"
 assert_grep '  publish:' "$IMAGE_WORKFLOW" \
   "push and tag publication must use a distinct privileged job"
-assert_grep "if: github.event_name == 'push'" "$IMAGE_WORKFLOW" \
-  "the packages-write job must be restricted to protected push and tag events"
+assert_grep 'needs: [behavior, provenance, validate]' "$IMAGE_WORKFLOW" \
+  "the packages-write job must require exact behavior, provenance, and image gates"
+assert_grep 'github.ref_protected' "$IMAGE_WORKFLOW" \
+  "main publication must require GitHub protected-ref provenance"
+assert_grep 'release tag must point at the exact protected-main head' "$IMAGE_WORKFLOW" \
+  "tag publication must require the exact tested protected-main commit"
 assert_grep 'Section 13' "$ROOT/docs/herdr-compliance.md" \
   "the Herdr audit must account for the network-interaction clause"
 assert_grep 'https://github.com/akua-dev/akua/tree/v0.8.25' "$ROOT/THIRD_PARTY_NOTICES.md" \

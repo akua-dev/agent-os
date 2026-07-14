@@ -4,6 +4,11 @@ set -eu
 
 FM_HOME=${FM_HOME:-/home/agent}
 export FM_HOME HOME="$FM_HOME"
+FM_ROOT=${FM_ROOT_OVERRIDE:-$FM_HOME/firstmate}
+IMAGE_SOURCE=${AGENT_OS_IMAGE_SOURCE:-/opt/agent-os-bootstrap}
+SOURCE_COMMIT=$(cat /opt/agent-os-source.commit)
+SOURCE_TREE=$(cat /opt/agent-os-source.tree)
+SOURCE_ORIGIN=$(cat /opt/agent-os-source.origin)
 
 mkdir -p \
   "$FM_HOME/config" \
@@ -16,6 +21,44 @@ mkdir -p \
   "$HOME/.local/share" \
   "$HOME/.bun" \
   "$HOME/.cargo"
+
+if [ ! -e "$FM_ROOT/.git" ]; then
+  [ ! -e "$FM_ROOT" ] || { echo "error: canonical FM_ROOT exists without Git provenance" >&2; exit 2; }
+  git clone --no-local "$IMAGE_SOURCE" "$FM_ROOT"
+  git -C "$FM_ROOT" checkout --detach "$SOURCE_COMMIT"
+  git -C "$FM_ROOT" remote set-url origin "$SOURCE_ORIGIN"
+  rm -rf "$FM_ROOT/.git/hooks"
+else
+  [ -d "$FM_ROOT/.git" ] || { echo "error: canonical FM_ROOT Git metadata is invalid" >&2; exit 2; }
+  [ "$(git -C "$FM_ROOT" remote get-url origin)" = "$SOURCE_ORIGIN" ] || {
+    echo "error: canonical FM_ROOT origin provenance changed" >&2
+    exit 2
+  }
+  [ -z "$(git -C "$FM_ROOT" status --porcelain)" ] || { echo "error: canonical FM_ROOT is not clean" >&2; exit 2; }
+  if git -C "$FM_ROOT" merge-base --is-ancestor HEAD "$SOURCE_COMMIT"; then
+    git -C "$FM_ROOT" fetch --no-tags "$IMAGE_SOURCE" "$SOURCE_COMMIT"
+    git -C "$FM_ROOT" merge --ff-only "$SOURCE_COMMIT"
+  elif ! git -C "$FM_ROOT" merge-base --is-ancestor "$SOURCE_COMMIT" HEAD; then
+    echo "error: canonical FM_ROOT source transition is not fast-forward compatible" >&2
+    exit 2
+  fi
+fi
+
+[ "$(git -C "$FM_ROOT" rev-parse "$SOURCE_COMMIT^{tree}")" = "$SOURCE_TREE" ] || {
+  echo "error: canonical FM_ROOT image source tree provenance failed" >&2
+  exit 2
+}
+[ -z "$(git -C "$FM_ROOT" status --porcelain)" ] || { echo "error: canonical FM_ROOT is not clean" >&2; exit 2; }
+[ -z "$(git -C "$FM_ROOT" ls-files -- config data projects state .no-mistakes)" ] || {
+  echo "error: canonical FM_ROOT contains operational state" >&2
+  exit 2
+}
+find "$FM_ROOT/.git/hooks" -mindepth 1 -print -quit 2>/dev/null | grep -q . && {
+  echo "error: canonical FM_ROOT contains Git hooks" >&2
+  exit 2
+}
+export FM_ROOT_OVERRIDE="$FM_ROOT"
+ln -sfn "$FM_ROOT/tools/agent-os/src/cli.ts" "$HOME/.local/bin/agent-os"
 
 if [ -n "${AGENT_OS_PI_AUTH_FILE:-}" ]; then
   if [ ! -f "$AGENT_OS_PI_AUTH_FILE" ]; then
@@ -103,5 +146,5 @@ for tool in gh-axi chrome-devtools-axi lavish-axi; do
   fi
 done
 
-cd /opt/agent-os
+cd "$FM_ROOT"
 exec herdr server

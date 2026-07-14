@@ -9,6 +9,9 @@ ARG NO_MISTAKES_VERSION=1.34.0
 ARG BUN_VERSION=1.3.14
 ARG AKUA_VERSION=0.8.25
 ARG K9S_VERSION=0.51.0
+ARG AGENT_OS_SOURCE_COMMIT
+ARG AGENT_OS_SOURCE_TREE
+ARG AGENT_OS_SOURCE_ORIGIN=https://github.com/akua-dev/agent-os.git
 
 COPY image/debian.sources /etc/apt/sources.list.d/debian.sources
 
@@ -157,15 +160,33 @@ ENV FM_HOME=/home/agent \
     XDG_CONFIG_HOME=/home/agent/.config \
     XDG_DATA_HOME=/home/agent/.local/share \
     XDG_CACHE_HOME=/home/agent/.cache \
-    NPM_CONFIG_PREFIX=/usr/local \
+    NPM_CONFIG_PREFIX=/home/agent/.local \
     BUN_INSTALL=/home/agent/.bun \
     CARGO_HOME=/home/agent/.cargo \
     PATH=/home/agent/.local/bin:/home/agent/.bun/bin:/home/agent/.cargo/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin \
     HERDR_SESSION=default
 
-RUN mkdir -p /home/agent /opt/agent-os /opt/image-usr-local
+RUN mkdir -p /home/agent /opt/agent-os
 
 COPY . /opt/agent-os
+COPY image/agent-os-source.bundle /opt/agent-os-source.bundle
+
+RUN set -eu; \
+  test -n "$AGENT_OS_SOURCE_COMMIT"; \
+  test -n "$AGENT_OS_SOURCE_TREE"; \
+  git bundle verify /opt/agent-os-source.bundle; \
+  git clone --no-local /opt/agent-os-source.bundle /opt/agent-os-bootstrap; \
+  git -C /opt/agent-os-bootstrap checkout --detach "$AGENT_OS_SOURCE_COMMIT"; \
+  test "$(git -C /opt/agent-os-bootstrap rev-parse HEAD)" = "$AGENT_OS_SOURCE_COMMIT"; \
+  test "$(git -C /opt/agent-os-bootstrap rev-parse HEAD^{tree})" = "$AGENT_OS_SOURCE_TREE"; \
+  test -z "$(git -C /opt/agent-os-bootstrap status --porcelain)"; \
+  test -z "$(git -C /opt/agent-os-bootstrap ls-files -- config data projects state .no-mistakes)"; \
+  rm -rf /opt/agent-os-bootstrap/.git/hooks; \
+  git -C /opt/agent-os-bootstrap remote set-url origin "$AGENT_OS_SOURCE_ORIGIN"; \
+  test "$(git -C /opt/agent-os-bootstrap remote get-url origin)" = "$AGENT_OS_SOURCE_ORIGIN"; \
+  printf '%s\n' "$AGENT_OS_SOURCE_COMMIT" > /opt/agent-os-source.commit; \
+  printf '%s\n' "$AGENT_OS_SOURCE_TREE" > /opt/agent-os-source.tree; \
+  printf '%s\n' "$AGENT_OS_SOURCE_ORIGIN" > /opt/agent-os-source.origin
 
 RUN install -D -m 0644 /opt/agent-os/THIRD_PARTY_NOTICES.md /usr/share/doc/agent-os/THIRD_PARTY_NOTICES.md \
   && install -D -m 0644 /opt/agent-os/THIRD_PARTY_SOURCES.md /usr/share/doc/agent-os/THIRD_PARTY_SOURCES.md
@@ -173,7 +194,10 @@ RUN install -D -m 0644 /opt/agent-os/THIRD_PARTY_NOTICES.md /usr/share/doc/agent
 RUN cd /opt/agent-os/tools/agent-os \
   && bun install --frozen-lockfile --production --ignore-scripts \
   && ln -s /opt/agent-os/tools/agent-os/src/cli.ts /usr/local/bin/agent-os \
-  && cp -a /usr/local/. /opt/image-usr-local/
+  && cd /usr/local \
+  && find . \( -type f -o -type l \) -print | LC_ALL=C sort | while IFS= read -r path; do sha256sum "$path"; done > /opt/agent-os-image-usr-local.manifest \
+  && cd /opt \
+  && sha256sum agent-os-image-usr-local.manifest > agent-os-image-usr-local.manifest.sha256
 
-WORKDIR /opt/agent-os
+WORKDIR /home/agent/firstmate
 ENTRYPOINT ["/opt/agent-os/bin/agent-os-container-entrypoint.sh"]

@@ -50,7 +50,8 @@ Set `rbac: none` only when another reviewed authority handles those runtime oper
 Set `rbac: cluster-admin` only for an isolated intelligence cluster after reviewing the broader ClusterRoleBinding.
 
 The persistent home PVC defaults to `20Gi` and is mounted at `/home/agent`.
-`/usr/local` is a subpath of that same PVC so user-installed global tools survive Pod replacement.
+Image-owned `/usr/local` remains immutable, while user-installed tools persist under `/home/agent/.local` and the other home-scoped prefixes on the PVC.
+The init container authenticates an image ownership manifest and refuses ambiguous legacy `/usr/local` migrations instead of retaining stale image binaries.
 
 ## Operations
 

@@ -26,8 +26,8 @@ assert_grep 'kind = "ServiceAccount"' "$FIRSTMATE/package.k" \
   "firstmate package must create its cluster identity"
 assert_grep 'herdr", "status", "--json"' "$FIRSTMATE/package.k" \
   "Firstmate readiness must prove the Herdr server is responsive"
-assert_grep 'mountPath = "/usr/local"' "$FIRSTMATE/package.k" \
-  "Firstmate-installed tools must persist"
+assert_no_grep 'mountPath = "/usr/local"' "$FIRSTMATE/package.k" \
+  "image-owned Firstmate tools must remain immutable"
 
 assert_no_grep 'image: str = ' "$FIRSTMATE/package.k" \
   "the portable package must require an explicit immutable image digest"
@@ -71,12 +71,20 @@ assert_grep "\$patch: delete" "$ROOT/deploy/akua/firstmate-auth-revoke.yaml" \
   "Akua overlay must define explicit authorization mount cleanup"
 assert_grep 'mountPath: /var/run/secrets/agent-os/akua' "$ROOT/deploy/akua/firstmate-auth-revoke.yaml" \
   "Akua overlay cleanup must use the strategic merge key for volume mounts"
-assert_grep "kubectl --context \"\$context\" -n \"\$namespace\" patch statefulset agent-os-firstmate --type=strategic --patch-file \"\$grant_patch\"" \
+assert_grep 'bin/agent-os-akua-auth.sh grant "$secret_name"' \
   "$ROOT/.agents/skills/akua-intelligence-bootstrap/SKILL.md" \
-  "Akua authorization grant must pin context, namespace, target, patch type, and patch file"
-assert_grep "kubectl --context \"\$context\" -n \"\$namespace\" patch statefulset agent-os-firstmate --type=strategic --patch-file \"\$revoke_patch\"" \
+  "Akua authorization grant must use serialized exact-target integration"
+assert_grep 'bin/agent-os-akua-auth.sh revoke "$secret_name"' \
   "$ROOT/.agents/skills/akua-intelligence-bootstrap/SKILL.md" \
-  "Akua authorization revocation must use the same explicit targeting contract"
+  "Akua authorization revocation must use the same serialized integration"
+assert_grep 'agent-os.dev/akua-auth-secret' "$ROOT/deploy/akua/firstmate-auth-grant.yaml" \
+  "Akua authorization overlays must carry a verifiable non-secret reference marker"
+[ -x "$ROOT/bin/agent-os-akua-auth.sh" ] || \
+  fail "Akua authorization mutations must use the shipped serialized helper"
+assert_grep 'resourceVersion:' "$ROOT/bin/agent-os-akua-auth.sh" \
+  "Akua authorization mutations must carry StatefulSet CAS evidence"
+assert_grep 'get pod agent-os-firstmate-0 -o json' "$ROOT/bin/agent-os-akua-auth.sh" \
+  "Akua authorization mutations must verify the exact-owned rollout Pod"
 assert_grep 'a missing credential grant is rejected before any mate resource is created' "$ROOT/docs/agent-evals.md" \
   "the eval contract must match fail-closed runtime authorization"
 assert_grep '@sha256:' "$FIRSTMATE/inputs.example.yaml" \

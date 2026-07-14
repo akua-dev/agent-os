@@ -21,6 +21,9 @@ MANAGES_NAMESPACE=0
 DESIRED_RBAC=none
 INSTALLATION_ID=
 OPERATION_ID=${AGENT_OS_OPERATION_ID:-"$(date -u '+%Y%m%d%H%M%S')-$$-$RANDOM"}
+LOCK_NONCE=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+LOCK_HOLDER_ID="$OPERATION_ID.$LOCK_NONCE"
+SERVICE_ACCOUNT_NAME="agent-os-firstmate-${LOCK_NONCE:0:12}"
 LOCK=
 LOCK_NAMESPACE=
 EXPECTED_LOCK=
@@ -92,12 +95,12 @@ render() {
     echo "error: Akua renderer '$AKUA' is required for Kubernetes package operations" >&2
     exit 2
   fi
-  if grep -Eq '^[[:space:]]*operationId:' "$INPUTS"; then
-    echo "error: operationId is reserved for the lifecycle helper" >&2
+  if grep -Eq '^[[:space:]]*(operationId|serviceAccountName):' "$INPUTS"; then
+    echo "error: operationId and serviceAccountName are reserved for the lifecycle helper" >&2
     exit 2
   fi
   cp "$INPUTS" "$RENDER_INPUTS"
-  printf '\noperationId: %s\n' "$OPERATION_ID" >> "$RENDER_INPUTS"
+  printf '\noperationId: %s\nserviceAccountName: %s\n' "$OPERATION_ID" "$SERVICE_ACCOUNT_NAME" >> "$RENDER_INPUTS"
   "$AKUA" render --no-agent-mode --package "$PACKAGE" --inputs "$RENDER_INPUTS" --out "$OUT"
   statefulset=$(rendered_statefulset)
   statefulset_count=$(printf '%s\n' "$statefulset" | sed '/^$/d' | wc -l | tr -d ' ')
@@ -115,6 +118,11 @@ render() {
     exit 2
   fi
   NAMESPACE=$rendered_namespace
+  case "$NAMESPACE" in ''|*[!a-z0-9-]*|-*|*-) echo "error: rendered namespace is not a valid Kubernetes DNS label" >&2; exit 2 ;; esac
+  [ "${#NAMESPACE}" -le 63 ] || { echo "error: rendered namespace is too long" >&2; exit 2; }
+  [ "${#SERVICE_ACCOUNT_NAME}" -le 63 ] || { echo "error: generated ServiceAccount name is too long" >&2; exit 2; }
+  [ "${#LOCK_HOLDER_ID}" -le 255 ] || { echo "error: generated lifecycle Lease holder identity is too long" >&2; exit 2; }
+  [ "${#NAMESPACE}" -le 231 ] || { echo "error: namespace makes the ClusterRoleBinding name too long" >&2; exit 2; }
   INSTALLATION_ID="agent-os-firstmate:$NAMESPACE"
   if render_has_kind Namespace; then
     MANAGES_NAMESPACE=1
@@ -191,7 +199,7 @@ ${rv:+  resourceVersion: $rv_value}
   annotations:
     agent-os.dev/installation-id: $INSTALLATION_ID
 spec:
-  holderIdentity: $OPERATION_ID
+  holderIdentity: $LOCK_HOLDER_ID
   acquireTime: $acquired_at
   renewTime: $renewed_at
   leaseDurationSeconds: $LOCK_DURATION_SECONDS
@@ -204,7 +212,7 @@ acquire_primary_lock() {
     LOCK=agent-os-firstmate-lifecycle
   elif [ "$COMMAND" = cleanup-cluster-rbac ]; then
     LOCK_NAMESPACE=${AGENT_OS_CLUSTER_LOCK_NAMESPACE:-kube-system}
-    LOCK="agent-os-firstmate-lifecycle-$NAMESPACE"
+    LOCK="agent-os-firstmate-lifecycle-$(sha256_text "$NAMESPACE" | cut -c1-16)"
   elif [ "$COMMAND" = uninstall ]; then
     return 0
   else
@@ -260,6 +268,112 @@ require_workload_owned() {
     echo "error: StatefulSet 'agent-os-firstmate' does not have the exact installation identity" >&2
     exit 2
   fi
+}
+
+workload_service_account() {
+  local state account identity
+  state=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" \
+    --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get statefulset agent-os-firstmate -o json)
+  identity=$(printf '%s' "$state" | jq -er --arg installation "$INSTALLATION_ID" '
+    select(.metadata.name == "agent-os-firstmate")
+    | select(.metadata.labels["app.kubernetes.io/managed-by"] == "agent-os")
+    | select(.metadata.annotations["agent-os.dev/installation-id"] == $installation)
+    | .spec.template.spec.serviceAccountName') || {
+    echo "error: StatefulSet ServiceAccount identity is unverifiable" >&2
+    exit 3
+  }
+  case "$identity" in agent-os-firstmate|agent-os-firstmate-[a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9]) ;; *) echo "error: StatefulSet ServiceAccount identity is invalid" >&2; exit 3 ;; esac
+  printf '%s' "$identity"
+}
+
+preflight_legacy_cluster_binding() {
+  local allow_owned=${1:-0} binding identity expected
+  binding="agent-os-firstmate-$NAMESPACE"
+  if ! identity=$("$KUBECTL" --context "$CONTEXT" get clusterrolebinding "$binding" --ignore-not-found \
+    -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}'); then
+    echo "error: exact legacy ClusterRoleBinding preflight requires separately authorized cluster-scoped read access" >&2
+    exit 2
+  fi
+  expected="$binding"$'\t'"agent-os"$'\t'"$INSTALLATION_ID"
+  if [ -n "$identity" ] && [ "$identity" != "$expected" ]; then
+    echo "error: ClusterRoleBinding '$binding' does not have the exact Agent OS installation identity" >&2
+    exit 2
+  fi
+  if [ -n "$identity" ] && [ "$allow_owned" -ne 1 ] && [ "$DESIRED_RBAC" != cluster-admin ]; then
+    echo "error: stale ClusterRoleBinding '$binding' must be removed through separately authorized cleanup before installation" >&2
+    exit 3
+  fi
+}
+
+require_no_active_rollback_checkpoint() {
+  local state checkpoint
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "error: jq is required to verify rollback checkpoint state before upgrade" >&2
+    exit 2
+  fi
+  state=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" \
+    --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get statefulset agent-os-firstmate -o json)
+  checkpoint=$(printf '%s' "$state" | jq -er --arg installation "$INSTALLATION_ID" '
+    select(.metadata.name == "agent-os-firstmate")
+    | select(.metadata.labels["app.kubernetes.io/managed-by"] == "agent-os")
+    | select(.metadata.annotations["agent-os.dev/installation-id"] == $installation)
+    | [(.metadata.annotations["agent-os.dev/rollback-operation"] // ""),
+       (.metadata.annotations["agent-os.dev/rollback-target-name"] // ""),
+       (.metadata.annotations["agent-os.dev/rollback-target-uid"] // ""),
+       (.metadata.annotations["agent-os.dev/rollback-target-digest"] // "")]
+    | @tsv') || { echo "error: StatefulSet rollback checkpoint state is unverifiable" >&2; exit 3; }
+  if [ -n "${checkpoint//$'\t'/}" ]; then
+    echo "error: active rollback checkpoint blocks upgrade; resume rollback until exact recovery and checkpoint finalization" >&2
+    exit 3
+  fi
+}
+
+verified_akua_overlay_secret() {
+  local expected_record=${1:-} expected_secret state secret record=''
+  expected_secret=$(printf '%s' "$expected_record" | cut -f1)
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "error: jq is required to verify the Akua authorization overlay" >&2
+    return 2
+  fi
+  state=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" \
+    --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get statefulset agent-os-firstmate -o json) || return 3
+  secret=$(printf '%s' "$state" | jq -er --arg installation "$INSTALLATION_ID" '
+    select(.metadata.name == "agent-os-firstmate")
+    | select(.metadata.labels["app.kubernetes.io/managed-by"] == "agent-os")
+    | select(.metadata.annotations["agent-os.dev/installation-id"] == $installation)
+    | (.metadata.annotations["agent-os.dev/akua-auth-secret"] // "") as $declared
+    | ([.spec.template.spec.containers[]? | select(.name == "firstmate") | .env[]? | select(.name == "AKUA_AUTH_HEADER_FILE")] // []) as $env
+    | ([.spec.template.spec.containers[]? | select(.name == "firstmate") | .volumeMounts[]? | select(.name == "akua-auth")] // []) as $mount
+    | ([.spec.template.spec.volumes[]? | select(.name == "akua-auth")] // []) as $volume
+    | if ($declared == "" and ($env|length) == 0 and ($mount|length) == 0 and ($volume|length) == 0) then ""
+      elif ($declared | test("^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")) and
+           ($env|length) == 1 and $env[0].value == "/var/run/secrets/agent-os/akua/authorization" and
+           ($mount|length) == 1 and $mount[0].mountPath == "/var/run/secrets/agent-os/akua" and $mount[0].readOnly == true and
+           ($volume|length) == 1 and $volume[0].secret.secretName == $declared and $volume[0].secret.defaultMode == 256
+      then $declared else error("unverifiable Akua authorization overlay") end') || {
+    echo "error: Akua authorization overlay is missing, changed, or unverifiable; upgrade blocked" >&2
+    return 3
+  }
+  if [ -n "$expected_record" ] && [ "$secret" != "$expected_secret" ]; then
+    echo "error: Akua authorization Secret reference changed during upgrade; upgrade blocked" >&2
+    return 3
+  fi
+  if [ -n "$secret" ]; then
+    record=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" \
+      --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get secret "$secret" --ignore-not-found \
+      -o 'jsonpath={.metadata.name}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}{"\t"}{range $key,$value := .data}{$key}{"\n"}{end}') || return 3
+    if [ "$(printf '%s' "$record" | cut -f1)" != "$secret" ] || \
+      [ -z "$(printf '%s' "$record" | cut -f2)" ] || [ -z "$(printf '%s' "$record" | cut -f3)" ] || \
+      [ "$(printf '%s' "$record" | cut -f4-)" != authorization ]; then
+      echo "error: Akua authorization Secret reference is missing or unverifiable; upgrade blocked" >&2
+      return 3
+    fi
+    if [ -n "$expected_record" ] && [ "$record" != "$expected_record" ]; then
+      echo "error: Akua authorization Secret UID or resourceVersion changed during upgrade; upgrade blocked" >&2
+      return 3
+    fi
+  fi
+  printf '%s' "$record"
 }
 
 rendered_resource_field() {
@@ -731,7 +845,7 @@ cas_patch_file() {
 }
 
 mutate_rendered_resource() {
-  local file=$1 kind name scope record expected uid rv operation current patch_file
+  local file=$1 kind name scope record expected uid rv operation current patch_file patch_type
   kind=$(rendered_resource_field "$file" kind)
   name=$(rendered_resource_field "$file" name)
   [ "$kind" != Namespace ] || return 0
@@ -763,7 +877,9 @@ mutate_rendered_resource() {
         return $?
       fi
     else
-      if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" patch "$kind" "$name" --type=merge --patch-file "$patch_file" >/dev/null; then
+      patch_type=merge
+      [ "$kind" != StatefulSet ] || patch_type=strategic
+      if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" patch "$kind" "$name" --type="$patch_type" --patch-file "$patch_file" >/dev/null; then
         report_partial_apply patch
         return $?
       fi
@@ -811,9 +927,9 @@ verify_desired_rbac() {
         {"apiGroups":["apps"],"resources":["statefulsets"],"verbs":["get","list","watch"]},
         {"apiGroups":["coordination.k8s.io"],"resources":["leases"],"verbs":["get","create","update","delete"]}
       ]' >/dev/null ||
-      ! printf '%s' "$binding_json" | jq -e --arg namespace "$NAMESPACE" '
+      ! printf '%s' "$binding_json" | jq -e --arg namespace "$NAMESPACE" --arg serviceAccount "$SERVICE_ACCOUNT_NAME" '
         .roleRef == {"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"agent-os-firstmate-runtime"} and
-        .subjects == [{"kind":"ServiceAccount","name":"agent-os-firstmate","namespace":$namespace}]' >/dev/null; then
+        .subjects == [{"kind":"ServiceAccount","name":$serviceAccount,"namespace":$namespace}]' >/dev/null; then
       echo "error: desired namespace RBAC did not verify after apply" >&2
       exit 2
     fi
@@ -1075,6 +1191,7 @@ case "$COMMAND" in
       echo "error: agent-os-firstmate already exists; use upgrade" >&2
       exit 2
     fi
+    preflight_legacy_cluster_binding 0
     apply_rendered
     ;;
   upgrade)
@@ -1090,6 +1207,17 @@ case "$COMMAND" in
       exit 2
     fi
     require_workload_owned "$previous"
+    previous_service_account=$(workload_service_account)
+    case "$previous_service_account" in
+      agent-os-firstmate-[a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9])
+        SERVICE_ACCOUNT_NAME=$previous_service_account
+        render
+        require_namespaced_resource_owned_or_absent ServiceAccount "$SERVICE_ACCOUNT_NAME"
+        ;;
+    esac
+    preflight_legacy_cluster_binding 1
+    require_no_active_rollback_checkpoint
+    preserved_akua_secret_record=$(verified_akua_overlay_secret)
     previous_mode=$(printf '%s' "$previous" | cut -f2)
     previous_cleanup=$(printf '%s' "$previous" | cut -f3)
     cleanup_required=0
@@ -1099,6 +1227,10 @@ case "$COMMAND" in
       patch_workload_annotations '{"agent-os.dev/cluster-rbac-cleanup":"required"}'
     fi
     apply_rendered
+    verified_akua_overlay_secret "$preserved_akua_secret_record" >/dev/null
+    if [ "$previous_service_account" != "$SERVICE_ACCOUNT_NAME" ]; then
+      delete_owned_resource namespaced ServiceAccount "$previous_service_account" 180
+    fi
     verify_desired_rbac
     if [ "$DESIRED_RBAC" != namespace ]; then
       delete_namespace_rbac
@@ -1323,9 +1455,16 @@ case "$COMMAND" in
     preflight_rendered_resources
     previous=$(workload_state)
     require_workload_owned "$previous" optional
+    previous_service_account=
+    if [ -n "$previous" ]; then
+      previous_service_account=$(workload_service_account)
+    fi
     previous_mode=$(printf '%s' "$previous" | cut -f2)
     previous_cleanup=$(printf '%s' "$previous" | cut -f3)
     delete_rendered_namespaced_resources
+    if [ -n "$previous_service_account" ] && [ "$previous_service_account" != "$SERVICE_ACCOUNT_NAME" ]; then
+      delete_owned_resource namespaced ServiceAccount "$previous_service_account" 180
+    fi
     delete_namespace_rbac
     if [ "$DELETE_NAMESPACE" -eq 1 ]; then
       delete_owned_empty_namespace

@@ -78,7 +78,7 @@ verify_lock_record() {
   identity=$(printf '%s' "$record" | cut -f1-4)
   holder=$(printf '%s' "$record" | cut -f5)
   uid=$(printf '%s' "$record" | cut -f9)
-  [ "$identity" = "$EXPECTED_LOCK" ] && [ "$holder" = "$OPERATION_ID" ] && [ -n "$uid" ]
+  [ "$identity" = "$EXPECTED_LOCK" ] && [ "$holder" = "$LOCK_HOLDER_ID" ] && [ -n "$uid" ]
 }
 
 lock_record_valid_until() {
@@ -156,7 +156,7 @@ release_lock() {
   holder=$(printf '%s' "$record" | cut -f5)
   uid=$(printf '%s' "$record" | cut -f9)
   rv=$(printf '%s' "$record" | cut -f10)
-  if [ "$identity" != "$EXPECTED_LOCK" ] || [ "$holder" != "$OPERATION_ID" ] || \
+  if [ "$identity" != "$EXPECTED_LOCK" ] || [ "$holder" != "$LOCK_HOLDER_ID" ] || \
     [ "$uid" != "$LOCK_UID" ] || [ -z "$rv" ]; then
     echo "error: lifecycle Lease '$LOCK' changed ownership before release; retained" >&2
     return 1
@@ -168,7 +168,7 @@ release_lock() {
       return 1
     }
     if [ -n "$after" ] && [ "$(printf '%s' "$after" | cut -f9)" = "$uid" ] && \
-      [ "$(printf '%s' "$after" | cut -f5)" = "$OPERATION_ID" ]; then
+      [ "$(printf '%s' "$after" | cut -f5)" = "$LOCK_HOLDER_ID" ]; then
       echo "error: lifecycle Lease '$LOCK' release precondition failed; retained" >&2
       return 1
     fi
@@ -180,7 +180,7 @@ release_lock() {
   if [ -n "$after" ]; then
     after_holder=$(printf '%s' "$after" | cut -f5)
     after_uid=$(printf '%s' "$after" | cut -f9)
-    if [ "$after_uid" = "$uid" ] && [ "$after_holder" = "$OPERATION_ID" ]; then
+    if [ "$after_uid" = "$uid" ] && [ "$after_holder" = "$LOCK_HOLDER_ID" ]; then
       echo "error: lifecycle Lease '$LOCK' still exists after release" >&2
       return 1
     fi

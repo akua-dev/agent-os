@@ -15,6 +15,8 @@ KUBECTL=${AGENT_OS_KUBECTL:-kubectl}
 TEMPLATE=${AGENT_OS_CREWMATE_TEMPLATE:-/opt/agent-os/tools/agent-os/packages/firstmate/crewmate.yaml}
 INSTALLATION_ID="agent-os-firstmate:$NAMESPACE"
 OPERATION_ID=${AGENT_OS_OPERATION_ID:-"$(date -u '+%Y%m%d%H%M%S')-$$-$RANDOM"}
+LOCK_NONCE=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+LOCK_HOLDER_ID="$OPERATION_ID.$LOCK_NONCE"
 
 if [ ! -f "$TEMPLATE" ]; then
   TEMPLATE="$ROOT/tools/agent-os/packages/firstmate/crewmate.yaml"
@@ -39,7 +41,12 @@ fi
 POD="agent-os-crewmate-$ID"
 PVC="$POD-home"
 LOCK="$POD-lifecycle"
+[ "${#ID}" -le 63 ] || { echo "error: invalid crewmate id '$ID'" >&2; exit 2; }
+for derived_name in "$POD" "$PVC" "$LOCK"; do
+  [ "${#derived_name}" -le 63 ] || { echo "error: crewmate id '$ID' makes Kubernetes resource names too long" >&2; exit 2; }
+done
 LOCK_NAMESPACE=$NAMESPACE
+LOCK_SCOPE=crewmate
 EXPECTED_POD="$POD"$'\t'"agent-os"$'\t'"$ID"$'\t'"$INSTALLATION_ID"
 EXPECTED_PVC="$PVC"$'\t'"agent-os"$'\t'"$ID"$'\t'"$INSTALLATION_ID"
 EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"$ID"$'\t'"$INSTALLATION_ID"
@@ -96,6 +103,11 @@ pvc_record() {
 lock_record() {
   local deadline=${1:-}
   [ -n "$deadline" ] || deadline=$(lock_default_deadline)
+  if [ "$LOCK_SCOPE" = fleet ]; then
+    lock_kube "$deadline" get lease "$LOCK" --ignore-not-found \
+      -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/lifecycle}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.spec.holderIdentity}{"\t"}{.spec.acquireTime}{"\t"}{.spec.renewTime}{"\t"}{.spec.leaseDurationSeconds}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}'
+    return
+  fi
   lock_kube "$deadline" get lease "$LOCK" --ignore-not-found \
     -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.spec.holderIdentity}{"\t"}{.spec.acquireTime}{"\t"}{.spec.renewTime}{"\t"}{.spec.leaseDurationSeconds}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}'
 }
@@ -161,6 +173,28 @@ render_lock() {
   local acquired_at=$1 renewed_at=$2 uid=${3:-} rv=${4:-} uid_value='' rv_value=''
   [ -z "$uid" ] || uid_value=$(yaml_string "$uid")
   [ -z "$rv" ] || rv_value=$(yaml_string "$rv")
+  if [ "$LOCK_SCOPE" = fleet ]; then
+    cat <<YAML
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: $LOCK
+  namespace: $NAMESPACE
+${uid:+  uid: $uid_value}
+${rv:+  resourceVersion: $rv_value}
+  labels:
+    app.kubernetes.io/managed-by: agent-os
+    agent-os.dev/lifecycle: primary
+  annotations:
+    agent-os.dev/installation-id: $INSTALLATION_ID
+spec:
+  holderIdentity: $LOCK_HOLDER_ID
+  acquireTime: $acquired_at
+  renewTime: $renewed_at
+  leaseDurationSeconds: $LOCK_DURATION_SECONDS
+YAML
+    return
+  fi
   cat <<YAML
 apiVersion: coordination.k8s.io/v1
 kind: Lease
@@ -175,7 +209,7 @@ ${rv:+  resourceVersion: $rv_value}
   annotations:
     agent-os.dev/installation-id: $INSTALLATION_ID
 spec:
-  holderIdentity: $OPERATION_ID
+  holderIdentity: $LOCK_HOLDER_ID
   acquireTime: $acquired_at
   renewTime: $renewed_at
   leaseDurationSeconds: $LOCK_DURATION_SECONDS
@@ -184,10 +218,45 @@ YAML
 
 . "$ROOT/bin/agent-os-kubernetes-lease.sh"
 
+acquire_lifecycle_locks() {
+  CREWMATE_LOCK=$LOCK
+  CREWMATE_EXPECTED_LOCK=$EXPECTED_LOCK
+  LOCK=agent-os-firstmate-lifecycle
+  EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"primary"$'\t'"$INSTALLATION_ID"
+  LOCK_SCOPE=fleet
+  acquire_lock
+  FLEET_LOCK_UID=$LOCK_UID
+  FLEET_LOCK_RV=$LOCK_RV
+  FLEET_LOCK_RENEW_PID=$LOCK_RENEW_PID
+  FLEET_LOCK_VALID_UNTIL=$LOCK_VALID_UNTIL
+  LOCK=$CREWMATE_LOCK
+  EXPECTED_LOCK=$CREWMATE_EXPECTED_LOCK
+  LOCK_SCOPE=crewmate
+  LOCK_UID=
+  LOCK_RV=
+  LOCK_RENEW_PID=
+  LOCK_VALID_UNTIL=
+  acquire_lock
+}
+
+release_lifecycle_locks() {
+  local status=0
+  release_lock || status=$?
+  LOCK=agent-os-firstmate-lifecycle
+  EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"primary"$'\t'"$INSTALLATION_ID"
+  LOCK_SCOPE=fleet
+  LOCK_UID=${FLEET_LOCK_UID:-}
+  LOCK_RV=${FLEET_LOCK_RV:-}
+  LOCK_RENEW_PID=${FLEET_LOCK_RENEW_PID:-}
+  LOCK_VALID_UNTIL=${FLEET_LOCK_VALID_UNTIL:-}
+  release_lock || status=$?
+  return "$status"
+}
+
 finish_lifecycle() {
   local status=$?
   trap - EXIT
-  if ! release_lock && [ "$status" -eq 0 ]; then
+  if ! release_lifecycle_locks && [ "$status" -eq 0 ]; then
     status=3
   fi
   exit "$status"
@@ -214,6 +283,15 @@ resource_mutation_seconds() {
   [ "$seconds" -le "$remaining" ] || seconds=$remaining
   [ "$seconds" -gt 0 ] || return 1
   printf '%s' "$seconds"
+}
+
+resource_wait_seconds() {
+  local deadline=$1 remaining reserve
+  remaining=$((deadline - $(date -u '+%s')))
+  [ "$remaining" -gt 1 ] || return 1
+  reserve=$RESOURCE_REQUEST_CEILING_SECONDS
+  [ "$reserve" -lt "$remaining" ] || reserve=$((remaining - 1))
+  printf '%s' "$((remaining - reserve))"
 }
 
 delete_owned_crewmate_resource() {
@@ -278,7 +356,7 @@ delete_owned_crewmate_resource() {
     delete_ok=1
   fi
   if [ "$delete_ok" -eq 1 ]; then
-    wait_seconds=$(resource_mutation_seconds "$deadline") || wait_seconds=0
+    wait_seconds=$(resource_wait_seconds "$deadline") || wait_seconds=0
     if [ "$wait_seconds" -gt 0 ]; then
       kube --request-timeout="${wait_seconds}s" wait --for=delete "$kind/$name" --timeout="${wait_seconds}s" >/dev/null 2>&1 || true
     fi
@@ -493,7 +571,7 @@ case "$COMMAND" in
   create)
     [ -z "$CONFIRM" ] || { echo "usage: $0 create <crewmate-id>" >&2; exit 2; }
     validate_ai_grant
-    acquire_lock
+    acquire_lifecycle_locks
     preflight_create
     create_and_wait
     ;;
@@ -513,14 +591,14 @@ case "$COMMAND" in
     ;;
   stop)
     [ -z "$CONFIRM" ] || { echo "usage: $0 stop <crewmate-id>" >&2; exit 2; }
-    acquire_lock
+    acquire_lifecycle_locks
     require_owned_pvc_or_absent >/dev/null
     quiesce_owned_home
     ;;
   restart)
     [ -z "$CONFIRM" ] || { echo "usage: $0 restart <crewmate-id>" >&2; exit 2; }
     validate_ai_grant
-    acquire_lock
+    acquire_lifecycle_locks
     preflight_existing_home >/dev/null
     quiesce_owned_home
     create_and_wait
@@ -531,7 +609,7 @@ case "$COMMAND" in
       echo "error: purge requires the purge-specific --yes confirmation" >&2
       exit 2
     fi
-    acquire_lock
+    acquire_lifecycle_locks
     if ! pod=$(pod_record); then
       echo "error: could not prove crewmate Pod absence before purge" >&2
       exit 3
