@@ -15,13 +15,62 @@ SOURCE_ARCHIVE="$OUTPUT_DIR/agent-os-source.tar"
 BOOTSTRAP_ARCHIVE="$OUTPUT_DIR/agent-os-bootstrap.tar"
 ATTESTATION="$OUTPUT_DIR/agent-os-source.attestation"
 TEMP="$OUTPUT_DIR/.agent-os-source.$$"
+GIT_BIN=$(command -v git)
+case "$GIT_BIN" in /*) ;; *) echo "error: trusted Git executable is unavailable" >&2; exit 2 ;; esac
 
 git_isolated() {
-  env -u GIT_CONFIG -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT \
-    -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
-    -u GIT_SSH -u GIT_SSH_COMMAND GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-    GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c core.hooksPath=/dev/null \
+  env -i HOME=/nonexistent PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+    "$GIT_BIN" -c credential.helper= -c core.hooksPath=/dev/null \
     -c http.proxy= -c https.proxy= "$@"
+}
+
+canonical_github_origin() {
+  case "$1" in
+    https://github.com/akua-dev/agent-os|https://github.com/akua-dev/agent-os.git)
+      printf '%s' "$SOURCE_ORIGIN"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_source_git_config() {
+  local key value origin worktree_keys
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    value=$(git_isolated -C "$ROOT" config --local --no-includes --get-all "$key" || true)
+    [ -n "$value" ] && [ "$value" = "$(printf '%s\n' "$value" | head -n 1)" ] || {
+      echo "error: source repository Git config key is duplicated or empty" >&2
+      exit 2
+    }
+    case "$key" in
+      core.repositoryformatversion) [ "$value" = 0 ] ;;
+      core.filemode|core.ignorecase|core.precomposeunicode|core.logallrefupdates|core.bare)
+        [ "$value" = true ] || [ "$value" = false ]
+        ;;
+      extensions.worktreeconfig|receive.advertisepushoptions)
+        [ "$value" = true ] || [ "$value" = false ]
+        ;;
+      gc.auto) [ "$value" = 0 ] ;;
+      maintenance.auto) [ "$value" = false ] ;;
+      remote.origin.url) canonical_github_origin "$value" >/dev/null ;;
+      remote.origin.fetch) [ "$value" = '+refs/heads/*:refs/remotes/origin/*' ] ;;
+      remote.origin.tagopt) [ "$value" = --no-tags ] ;;
+      branch.main.remote) [ "$value" = origin ] ;;
+      branch.main.merge) [ "$value" = refs/heads/main ] ;;
+      *) echo "error: source repository Git config key is not allowlisted: $key" >&2; exit 2 ;;
+    esac || { echo "error: source repository Git config value is invalid: $key" >&2; exit 2; }
+  done < <(git_isolated -C "$ROOT" config --local --no-includes --name-only --list)
+  worktree_keys=$(git_isolated -C "$ROOT" config --worktree --no-includes --name-only --list 2>/dev/null || true)
+  [ -z "$worktree_keys" ] || {
+    echo "error: source repository worktree Git config is not allowed" >&2
+    exit 2
+  }
+  origin=$(git_isolated -C "$ROOT" config --local --no-includes --get remote.origin.url || true)
+  [ "$(canonical_github_origin "$origin" 2>/dev/null || true)" = "$SOURCE_ORIGIN" ] || {
+    echo "error: repository origin is not the exact trusted HTTPS origin" >&2
+    exit 2
+  }
 }
 
 sha256_file() {
@@ -32,10 +81,7 @@ sha256_stream() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum | awk '{print $1}'; else shasum -a 256 | awk '{print $1}'; fi
 }
 
-[ "$(git_isolated -C "$ROOT" remote get-url origin)" = "$SOURCE_ORIGIN" ] || {
-  echo "error: repository origin is not the exact trusted HTTPS origin" >&2
-  exit 2
-}
+validate_source_git_config
 [ -z "$(git_isolated -C "$ROOT" status --porcelain --untracked-files=all)" ] || {
   echo "error: exact-source image builds require a clean worktree" >&2
   exit 2
@@ -48,7 +94,7 @@ trap 'rm -rf "$TEMP" "$SOURCE_ARCHIVE.tmp.$$" "$BOOTSTRAP_ARCHIVE.tmp.$$" "$ATTE
 git_isolated init --bare "$TEMP/bootstrap.git" >/dev/null
 
 case "$SOURCE_MODE" in
-  main)
+  main|candidate)
     git_isolated --git-dir="$TEMP/bootstrap.git" fetch --depth=1 --no-tags "$SOURCE_ORIGIN" \
       refs/heads/main:refs/heads/main
     ;;
@@ -84,8 +130,18 @@ case "$SOURCE_MODE" in
     jq -e --arg tag "$RELEASE_TAG" '
       .tag == $tag and (.commit|test("^[0-9a-f]{40}$")) and (.tree|test("^[0-9a-f]{40}$")) and
       (.source_archive_sha256|test("^[0-9a-f]{64}$")) and (.package_sha256|test("^[0-9a-f]{64}$")) and
+      (.bootstrap_archive_sha256|test("^[0-9a-f]{64}$")) and
       (.schema_sha256|test("^[0-9a-f]{64}$")) and (.image_digest|test("^sha256:[0-9a-f]{64}$")) and
       (.sbom_sha256|test("^[0-9a-f]{64}$")) and (.provenance_sha256|test("^[0-9a-f]{64}$")) and
+      (.buildkit_outputs_sha256|test("^[0-9a-f]{64}$")) and
+      (.platform_manifests_sha256|test("^[0-9a-f]{64}$")) and
+      (.candidate_record_digest|test("^sha256:[0-9a-f]{64}$")) and
+      .source_mode == "candidate" and
+      .image_repository == "ghcr.io/akua-dev/agent-os" and
+      (.platform_manifests|type == "array" and length == 2) and
+      ([.platform_manifests[].platform] | sort == ["linux/amd64","linux/arm64"]) and
+      (all(.platform_manifests[]; (.digest|test("^sha256:[0-9a-f]{64}$")) and
+        (.mediaType|type == "string" and length > 0) and (.size|type == "number" and . > 0))) and
       (.quickstart_sha256|test("^[0-9a-f]{64}$")) and (.tag_ruleset_id|type == "number") and
       (.tag_ruleset_sha256|test("^[0-9a-f]{64}$"))' "$TEMP/release.json" >/dev/null || {
       echo "error: release record is incomplete or malformed" >&2
@@ -99,7 +155,10 @@ esac
 
 SOURCE_COMMIT=$(git_isolated --git-dir="$TEMP/bootstrap.git" rev-parse --verify refs/heads/main)
 SOURCE_TREE=$(git_isolated --git-dir="$TEMP/bootstrap.git" rev-parse --verify "$SOURCE_COMMIT^{tree}")
-if [ "$SOURCE_MODE" = main ]; then
+if [ "$SOURCE_MODE" = candidate ]; then
+  SOURCE_REF="refs/agent-os/candidates/$SOURCE_COMMIT"
+fi
+if [ "$SOURCE_MODE" = main ] || [ "$SOURCE_MODE" = candidate ]; then
   [ "$(git_isolated -C "$ROOT" rev-parse --verify HEAD)" = "$SOURCE_COMMIT" ] && \
     [ "$(git_isolated -C "$ROOT" rev-parse --verify 'HEAD^{tree}')" = "$SOURCE_TREE" ] || {
     echo "error: local source does not exactly match the freshly fetched trusted source ref" >&2

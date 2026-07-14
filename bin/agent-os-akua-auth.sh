@@ -153,6 +153,7 @@ verify_overlay() {
         ([.spec.template.spec.volumes[] | select(.name == "akua-auth" and .secret.secretName == $secret and .secret.defaultMode == 256)] | length) == 1
       else
         (.metadata.annotations["agent-os.dev/akua-auth-secret"] // "") == "" and
+        (.metadata.annotations["agent-os.dev/akua-auth-rejected-record"] // "") == "" and
         ([.spec.template.spec.containers[] | select(.name == "firstmate") | .env[]? | select(.name == "AKUA_AUTH_HEADER_FILE")] | length) == 0 and
         ([.spec.template.spec.containers[] | select(.name == "firstmate") | .volumeMounts[]? | select(.name == "akua-auth")] | length) == 0 and
         ([.spec.template.spec.volumes[]? | select(.name == "akua-auth")] | length) == 0
@@ -298,5 +299,5 @@ if [ "$COMMAND" = grant ]; then
     fail_grant_closed "grant verification failed"
   fi
 else
-  verify_overlay absent "$STATE_UID"
+  verify_overlay absent "$STATE_UID" 0
 fi

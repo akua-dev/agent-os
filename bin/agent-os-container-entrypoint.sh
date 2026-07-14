@@ -15,18 +15,24 @@ SOURCE_REF=$(cat /opt/agent-os-source.ref)
 case "$SOURCE_BRANCH" in ''|*[!A-Za-z0-9._/-]*|/*|*/|*..*) echo "error: image source branch provenance is invalid" >&2; exit 2 ;; esac
 [ "$SOURCE_ORIGIN" = https://github.com/akua-dev/agent-os.git ] || { echo "error: image source origin is invalid" >&2; exit 2; }
 case "$SOURCE_MODE" in
-  main) [ "$SOURCE_REF" = refs/heads/main ] || exit 2; TRUSTED_REF=refs/remotes/agent-os-verified/main ;;
-  release) [[ "$SOURCE_REF" =~ ^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || exit 2; TRUSTED_REF=refs/remotes/agent-os-verified/release ;;
+  main) [ "$SOURCE_REF" = refs/heads/main ] || exit 2; TRUSTED_SOURCE_REF=$SOURCE_REF; TRUSTED_REF=refs/remotes/agent-os-verified/main ;;
+  candidate)
+    [ "$SOURCE_REF" = "refs/agent-os/candidates/$SOURCE_COMMIT" ] || exit 2
+    TRUSTED_SOURCE_REF=refs/heads/main
+    TRUSTED_REF=refs/remotes/agent-os-verified/main
+    ;;
+  release) [[ "$SOURCE_REF" =~ ^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || exit 2; TRUSTED_SOURCE_REF=$SOURCE_REF; TRUSTED_REF=refs/remotes/agent-os-verified/release ;;
   event) echo "error: pull-request validation images are not runnable" >&2; exit 2 ;;
   *) echo "error: image source mode is invalid" >&2; exit 2 ;;
 esac
 IMAGE_REF="refs/remotes/agent-os-image/$SOURCE_BRANCH"
+GIT_BIN=$(command -v git)
+case "$GIT_BIN" in /*) ;; *) echo "error: trusted Git executable is unavailable" >&2; exit 2 ;; esac
 
 trusted_git() {
-  env -u GIT_CONFIG -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT \
-    -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
-    -u GIT_SSH -u GIT_SSH_COMMAND GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-    GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c core.hooksPath=/dev/null \
+  env -i HOME=/nonexistent PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+    "$GIT_BIN" -c credential.helper= -c core.hooksPath=/dev/null \
     -c http.proxy= -c https.proxy= "$@"
 }
 
@@ -136,7 +142,7 @@ fi
 }
 validate_git_config
 trusted_git -C "$FM_ROOT" fetch --no-tags --prune "$SOURCE_ORIGIN" \
-  "$SOURCE_REF:$TRUSTED_REF" || {
+  "$TRUSTED_SOURCE_REF:$TRUSTED_REF" || {
   echo "error: fresh trusted source provenance is unavailable" >&2
   exit 3
 }
@@ -152,14 +158,21 @@ if [ "$SOURCE_MODE" = main ]; then
   trusted_git -C "$FM_ROOT" merge --ff-only "$TRUSTED_REF"
 else
   [ "$(trusted_git -C "$FM_ROOT" rev-parse HEAD)" = "$SOURCE_COMMIT" ] || {
-    echo "error: release FM_ROOT differs from its immutable release commit" >&2
+    echo "error: immutable FM_ROOT differs from its verified source commit" >&2
     exit 2
   }
 fi
-[ "$(trusted_git -C "$FM_ROOT" rev-parse HEAD)" = "$(trusted_git -C "$FM_ROOT" rev-parse "$TRUSTED_REF^{commit}")" ] || {
-  echo "error: canonical FM_ROOT HEAD is not the exact fresh trusted source ref" >&2
-  exit 2
-}
+if [ "$SOURCE_MODE" = main ]; then
+  [ "$(trusted_git -C "$FM_ROOT" rev-parse HEAD)" = "$(trusted_git -C "$FM_ROOT" rev-parse "$TRUSTED_REF^{commit}")" ] || {
+    echo "error: canonical FM_ROOT HEAD is not the exact fresh trusted source ref" >&2
+    exit 2
+  }
+else
+  trusted_git -C "$FM_ROOT" merge-base --is-ancestor "$SOURCE_COMMIT" "$TRUSTED_REF" || {
+    echo "error: immutable image source is not reachable from the fresh trusted ref" >&2
+    exit 2
+  }
+fi
 trusted_git -C "$FM_ROOT" update-ref "refs/remotes/origin/$SOURCE_BRANCH" "$TRUSTED_REF"
 [ -z "$(trusted_git -C "$FM_ROOT" status --porcelain)" ] || { echo "error: canonical FM_ROOT is not clean" >&2; exit 2; }
 [ -z "$(trusted_git -C "$FM_ROOT" ls-files -- config data projects state .no-mistakes)" ] || {

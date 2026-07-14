@@ -40,6 +40,8 @@ CONTROL_LOCK_RENEW_PID=
 CONTROL_LOCK_VALID_UNTIL=
 REMOVE_CONTROL_ACCESS=0
 STATEFULSET_CAS_ATTEMPTED=0
+STATEFULSET_CAS_UID=
+STATEFULSET_CAS_RV=
 LOCK_DURATION_SECONDS=${AGENT_OS_LOCK_DURATION_SECONDS:-300}
 LOCK_CLOCK_SKEW_SECONDS=${AGENT_OS_LOCK_CLOCK_SKEW_SECONDS:-5}
 LOCK_ACQUIRE_SECONDS=${AGENT_OS_LOCK_ACQUIRE_SECONDS:-30}
@@ -60,10 +62,14 @@ done
 cleanup() {
   local status=$?
   trap - EXIT
-  if ! release_primary_locks && [ "$status" -eq 0 ]; then
-    status=3
+  if [ "$REMOVE_CONTROL_ACCESS" -eq 1 ]; then
+    if delete_control_lock_access; then
+      REMOVE_CONTROL_ACCESS=0
+    elif [ "$status" -eq 0 ]; then
+      status=3
+    fi
   fi
-  if [ "$REMOVE_CONTROL_ACCESS" -eq 1 ] && ! delete_control_lock_access && [ "$status" -eq 0 ]; then
+  if ! release_primary_locks && [ "$status" -eq 0 ]; then
     status=3
   fi
   rm -rf "$OUT" "$RENDER_INPUTS"
@@ -683,7 +689,7 @@ require_no_active_rollback_checkpoint() {
 }
 
 verified_akua_overlay_secret() {
-  local expected_supplied=0 expected_record='' state secret record current
+  local expected_supplied=0 expected_record='' expected_uid=${2:-} state secret record current
   if [ "$#" -gt 0 ]; then
     expected_supplied=1
     expected_record=$1
@@ -694,8 +700,9 @@ verified_akua_overlay_secret() {
   fi
   state=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" \
     --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get statefulset agent-os-firstmate -o json) || return 3
-  secret=$(printf '%s' "$state" | jq -er --arg installation "$INSTALLATION_ID" '
+  secret=$(printf '%s' "$state" | jq -er --arg installation "$INSTALLATION_ID" --arg uid "$expected_uid" '
     select(.metadata.name == "agent-os-firstmate")
+    | select($uid == "" or .metadata.uid == $uid)
     | select(.metadata.labels["app.kubernetes.io/managed-by"] == "agent-os")
     | select(.metadata.annotations["agent-os.dev/installation-id"] == $installation)
     | (.metadata.annotations["agent-os.dev/akua-auth-secret"] // "") as $declared
@@ -733,11 +740,13 @@ verified_akua_overlay_secret() {
 }
 
 reconcile_failed_akua_upgrade() {
-  local expected=$1 state uid rv rejected patch
+  local expected=$1 expected_uid=${2:-$STATEFULSET_CAS_UID} state uid rv rejected patch
+  [ -n "$expected_uid" ] || return 3
   state=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" \
     --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get statefulset agent-os-firstmate -o json) || return 3
-  uid=$(printf '%s' "$state" | jq -er --arg installation "$INSTALLATION_ID" '
+  uid=$(printf '%s' "$state" | jq -er --arg installation "$INSTALLATION_ID" --arg uid "$expected_uid" '
     select(.metadata.name == "agent-os-firstmate")
+    | select(.metadata.uid == $uid)
     | select(.metadata.labels["app.kubernetes.io/managed-by"] == "agent-os")
     | select(.metadata.annotations["agent-os.dev/installation-id"] == $installation)
     | .metadata.uid') || return 3
@@ -748,7 +757,7 @@ reconcile_failed_akua_upgrade() {
      spec:{template:{spec:{containers:[{name:"firstmate",env:[{name:"AKUA_AUTH_HEADER_FILE","$patch":"delete"}],volumeMounts:[{mountPath:"/var/run/secrets/agent-os/akua","$patch":"delete"}]}],volumes:[{name:"akua-auth","$patch":"delete"}]}}}}')
   "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" patch statefulset agent-os-firstmate --type=strategic -p "$patch" >/dev/null || return 3
   "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" rollout status statefulset/agent-os-firstmate --timeout=180s || return 3
-  verified_akua_overlay_secret absent >/dev/null || return 3
+  verified_akua_overlay_secret absent "$expected_uid" >/dev/null || return 3
   printf 'incomplete: upgrade authorization failed closed expected-secret-uid=%s expected-secret-rv=%s\n' \
     "$(printf '%s' "$expected" | cut -f3)" "$(printf '%s' "$expected" | cut -f4)" >&2
 }
@@ -1248,8 +1257,12 @@ mutate_rendered_resource() {
     uid=$(printf '%s' "$record" | cut -f4)
     rv=$(printf '%s' "$record" | cut -f5)
     [ -n "$uid" ] && [ -n "$rv" ] || { echo "error: $kind '$name' lacks CAS identity" >&2; exit 2; }
+    if [ "$kind" = StatefulSet ]; then
+      STATEFULSET_CAS_UID=$uid
+      STATEFULSET_CAS_RV=$rv
+    fi
     if [ "$kind" = StatefulSet ] && [ "$AKUA_OVERLAY_VERIFIED" -eq 1 ]; then
-      verified_akua_overlay_secret "$PRESERVED_AKUA_SECRET_RECORD" >/dev/null || {
+      verified_akua_overlay_secret "$PRESERVED_AKUA_SECRET_RECORD" "$STATEFULSET_CAS_UID" >/dev/null || {
         echo "incomplete: Akua authorization changed before StatefulSet CAS; no template mutation attempted" >&2
         return 3
       }
@@ -1280,6 +1293,10 @@ mutate_rendered_resource() {
   if [ -n "$record" ] && [ "$(printf '%s' "$current" | cut -f4)" != "$(printf '%s' "$record" | cut -f4)" ]; then
     echo "error: $kind '$name' UID changed during mutation" >&2
     exit 3
+  fi
+  if [ "$kind" = StatefulSet ] && [ -z "$STATEFULSET_CAS_UID" ]; then
+    STATEFULSET_CAS_UID=$(printf '%s' "$current" | cut -f4)
+    STATEFULSET_CAS_RV=$(printf '%s' "$current" | cut -f5)
   fi
 }
 
@@ -1636,7 +1653,7 @@ case "$COMMAND" in
     ensure_control_lock_access
     if ! apply_rendered; then
       if [ "$STATEFULSET_CAS_ATTEMPTED" -eq 1 ]; then
-        reconcile_failed_akua_upgrade "$PRESERVED_AKUA_SECRET_RECORD" || {
+        reconcile_failed_akua_upgrade "$PRESERVED_AKUA_SECRET_RECORD" "$STATEFULSET_CAS_UID" || {
           echo "incomplete: post-CAS upgrade failure and fail-closed authorization reconciliation is unverified" >&2
           report_partial_observation StatefulSet agent-os-firstmate namespaced
           report_partial_observation Pod agent-os-firstmate-0 namespaced
@@ -1646,8 +1663,8 @@ case "$COMMAND" in
       fi
       exit 3
     fi
-    if ! verified_akua_overlay_secret "$PRESERVED_AKUA_SECRET_RECORD" >/dev/null; then
-      reconcile_failed_akua_upgrade "$PRESERVED_AKUA_SECRET_RECORD" || {
+    if ! verified_akua_overlay_secret "$PRESERVED_AKUA_SECRET_RECORD" "$STATEFULSET_CAS_UID" >/dev/null; then
+      reconcile_failed_akua_upgrade "$PRESERVED_AKUA_SECRET_RECORD" "$STATEFULSET_CAS_UID" || {
         echo "incomplete: upgrade authorization changed and fail-closed reconciliation is unverified" >&2
         report_partial_observation StatefulSet agent-os-firstmate namespaced
         report_partial_observation Pod agent-os-firstmate-0 namespaced
@@ -2018,6 +2035,11 @@ case "$COMMAND" in
       delete_owned_resource namespaced ServiceAccount "$historical_service_account" 180
     done <<< "$historical_service_accounts"
     delete_namespace_rbac
+    delete_control_lock_access || {
+      echo "incomplete: exact-owned control RBAC removal is unverified" >&2
+      exit 3
+    }
+    REMOVE_CONTROL_ACCESS=0
     if [ "$DELETE_NAMESPACE" -eq 1 ]; then
       delete_owned_empty_namespace
     fi

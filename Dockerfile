@@ -18,7 +18,7 @@ RUN set -eu; \
   test -n "$AGENT_OS_SOURCE_TREE"; \
   test "$AGENT_OS_SOURCE_BRANCH" = main; \
   test "$AGENT_OS_SOURCE_ORIGIN" = https://github.com/akua-dev/agent-os.git; \
-  case "$AGENT_OS_SOURCE_MODE" in main|event|release) ;; *) exit 1 ;; esac; \
+  case "$AGENT_OS_SOURCE_MODE" in main|candidate|event|release) ;; *) exit 1 ;; esac; \
   test -n "$AGENT_OS_SOURCE_REF"; \
   grep -Fx "mode=$AGENT_OS_SOURCE_MODE" /tmp/agent-os-source.attestation; \
   grep -Fx "commit=$AGENT_OS_SOURCE_COMMIT" /tmp/agent-os-source.attestation; \

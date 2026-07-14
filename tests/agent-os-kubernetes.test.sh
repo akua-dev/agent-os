@@ -37,8 +37,14 @@ assert_grep 'rollback_source_digest' "$ROOT/bin/agent-os-kubernetes.sh" \
   "rollback compensation must verify its immutable source revision digest"
 assert_grep 'if [ "$COMMAND" = grant ]; then' "$ROOT/bin/agent-os-akua-auth.sh" \
   "authorization Secret validation must apply only to grant"
+assert_grep 'verify_overlay absent "$STATE_UID" 0' "$ROOT/bin/agent-os-akua-auth.sh" \
+  "authorization revoke must verify absence without requiring a Secret record"
+assert_grep '.metadata.annotations["agent-os.dev/akua-auth-rejected-record"] // ""' "$ROOT/bin/agent-os-akua-auth.sh" \
+  "authorization revoke must verify the rejected Secret identity marker is absent"
 assert_grep 'STATEFULSET_CAS_ATTEMPTED' "$ROOT/bin/agent-os-kubernetes.sh" \
   "post-CAS upgrade failures must enter fail-closed authorization reconciliation"
+assert_grep 'STATEFULSET_CAS_UID' "$ROOT/bin/agent-os-kubernetes.sh" \
+  "upgrade compensation must remain bound to the pre-CAS StatefulSet UID"
 assert_grep 'inventory_owned_service_accounts' "$ROOT/bin/agent-os-kubernetes.sh" \
   "uninstall retries must recover exact-owned historical ServiceAccounts independently"
 assert_grep 'verify_runtime_role_rules' "$ROOT/bin/agent-os-kubernetes.sh" \
@@ -493,8 +499,13 @@ case " $* " in
       checkpoint_annotations=$(printf '%s' "$checkpoint_annotations" | \
         sed 's/rollback-operation":"[^"]*/rollback-operation":"other-operation/')
     fi
-    printf '{"metadata":{"name":"agent-os-firstmate","uid":"uid-statefulset","resourceVersion":"%s","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"%s%s}},"spec":{"template":{"spec":{"serviceAccountName":"%s","containers":[{"name":"firstmate","env":[%s],"volumeMounts":[%s]}],"volumes":[%s]}}},"status":{"currentRevision":"%s","updateRevision":"%s"}}\n' \
-      "${AGENT_OS_TEST_RESOURCE_RV:-rv-statefulset}" "$checkpoint_annotations" "$akua_annotations" "${AGENT_OS_TEST_WORKLOAD_SERVICE_ACCOUNT:-agent-os-firstmate}" "${akua_env#,}" "${akua_mount#,}" "${akua_volume#,}" "$rollback_current" "$rollback_update"
+    statefulset_uid=uid-statefulset
+    if [ "${AGENT_OS_TEST_REPLACE_STATEFULSET_AFTER_ROLLOUT:-0}" = 1 ] && \
+      grep -F 'rollout status statefulset/agent-os-firstmate' "$AGENT_OS_TEST_LOG" >/dev/null; then
+      statefulset_uid=uid-statefulset-replacement
+    fi
+    printf '{"metadata":{"name":"agent-os-firstmate","uid":"%s","resourceVersion":"%s","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"%s%s}},"spec":{"template":{"spec":{"serviceAccountName":"%s","containers":[{"name":"firstmate","env":[%s],"volumeMounts":[%s]}],"volumes":[%s]}}},"status":{"currentRevision":"%s","updateRevision":"%s"}}\n' \
+      "$statefulset_uid" "${AGENT_OS_TEST_RESOURCE_RV:-rv-statefulset}" "$checkpoint_annotations" "$akua_annotations" "${AGENT_OS_TEST_WORKLOAD_SERVICE_ACCOUNT:-agent-os-firstmate}" "${akua_env#,}" "${akua_mount#,}" "${akua_volume#,}" "$rollback_current" "$rollback_update"
     ;;
   *" get secret "*" --ignore-not-found -o jsonpath="*)
     secret_name=$(printf '%s\n' "$*" | sed -n 's/.* get secret \([^ ]*\) .*/\1/p')
@@ -1692,6 +1703,20 @@ assert_grep '"AKUA_AUTH_HEADER_FILE","$patch":"delete"' "$CALLS" \
 pass "upgrade post-CAS failures reconcile authorization fail closed"
 
 : > "$CALLS"
+replacement_reconcile_out=''
+replacement_reconcile_rc=0
+replacement_reconcile_out=$(AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_RESOURCE_STATE=owned \
+  AGENT_OS_TEST_WORKLOAD_STATE=namespace AGENT_OS_TEST_AKUA_OVERLAY_SECRET=akua-auth \
+  AGENT_OS_TEST_FAIL_FIRST_ROLLOUT=1 AGENT_OS_TEST_REPLACE_STATEFULSET_AFTER_ROLLOUT=1 \
+  run_generic upgrade 2>&1) || replacement_reconcile_rc=$?
+[ "$replacement_reconcile_rc" -eq 3 ] || fail "replacement workload reconciliation must fail closed: $replacement_reconcile_out"
+assert_not_contains "$replacement_reconcile_out" 'authorization overlay removed' \
+  "replacement workload must never be reported as reconciled"
+assert_no_grep 'agent-os.dev/akua-auth-rejected-record' "$CALLS" \
+  "upgrade compensation must not mutate a replacement StatefulSet"
+pass "upgrade compensation leaves replacement workloads untouched"
+
+: > "$CALLS"
 AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_RESOURCE_STATE=owned \
   AGENT_OS_TEST_WORKLOAD_STATE=namespace \
   AGENT_OS_TEST_WORKLOAD_SERVICE_ACCOUNT=agent-os-firstmate-bbbbbbbbbbbb run_generic upgrade
@@ -2014,6 +2039,11 @@ namespace_inventory_line=$(grep -Fn 'api-resources --verbs=list --namespaced -o 
 [ -n "$namespace_lock_line" ] && [ -n "$namespace_inventory_line" ] && \
   [ "$namespace_lock_line" -lt "$namespace_inventory_line" ] || \
   fail "namespace deletion must inventory only after holding the installation-wide barrier"
+awk '
+  /namespaces\/kube-system\/rolebindings\/agent-os-lifecycle-/ && /delete --raw/ && !control { control=NR }
+  /\/api\/v1\/namespaces\/portable-agent-os -f -/ && /delete --raw/ && !namespace { namespace=NR }
+  END { exit !(control && namespace && control < namespace) }
+' "$CALLS" || fail "uninstall must delete and verify control RBAC before namespace finalization: $(grep -E 'rolebindings/agent-os-lifecycle-|/api/v1/namespaces/portable-agent-os' "$CALLS" | tr '\n' ';')"
 pass "optional namespace deletion proves ownership and no foreign resources"
 
 : > "$CALLS"

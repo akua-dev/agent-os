@@ -121,8 +121,14 @@ assert_grep 'fetch --depth=1 --no-tags' "$ROOT/bin/agent-os-source-bundle.sh" \
   "source preparation must fetch an allowlisted remote ref freshly"
 assert_grep 'GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null' "$ROOT/bin/agent-os-source-bundle.sh" \
   "source preparation must isolate trusted Git operations from ambient configuration"
-assert_grep 'GIT_TERMINAL_PROMPT=0 git ' "$ROOT/bin/agent-os-source-bundle.sh" \
-  "source preparation must invoke Git directly through env"
+assert_grep 'env -i' "$ROOT/bin/agent-os-source-bundle.sh" \
+  "source preparation must use an environment allowlist for trusted Git operations"
+assert_grep 'validate_source_git_config' "$ROOT/bin/agent-os-source-bundle.sh" \
+  "source preparation must reject executable repository-local Git configuration"
+assert_grep 'canonical_github_origin' "$ROOT/bin/agent-os-source-bundle.sh" \
+  "source preparation must canonicalize the trusted GitHub HTTPS origin"
+assert_grep 'https://github.com/akua-dev/agent-os|https://github.com/akua-dev/agent-os.git)' "$ROOT/bin/agent-os-source-bundle.sh" \
+  "source preparation must accept the checkout origin without a dot-git suffix"
 assert_grep 'repository origin is not the exact trusted HTTPS origin' "$ROOT/bin/agent-os-source-bundle.sh" \
   "source preparation must require the exact trusted HTTPS origin"
 assert_grep 'AGENT_OS_SOURCE_MODE=event AGENT_OS_SOURCE_EVENT_COMMIT' "$IMAGE_WORKFLOW" \
@@ -137,8 +143,8 @@ assert_grep 'source_archive_sha256' "$ROOT/bin/agent-os-source-bundle.sh" \
   "release records must bind the exact archived source"
 assert_grep 'GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null' "$ROOT/bin/agent-os-container-entrypoint.sh" \
   "runtime provenance must isolate trusted Git operations"
-assert_grep 'GIT_TERMINAL_PROMPT=0 git ' "$ROOT/bin/agent-os-container-entrypoint.sh" \
-  "runtime provenance must invoke Git directly through env"
+assert_grep 'env -i' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "runtime provenance must clear ambient Git paths, objects, helpers, and transport state"
 assert_grep 'canonical FM_ROOT Git config key is not allowlisted' "$ROOT/bin/agent-os-container-entrypoint.sh" \
   "runtime provenance must use a strict repository-config allowlist"
 assert_no_grep 'config --file "$config" --no-includes --name-only --get-regexp' "$ROOT/bin/agent-os-container-entrypoint.sh" \
@@ -196,8 +202,12 @@ assert_grep '  validate:' "$IMAGE_WORKFLOW" \
   "pull requests must use a distinct read-only validation job"
 assert_grep '  publish:' "$IMAGE_WORKFLOW" \
   "push and tag publication must use a distinct privileged job"
-assert_grep 'needs: [behavior, provenance, validate, release_artifacts]' "$IMAGE_WORKFLOW" \
+assert_grep 'needs: [behavior, provenance, validate]' "$IMAGE_WORKFLOW" \
   "the packages-write job must require exact behavior, provenance, and image gates"
+assert_grep 'cancel-in-progress: false' "$IMAGE_WORKFLOW" \
+  "publication must not strand an unrecorded candidate by cancelling an in-flight main build"
+assert_grep 'trusted_git()' "$IMAGE_WORKFLOW" \
+  "workflow provenance reads must isolate trusted Git from ambient configuration and paths"
 assert_grep 'github.ref_protected' "$IMAGE_WORKFLOW" \
   "main publication must require GitHub protected-ref provenance"
 assert_grep 'release tag ruleset differs from immutable record' "$IMAGE_WORKFLOW" \
@@ -208,20 +218,38 @@ assert_grep '.enforcement == "active" and .target == "tag"' "$IMAGE_WORKFLOW" \
   "tag publication must require an active tag-targeting ruleset"
 assert_grep '.bypass_actors | length == 0' "$IMAGE_WORKFLOW" \
   "tag publication must reject rulesets with bypass actors"
-assert_grep 'release_artifacts:' "$IMAGE_WORKFLOW" \
-  "release publication must have a read-only artifact verification gate"
+assert_grep 'candidate-record-' "$IMAGE_WORKFLOW" \
+  "protected main must retain one commit-addressed release candidate record"
+assert_grep 'candidate record coordinate already contains different artifacts' "$IMAGE_WORKFLOW" \
+  "candidate record creation must reject immutable coordinate conflicts"
+assert_grep 'release candidate image provenance conflicts with the exact protected-main source' "$IMAGE_WORKFLOW" \
+  "publication must reject an unrecorded candidate image whose provenance conflicts"
+assert_grep 'oras blob fetch --output "$provenance_file" "$IMAGE@$provenance_digest"' "$IMAGE_WORKFLOW" \
+  "candidate recovery must inspect the exact published BuildKit provenance bytes"
+assert_grep 'source_mode:"candidate"' "$IMAGE_WORKFLOW" \
+  "candidate records must bind the immutable runtime source policy"
+assert_grep 'platform_manifests' "$IMAGE_WORKFLOW" \
+  "candidate records must bind every published platform manifest"
+assert_grep 'buildkit_outputs_sha256' "$IMAGE_WORKFLOW" \
+  "candidate records must bind the exact BuildKit output descriptors"
 assert_grep 'actual_image_digest' "$IMAGE_WORKFLOW" \
   "release publication must compare the actual multi-platform image digest"
 assert_grep 'actual_sbom_sha256' "$IMAGE_WORKFLOW" \
   "release publication must compare the actual SBOM artifact set"
 assert_grep 'actual_provenance_sha256' "$IMAGE_WORKFLOW" \
   "release publication must compare the actual provenance artifact set"
-assert_grep 'oras cp --from-oci-layout' "$IMAGE_WORKFLOW" \
-  "release publication must copy the exact read-only verified OCI artifact"
+assert_grep 'oras tag "$IMAGE@$RELEASE_DIGEST" "$release_tag"' "$IMAGE_WORKFLOW" \
+  "release publication must alias the exact existing candidate manifest by digest"
+assert_no_grep 'oras cp --from-oci-layout' "$IMAGE_WORKFLOW" \
+  "release publication must not rebuild or re-upload an OCI layout"
 assert_grep 'oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6' "$IMAGE_WORKFLOW" \
   "release publication must pin the OCI transfer implementation"
 assert_grep 'published-tag-index.json' "$IMAGE_WORKFLOW" \
   "release publication must verify every published tag resolves to the recorded digest"
+assert_grep 'File.fnmatch?(pattern, ref, File::FNM_PATHNAME)' "$IMAGE_WORKFLOW" \
+  "tag ruleset coverage must use GitHub's documented pathname matcher"
+assert_no_grep 'import fnmatch' "$IMAGE_WORKFLOW" \
+  "tag ruleset coverage must not let a star wildcard cross ref separators"
 assert_grep 'Section 13' "$ROOT/docs/herdr-compliance.md" \
   "the Herdr audit must account for the network-interaction clause"
 assert_grep 'https://github.com/akua-dev/akua/tree/v0.8.25' "$ROOT/THIRD_PARTY_NOTICES.md" \
@@ -273,10 +301,10 @@ assert_grep 'ghcr.io/akua-dev/agent-os' "$ROOT/.github/workflows/agent-os-image.
   "release workflow must publish the image expected by the portable package"
 assert_grep 'linux/amd64,linux/arm64' "$ROOT/.github/workflows/agent-os-image.yml" \
   "release workflow must build the two supported container architectures"
-[ "$(grep -c '^          push: false$' "$IMAGE_WORKFLOW")" -eq 2 ] || \
-  fail "the read-only validation and release-artifact jobs must build without publishing"
-[ "$(grep -c '^          push: true$' "$IMAGE_WORKFLOW")" -eq 1 ] || \
-  fail "only the protected publication job may push images"
+[ "$(grep -c '^          push: false$' "$IMAGE_WORKFLOW")" -eq 1 ] || \
+  fail "the read-only validation job must build without publishing"
+[ "$(grep -c '^          push: true$' "$IMAGE_WORKFLOW")" -eq 2 ] || \
+  fail "only the protected candidate and main publication builds may push images"
 assert_grep 'id: build' "$ROOT/.github/workflows/agent-os-image.yml" \
   "release workflow must expose its build result"
 assert_grep 'steps.build.outputs.digest' "$ROOT/.github/workflows/agent-os-image.yml" \
