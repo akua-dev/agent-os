@@ -507,6 +507,32 @@ test_create_task_recovers_empty_new_tab_id_from_exact_scoped_structure() {
   pass "fm_backend_zellij_create_task: recovers empty new-tab stdout only from the exact scoped tab and terminal pane"
 }
 
+test_create_task_waits_boundedly_for_delayed_pane_after_empty_new_tab_id() {
+  local dir fb out title attempt response=3
+  dir="$TMP_ROOT/create-task-empty-id-delayed-pane"; mkdir -p "$dir/responses"
+  title=$(zellij_expected_scoped_title fm-empty-id-delayed)
+  printf '[]\n' > "$dir/responses/1.out"
+  # The exact tab is visible throughout, but the terminal pane arrives only on
+  # poll 21. Real Zellij 0.44.1 took longer than the former two-second bound in
+  # the full close/recreate smoke lifecycle.
+  for attempt in {1..21}; do
+    printf '[{"tab_id":3,"name":"%s"}]\n' "$title" > "$dir/responses/$response.out"
+    response=$((response + 1))
+    if [ "$attempt" -eq 21 ]; then
+      printf '[{"id":7,"tab_id":3,"is_plugin":false}]\n' > "$dir/responses/$response.out"
+    else
+      printf '[]\n' > "$dir/responses/$response.out"
+    fi
+    response=$((response + 1))
+  done
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-empty-id-delayed /tmp/proj' "$ROOT" )
+  [ "$out" = "3 7" ] || fail "create_task should keep its bounded structural recovery open for a delayed terminal pane, got '$out'"
+  pass "fm_backend_zellij_create_task: bounded empty-id recovery tolerates a delayed exact terminal pane"
+}
+
 test_create_task_refuses_empty_new_tab_id_without_unique_terminal_pane() {
   local dir fb out status title
   dir="$TMP_ROOT/create-task-empty-id-ambiguous-pane"; mkdir -p "$dir/responses"
@@ -728,6 +754,26 @@ test_current_path_probes_with_marker_and_ignores_prompt_paths() {
   pass "fm_backend_zellij_current_path: actively probes with marked begin/end lines and reconstructs wrapped cwd output"
 }
 
+test_current_path_parses_marker_and_path_joined_to_command_echo() {
+  local dir fb out
+  dir="$TMP_ROOT/cwd-joined-marker"; mkdir -p "$dir/responses"
+  zellij_pane_response "$dir" 1 7 3
+  zellij_pane_response "$dir" 2 7 3
+  zellij_pane_response "$dir" 4 7 3
+  zellij_pane_response "$dir" 6 7 3
+  printf '%s\n' \
+    "❯ printf '%s\\n' '__FM_ZELLIJ_CWD_BEGIN__'; pwd;printf '%s\\n' '__FM_ZELLIJ_CWD_END__'__FM_ZELLIJ_CWD_BEGIN__/tmp" \
+    '__FM_ZELLIJ_CWD_END__' \
+    '/tmp ❯' \
+    > "$dir/responses/7.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_current_path firstmate:7' "$ROOT" )
+  [ "$out" = "/tmp" ] || fail "current_path should parse a begin marker and cwd joined to the echoed probe command, got '$out'"
+  pass "fm_backend_zellij_current_path: parses Zellij 0.44.1 output when the marker and cwd join the echoed command"
+}
+
 test_current_path_ignores_tilde_prefixed_banner_lines() {
   local dir fb out
   dir="$TMP_ROOT/cwd-tilde"; mkdir -p "$dir/responses"
@@ -766,7 +812,10 @@ test_kill_resolves_tab_and_closes_by_id() {
 test_kill_falls_back_to_close_pane_when_tab_lookup_empty() {
   local dir fb
   dir="$TMP_ROOT/kill-fallback"; mkdir -p "$dir/responses"
+  # The owning-tab lookup is transiently empty, but a fresh existence check
+  # still finds the terminal pane and permits the direct close-pane fallback.
   printf '[]\n' > "$dir/responses/1.out"
+  zellij_pane_response "$dir" 2 7 3
   fb=$(make_zellij_fakebin "$dir")
   PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
     FM_ZELLIJ_SESSION_LIST="firstmate" \
@@ -776,7 +825,25 @@ test_kill_falls_back_to_close_pane_when_tab_lookup_empty() {
     "kill did not verify the pane before close-pane fallback"
   assert_contains "$(cat "$dir/log")" $'\x1f''close-pane'$'\x1f''--pane-id'$'\x1f''7' \
     "kill did not fall back to a direct close-pane when no owning tab could be resolved"
-  pass "fm_backend_zellij_kill: falls back to close-pane when the owning tab cannot be resolved"
+  pass "fm_backend_zellij_kill: falls back to close-pane only while the unresolved pane still exists"
+}
+
+test_kill_is_noop_when_pane_is_already_absent() {
+  local dir fb log
+  dir="$TMP_ROOT/kill-absent-pane"; mkdir -p "$dir/responses"
+  printf '[]\n' > "$dir/responses/1.out"
+  printf '[]\n' > "$dir/responses/2.out"
+  fb=$(make_zellij_fakebin "$dir")
+  PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_kill firstmate:7' "$ROOT"
+  expect_code 0 $? "kill on an already-absent pane must remain a no-op success"
+  log=$(cat "$dir/log")
+  assert_not_contains "$log" $'\x1f''close-pane' \
+    "kill must not queue a close against an absent pane id that Zellij may reuse"
+  assert_not_contains "$log" $'\x1f''close-tab-by-id' \
+    "kill must not close a tab when neither a live pane nor a verified fallback tab exists"
+  pass "fm_backend_zellij_kill: an already-absent pane is a no-op, preventing stale close races with recreated tasks"
 }
 
 test_kill_closes_recorded_tab_when_pane_already_gone() {
@@ -1078,6 +1145,7 @@ test_dispatch_busy_state_unknown_for_zellij
 test_create_task_refuses_duplicate_label
 test_create_task_creates_and_parses_ids
 test_create_task_recovers_empty_new_tab_id_from_exact_scoped_structure
+test_create_task_waits_boundedly_for_delayed_pane_after_empty_new_tab_id
 test_create_task_refuses_empty_new_tab_id_without_unique_terminal_pane
 test_create_task_restores_previously_active_tab
 test_create_task_no_restore_when_new_tab_was_already_active
@@ -1090,9 +1158,11 @@ test_send_literal_uses_paste_separator_for_option_shaped_text
 test_expected_label_allows_matching_task_tab
 test_expected_label_rejects_reused_pane_id
 test_current_path_probes_with_marker_and_ignores_prompt_paths
+test_current_path_parses_marker_and_path_joined_to_command_echo
 test_current_path_ignores_tilde_prefixed_banner_lines
 test_kill_resolves_tab_and_closes_by_id
 test_kill_falls_back_to_close_pane_when_tab_lookup_empty
+test_kill_is_noop_when_pane_is_already_absent
 test_kill_closes_recorded_tab_when_pane_already_gone
 test_kill_skips_recorded_tab_when_label_mismatches
 test_kill_is_noop_when_session_absent

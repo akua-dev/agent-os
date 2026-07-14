@@ -328,10 +328,10 @@ fm_backend_zellij_tab_matches_label() {  # <session> <tab_id> <label>
 # fm_backend_zellij_recover_created_task: after a successful-looking new-tab
 # call emits empty stdout, recover only an EXACT, unique <title> tab with one
 # terminal pane. Zellij has no trustworthy completion signal, so make the
-# immediate structural check plus two short follow-up polls before refusing.
+# immediate structural check plus a bounded five-second poll before refusing.
 fm_backend_zellij_recover_created_task() {  # <session> <scoped-title>
   local session=$1 title=$2 attempt tabs tab_id panes pane_id
-  for attempt in 1 2 3; do
+  for attempt in {1..50}; do
     tabs=$(fm_backend_zellij_cli "$session" action list-tabs --json 2>/dev/null)
     tab_id=$(printf '%s' "$tabs" | jq -r --arg want "$title" \
       '[.[]? | select(.name == $want)] | if length == 1 then .[0].tab_id else empty end' 2>/dev/null)
@@ -347,7 +347,7 @@ fm_backend_zellij_recover_created_task() {  # <session> <scoped-title>
         esac
         ;;
     esac
-    [ "$attempt" -eq 3 ] || sleep 0.1
+    [ "$attempt" -eq 50 ] || sleep 0.1
   done
   return 1
 }
@@ -447,11 +447,17 @@ fm_backend_zellij_current_path() {  # <target> [expected-label]
   sleep 0.3
   out=$(fm_backend_zellij_capture "$target" 200 "$expected_label") || return 0
   while IFS= read -r line; do
-    if [ "$line" = "$marker_begin" ]; then
-      in_block=1
-      chunk=""
-      continue
-    fi
+    # Zellij 0.44.1 can render the first output bytes on the same terminal line
+    # as the echoed command. Use the suffix after the LAST begin marker: the
+    # probe command contains an earlier quoted copy, while the final copy and
+    # any following bytes are structural output from the probe itself.
+    case "$line" in
+      *"$marker_begin"*)
+        in_block=1
+        chunk=${line##*"$marker_begin"}
+        continue
+        ;;
+    esac
     if [ "$line" = "$marker_end" ]; then
       case "$chunk" in /*) last=$chunk ;; esac
       in_block=0
@@ -590,7 +596,10 @@ fm_backend_zellij_kill() {  # <target> [tab_id] [expected_label]
   esac
   if [ -n "$tab_id" ]; then
     fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action close-tab-by-id "$tab_id" >/dev/null 2>&1 || true
-  elif [ -z "$expected_label" ]; then
+  elif [ -z "$expected_label" ] && fm_backend_zellij_pane_exists "$FM_BACKEND_ZELLIJ_SESSION" "$FM_BACKEND_ZELLIJ_PANE"; then
+    # Re-check before the fallback: close-tab is asynchronous and an
+    # idempotent second kill must not queue a stale close-pane action that can
+    # race a newly created task after Zellij reuses the numeric pane id.
     fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action close-pane --pane-id "$FM_BACKEND_ZELLIJ_PANE" >/dev/null 2>&1 || true
   fi
 }
