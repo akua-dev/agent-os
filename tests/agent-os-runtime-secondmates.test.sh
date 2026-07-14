@@ -75,6 +75,8 @@ for id in linked standalone; do
   gitdir=$(git -C "$TMP/$id" rev-parse --absolute-git-dir)
   [ -f "$gitdir/agent-os-runtime-source" ] || fail "$id immutable policy was not persisted"
   [ -f "$TMP/$id/config/agent-os-source-policy" ] || fail "$id home policy was not persisted"
+  [ -f "$TMP/$id/config/agent-os-source-policy.required" ] || \
+    fail "$id immutable policy requirement was not persisted"
   cmp "$gitdir/agent-os-runtime-source" "$TMP/$id/config/agent-os-source-policy" || \
     fail "$id Git and home policies differ"
 done
@@ -98,6 +100,24 @@ fi
 cp "$gitdir/agent-os-runtime-source" "$TMP/standalone/config/agent-os-source-policy"
 pass "secondmate selection rejects mismatched immutable policies"
 
+gitdir=$(git -C "$TMP/standalone" rev-parse --absolute-git-dir)
+printf 'immutable\n' > "$TMP/standalone/config/agent-os-source-policy.required"
+printf 'mode=release\ncommit=%s\nsource_sha256=%s\n' "$B_COMMIT" "$B_SHA" \
+  > "$TMP/standalone/config/agent-os-source-policy.pending"
+cp "$TMP/standalone/config/agent-os-source-policy.pending" \
+  "$TMP/standalone/config/agent-os-source-policy"
+printf 'mode=release\ncommit=%s\nsource_sha256=%s\n' "$A_COMMIT" "$A_SHA" \
+  > "$gitdir/agent-os-runtime-source"
+run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null || \
+  fail "journaled secondmate policy transition was not recovered"
+[ ! -e "$TMP/standalone/config/agent-os-source-policy.pending" ] || \
+  fail "recovered secondmate policy journal was retained"
+cmp "$gitdir/agent-os-runtime-source" "$TMP/standalone/config/agent-os-source-policy" || \
+  fail "recovered secondmate policies differ"
+run_sync "$TMP/primary-a" "$A_COMMIT" "$A_TREE" "$A_SHA" >/dev/null || \
+  fail "secondmate did not return to A after journal recovery"
+pass "secondmate selection recovers journaled policy transitions"
+
 git clone -q "$LEASE" "$TMP/redirected"
 git -C "$TMP/redirected" checkout -q --detach "$A_COMMIT"
 printf 'owner\n' > "$TMP/redirected/.fm-secondmate-home"
@@ -114,6 +134,28 @@ fi
   fail "mismatched secondmate home was mutated"
 rm "$FM_HOME_DIR/state/redirected.meta"
 pass "secondmate selection requires exact registered marker ownership"
+
+git clone -q "$LEASE" "$TMP/git-victim"
+git -C "$TMP/git-victim" checkout -q --detach "$A_COMMIT"
+git clone -q "$LEASE" "$TMP/git-redirected"
+git -C "$TMP/git-redirected" checkout -q --detach "$A_COMMIT"
+printf 'git-redirected\n' > "$TMP/git-redirected/.fm-secondmate-home"
+mkdir -p "$TMP/git-redirected/data" "$TMP/git-redirected/state" \
+  "$TMP/git-redirected/config" "$TMP/git-redirected/projects"
+mv "$TMP/git-redirected/.git" "$TMP/git-redirected-own.git"
+printf 'gitdir: %s/git-victim/.git\n' "$TMP" > "$TMP/git-redirected/.git"
+{
+  printf 'window=firstmate:fm-git-redirected\n'
+  printf 'kind=secondmate\n'
+  printf 'home=%s/git-redirected\n' "$TMP"
+} > "$FM_HOME_DIR/state/git-redirected.meta"
+if run_sync "$TMP/primary-b" "$B_COMMIT" "$B_TREE" "$B_SHA" >/dev/null 2>&1; then
+  fail "secondmate home redirected to another Git directory was accepted"
+fi
+[ "$(git -C "$TMP/git-victim" rev-parse HEAD)" = "$A_COMMIT" ] || \
+  fail "foreign Git metadata was mutated through a redirected secondmate home"
+rm "$FM_HOME_DIR/state/git-redirected.meta"
+pass "secondmate selection binds Git metadata to its exact home"
 
 git clone -q "$LEASE" "$TMP/linked-alias"
 git -C "$TMP/linked-alias" checkout -q --detach "$A_COMMIT"

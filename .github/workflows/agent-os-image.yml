@@ -262,6 +262,7 @@ jobs:
           load_latest_claim() {
             claim_ref="$claim_prefix/initial"
             load_claim "$claim_ref"
+            CLAIM_OWNERS="|$CLAIM_OWNER|"
             depth=0
             while [ "$depth" -lt 32 ]; do
               next_ref="$claim_prefix/recover-$CLAIM_OWNER"
@@ -270,6 +271,7 @@ jobs:
                 2> "$RUNNER_TEMP/candidate-next-claim.err"; then
                 claim_ref=$next_ref
                 load_claim "$claim_ref"
+                CLAIM_OWNERS="${CLAIM_OWNERS}${CLAIM_OWNER}|"
                 depth=$((depth + 1))
                 continue
               fi
@@ -302,6 +304,27 @@ jobs:
             load_latest_claim
             [ "$CLAIM_OWNER" = "$GITHUB_RUN_ID" ] || {
               echo "::error::candidate reservation recovery was claimed by another workflow run"
+              exit 1
+            }
+          }
+          validate_artifact_run() {
+            artifact_run_id=$1
+            case "$CLAIM_OWNERS" in
+              *"|$artifact_run_id|"*) ;;
+              *)
+                echo "::error::candidate artifact run is outside the authorized claim chain"
+                exit 1
+                ;;
+            esac
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$artifact_run_id" \
+              > "$RUNNER_TEMP/candidate-artifact-run.json"
+            jq -e --argjson run "$artifact_run_id" --arg sha "$GITHUB_SHA" \
+              --arg repo "$GITHUB_REPOSITORY" '
+              .id == $run and .head_sha == $sha and .event == "push" and
+              .head_branch == "main" and .repository.full_name == $repo and
+              .path == ".github/workflows/agent-os-image.yml"' \
+              "$RUNNER_TEMP/candidate-artifact-run.json" >/dev/null || {
+              echo "::error::candidate artifact run is not an authorized publication workflow"
               exit 1
             }
           }
@@ -355,6 +378,7 @@ jobs:
               exit 1
             }
             if [ "$trusted_artifact_count" -eq 1 ]; then
+              validate_artifact_run "$artifact_owner"
               trusted_artifact_id=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$artifact_owner" \
                 '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | .[0].id' \
                 "$RUNNER_TEMP/candidate-trusted-artifacts.json")
@@ -391,12 +415,46 @@ jobs:
               cp "$RUNNER_TEMP/candidate-trusted-artifact/agent-os-bootstrap.tar" image/agent-os-bootstrap.tar
               image_digest=$(jq -er .image_digest "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
               bootstrap_sha=$(jq -er .bootstrap_archive_sha256 "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
-              printf 'build=false\ncandidate_record_digest=%s\nimage_digest=%s\nbootstrap_sha256=%s\n' \
+              printf 'build=false\nrecord_artifact=true\ncandidate_record_digest=%s\nimage_digest=%s\nbootstrap_sha256=%s\n' \
                 "$candidate_record_digest" "$image_digest" "$bootstrap_sha" >> "$GITHUB_OUTPUT"
               echo "::notice::candidate reservation recovered from durable trusted artifact"
               exit 0
             fi
-            printf 'build=true\nbootstrap_sha256=%s\n' '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' >> "$GITHUB_OUTPUT"
+            artifact_name="agent-os-candidate-build-$GITHUB_SHA"
+            gh api --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$artifact_name&per_page=100" \
+              > "$RUNNER_TEMP/candidate-build-artifacts.json"
+            build_artifact_count=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$artifact_owner" \
+              '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | length' \
+              "$RUNNER_TEMP/candidate-build-artifacts.json")
+            [ "$build_artifact_count" -le 1 ] || {
+              echo "::error::candidate reservation has conflicting exact build evidence"
+              exit 1
+            }
+            if [ "$build_artifact_count" -eq 1 ]; then
+              validate_artifact_run "$artifact_owner"
+              build_artifact_id=$(jq -er --arg sha "$GITHUB_SHA" --argjson owner "$artifact_owner" \
+                '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha and .workflow_run.id == $owner)] | .[0].id' \
+                "$RUNNER_TEMP/candidate-build-artifacts.json")
+              mkdir "$RUNNER_TEMP/candidate-build-artifact"
+              gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$build_artifact_id/zip" \
+                > "$RUNNER_TEMP/candidate-build-artifact.zip"
+              unzip -q "$RUNNER_TEMP/candidate-build-artifact.zip" -d "$RUNNER_TEMP/candidate-build-artifact"
+              jq -e --arg commit '${{ steps.candidate_source.outputs.commit }}' \
+                --arg tree '${{ steps.candidate_source.outputs.tree }}' \
+                --arg reservation "$reservation_digest" --arg repository "$IMAGE" \
+                --argjson owner "$artifact_owner" '
+                .schema_version == 1 and .commit == $commit and .tree == $tree and
+                .reservation_digest == $reservation and .image_repository == $repository and
+                .owner_run_id == $owner and
+                (.image_digest | test("^sha256:[0-9a-f]{64}$"))' \
+                "$RUNNER_TEMP/candidate-build-artifact/candidate-build.json" >/dev/null
+              image_digest=$(jq -er .image_digest "$RUNNER_TEMP/candidate-build-artifact/candidate-build.json")
+              printf 'build=false\nrecord_artifact=false\nimage_digest=%s\nbootstrap_sha256=%s\n' \
+                "$image_digest" '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' >> "$GITHUB_OUTPUT"
+              echo "::notice::candidate reservation recovered from exact build evidence"
+              exit 0
+            fi
+            printf 'build=true\nrecord_artifact=false\nbootstrap_sha256=%s\n' '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' >> "$GITHUB_OUTPUT"
             exit 0
           fi
           [ "$referrer_count" -eq 1 ] || { echo "::error::candidate reservation has conflicting records"; exit 1; }
@@ -415,6 +473,10 @@ jobs:
           trusted_artifact_id=$(jq -er --arg sha "$GITHUB_SHA" \
             '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha)] | .[0].id' \
             "$RUNNER_TEMP/candidate-trusted-artifacts.json")
+          artifact_run_id=$(jq -er --arg sha "$GITHUB_SHA" \
+            '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha)] | .[0].workflow_run.id' \
+            "$RUNNER_TEMP/candidate-trusted-artifacts.json")
+          validate_artifact_run "$artifact_run_id"
           mkdir "$RUNNER_TEMP/candidate-trusted-artifact"
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$trusted_artifact_id/zip" \
             > "$RUNNER_TEMP/candidate-trusted-artifact.zip"
@@ -431,7 +493,7 @@ jobs:
           image_digest=$(jq -er '.image_digest | select(test("^sha256:[0-9a-f]{64}$"))' "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
           bootstrap_sha=$(jq -er '.bootstrap_archive_sha256 | select(test("^[0-9a-f]{64}$"))' "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
           [ "$(sha256sum image/agent-os-bootstrap.tar | awk '{print $1}')" = "$bootstrap_sha" ]
-          printf 'build=false\ncandidate_record_digest=%s\nimage_digest=%s\nbootstrap_sha256=%s\n' \
+          printf 'build=false\nrecord_artifact=true\ncandidate_record_digest=%s\nimage_digest=%s\nbootstrap_sha256=%s\n' \
             "$candidate_record_digest" "$image_digest" "$bootstrap_sha" >> "$GITHUB_OUTPUT"
 
       - name: Reject legacy candidate coordinates
@@ -468,6 +530,30 @@ jobs:
             AGENT_OS_SOURCE_ORIGIN=${{ steps.candidate_source.outputs.origin }}
             AGENT_OS_SOURCE_MODE=${{ steps.candidate_source.outputs.mode }}
             AGENT_OS_SOURCE_REF=${{ steps.candidate_source.outputs.ref }}
+
+      - name: Prepare exact candidate build evidence
+        if: github.ref == 'refs/heads/main' && steps.candidate_reservation.outputs.build == 'true'
+        run: |
+          set -eu
+          image_digest='${{ steps.candidate_build.outputs.digest }}'
+          [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          jq -cnS \
+            --arg commit '${{ steps.candidate_source.outputs.commit }}' \
+            --arg tree '${{ steps.candidate_source.outputs.tree }}' \
+            --arg reservation '${{ steps.candidate_reservation.outputs.reservation_digest }}' \
+            --arg repository "$IMAGE" --arg image "$image_digest" \
+            --argjson owner "$GITHUB_RUN_ID" \
+            '{schema_version:1,commit:$commit,tree:$tree,reservation_digest:$reservation,image_repository:$repository,image_digest:$image,owner_run_id:$owner}' \
+            > "$RUNNER_TEMP/candidate-build.json"
+
+      - name: Stage exact candidate build evidence
+        if: github.ref == 'refs/heads/main' && steps.candidate_reservation.outputs.build == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: agent-os-candidate-build-${{ github.sha }}
+          path: ${{ runner.temp }}/candidate-build.json
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Prepare immutable release candidate record
         if: github.ref == 'refs/heads/main'
@@ -610,7 +696,7 @@ jobs:
           printf 'candidate_record_digest=%s\nimage_digest=%s\n' "$candidate_record_digest" "$actual_image_digest" >> "$GITHUB_OUTPUT"
 
       - name: Stage trusted candidate record evidence
-        if: github.ref == 'refs/heads/main' && steps.candidate_reservation.outputs.build == 'true'
+        if: github.ref == 'refs/heads/main' && steps.candidate_reservation.outputs.record_artifact != 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: agent-os-candidate-record-${{ github.sha }}

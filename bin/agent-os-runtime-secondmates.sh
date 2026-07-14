@@ -56,6 +56,38 @@ resolve_git_metadata() {
   fi
 }
 
+resolve_file_path() {
+  local path=$1 parent
+  parent=$(cd "$(dirname "$path")" 2>/dev/null && pwd -P) || return 1
+  printf '%s/%s\n' "$parent" "$(basename "$path")"
+}
+
+validate_git_binding() {
+  local root=$1 expected backlink backlink_path relative
+  expected=$(resolve_file_path "$root/.git") || return 1
+  if [ -d "$root/.git" ] && [ ! -L "$root/.git" ]; then
+    [ "$RESOLVED_GIT_DIR" = "$expected" ] || return 1
+    [ "$RESOLVED_COMMON_DIR" = "$RESOLVED_GIT_DIR" ] || return 1
+    return 0
+  fi
+  [ -f "$root/.git" ] && [ ! -L "$root/.git" ] || return 1
+  [ -f "$RESOLVED_GIT_DIR/gitdir" ] && [ ! -L "$RESOLVED_GIT_DIR/gitdir" ] || return 1
+  [ "$(wc -l < "$RESOLVED_GIT_DIR/gitdir" | tr -d ' ')" -eq 1 ] || return 1
+  backlink=$(cat "$RESOLVED_GIT_DIR/gitdir")
+  case "$backlink" in
+    /*) backlink_path=$(resolve_file_path "$backlink") || return 1 ;;
+    *) backlink_path=$(resolve_file_path "$RESOLVED_GIT_DIR/$backlink") || return 1 ;;
+  esac
+  [ "$backlink_path" = "$expected" ] || return 1
+  case "$RESOLVED_GIT_DIR" in
+    "$RESOLVED_COMMON_DIR"/worktrees/*) ;;
+    *) return 1 ;;
+  esac
+  relative=${RESOLVED_GIT_DIR#"$RESOLVED_COMMON_DIR"/worktrees/}
+  case "$relative" in ''|*/*) return 1 ;; esac
+  [ -d "$RESOLVED_COMMON_DIR" ] && [ ! -L "$RESOLVED_COMMON_DIR" ] || return 1
+}
+
 validate_config() {
   local config=$1 section='' line key value token seen=''
   [ -f "$config" ] && [ ! -L "$config" ] || return 1
@@ -93,6 +125,18 @@ validate_config() {
     remote.origin.url remote.origin.fetch; do
     case "|$seen|" in *"|$token|"*) ;; *) return 1 ;; esac
   done
+}
+
+validate_policy() {
+  local policy=$1 policy_mode policy_commit policy_sha
+  [ -f "$policy" ] && [ ! -L "$policy" ] || return 1
+  policy_mode=$(sed -n 's/^mode=//p' "$policy")
+  policy_commit=$(sed -n 's/^commit=//p' "$policy")
+  policy_sha=$(sed -n 's/^source_sha256=//p' "$policy")
+  case "$policy_mode" in candidate|release) ;; *) return 1 ;; esac
+  [[ "$policy_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ "$policy_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [ "$(wc -l < "$policy" | tr -d ' ')" -eq 3 ]
 }
 
 ids=()
@@ -162,6 +206,10 @@ for index in "${!homes[@]}"; do
   case "$seen_homes" in *$'\n'"$home"$'\n'*) continue ;; esac
   seen_homes+="$home"$'\n'
   resolve_git_metadata "$home" || { echo "error: secondmate Git metadata is invalid: $home" >&2; exit 2; }
+  validate_git_binding "$home" || {
+    echo "error: secondmate Git metadata is not bound to its home: $home" >&2
+    exit 2
+  }
   validate_config "$RESOLVED_COMMON_DIR/config" || {
     echo "error: secondmate Git configuration is invalid: $home" >&2
     exit 2
@@ -172,35 +220,45 @@ for index in "${!homes[@]}"; do
   }
   git_policy="$RESOLVED_GIT_DIR/agent-os-runtime-source"
   home_policy="$home/config/agent-os-source-policy"
+  required_policy="$home/config/agent-os-source-policy.required"
+  pending_policy="$home/config/agent-os-source-policy.pending"
   for policy in "$git_policy" "$home_policy"; do
     if [ -e "$policy" ]; then
-      [ -f "$policy" ] && [ ! -L "$policy" ] || {
-        echo "error: secondmate immutable policy is invalid: $home" >&2
-        exit 2
-      }
-      policy_mode=$(sed -n 's/^mode=//p' "$policy")
-      policy_commit=$(sed -n 's/^commit=//p' "$policy")
-      policy_sha=$(sed -n 's/^source_sha256=//p' "$policy")
-      case "$policy_mode" in candidate|release) ;; *) echo "error: secondmate immutable policy is invalid: $home" >&2; exit 2 ;; esac
-      [[ "$policy_commit" =~ ^[0-9a-f]{40}$ ]] && [[ "$policy_sha" =~ ^[0-9a-f]{64}$ ]] || {
-        echo "error: secondmate immutable policy is invalid: $home" >&2
-        exit 2
-      }
-      [ "$(wc -l < "$policy" | tr -d ' ')" -eq 3 ] || {
+      validate_policy "$policy" || {
         echo "error: secondmate immutable policy is invalid: $home" >&2
         exit 2
       }
     fi
   done
-  if [ -e "$home_policy" ] && [ ! -e "$git_policy" ]; then
-    echo "error: secondmate immutable policy is incomplete: $home" >&2
-    exit 2
-  fi
-  if [ -e "$git_policy" ] && [ -e "$home_policy" ]; then
-    cmp "$git_policy" "$home_policy" || {
-      echo "error: secondmate immutable policies do not match: $home" >&2
+  if [ -e "$required_policy" ]; then
+    [ -f "$required_policy" ] && [ ! -L "$required_policy" ] && \
+      [ "$(cat "$required_policy")" = immutable ] || {
+      echo "error: secondmate immutable policy requirement is invalid: $home" >&2
       exit 2
     }
+  fi
+  if [ -e "$pending_policy" ]; then
+    validate_policy "$pending_policy" || {
+      echo "error: secondmate immutable policy journal is invalid: $home" >&2
+      exit 2
+    }
+  elif [ -e "$required_policy" ]; then
+    if ! { [ -e "$git_policy" ] && [ -e "$home_policy" ] && \
+      cmp "$git_policy" "$home_policy"; }; then
+      echo "error: secondmate immutable policy is incomplete: $home" >&2
+      exit 2
+    fi
+  else
+    if [ -e "$home_policy" ] && [ ! -e "$git_policy" ]; then
+      echo "error: secondmate immutable policy is incomplete: $home" >&2
+      exit 2
+    fi
+    if [ -e "$git_policy" ] && [ -e "$home_policy" ]; then
+      cmp "$git_policy" "$home_policy" || {
+        echo "error: secondmate immutable policies do not match: $home" >&2
+        exit 2
+      }
+    fi
   fi
   validated_ids+=("$id")
   validated_homes+=("$home")
@@ -216,9 +274,17 @@ for index in "${!validated_homes[@]}"; do
   trusted_git -c protocol.file.allow=always -C "$home" fetch --no-tags "$FM_ROOT" "$SOURCE_COMMIT"
   [ "$(trusted_git -C "$home" rev-parse FETCH_HEAD)" = "$SOURCE_COMMIT" ] || exit 2
   [ "$(trusted_git -C "$home" rev-parse 'FETCH_HEAD^{tree}')" = "$SOURCE_TREE" ] || exit 2
+  mkdir -p "$home/config"
+  pending_policy="$home/config/agent-os-source-policy.pending"
+  pending_tmp="$home/config/.agent-os-source-policy.pending.$$"
+  printf '%s\n' "$marker" > "$pending_tmp"
+  mv "$pending_tmp" "$pending_policy"
+  required_policy="$home/config/agent-os-source-policy.required"
+  required_tmp="$home/config/.agent-os-source-policy.required.$$"
+  printf 'immutable\n' > "$required_tmp"
+  mv "$required_tmp" "$required_policy"
   trusted_git -C "$home" checkout --detach "$SOURCE_COMMIT"
   trusted_git -C "$home" remote set-url origin "$SOURCE_ORIGIN"
-  mkdir -p "$home/config"
   home_marker_tmp="$home/config/.agent-os-source-policy.$$"
   printf '%s\n' "$marker" > "$home_marker_tmp"
   mv "$home_marker_tmp" "$home/config/agent-os-source-policy"
@@ -229,5 +295,6 @@ for index in "${!validated_homes[@]}"; do
   [ "$(trusted_git -C "$home" rev-parse HEAD)" = "$SOURCE_COMMIT" ] || exit 2
   [ "$(trusted_git -C "$home" rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE" ] || exit 2
   [ -z "$(trusted_git -C "$home" status --porcelain --untracked-files=all)" ] || exit 2
+  rm "$pending_policy"
   printf 'selected: %s\n' "$home"
 done

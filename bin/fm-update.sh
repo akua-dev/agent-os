@@ -69,6 +69,8 @@ POLICY_GIT_DIR=
 resolve_policy_git_dir "$FM_ROOT" || true
 policy_file=${POLICY_GIT_DIR:+$POLICY_GIT_DIR/agent-os-runtime-source}
 home_policy_file="$FM_ROOT/config/agent-os-source-policy"
+required_policy_file="$FM_ROOT/config/agent-os-source-policy.required"
+pending_policy_file="$FM_ROOT/config/agent-os-source-policy.pending"
 secondmate_home=false
 if [ -e "$FM_ROOT/.fm-secondmate-home" ]; then
   [ -f "$FM_ROOT/.fm-secondmate-home" ] && [ ! -L "$FM_ROOT/.fm-secondmate-home" ] || {
@@ -77,7 +79,20 @@ if [ -e "$FM_ROOT/.fm-secondmate-home" ]; then
   }
   secondmate_home=true
 fi
-if [ "$secondmate_home" = true ] && { [ -e "$policy_file" ] || [ -e "$home_policy_file" ]; }; then
+if [ "$secondmate_home" = true ] && \
+  { [ -e "$policy_file" ] || [ -e "$home_policy_file" ] || \
+    [ -e "$required_policy_file" ] || [ -e "$pending_policy_file" ]; }; then
+  [ ! -e "$pending_policy_file" ] || {
+    echo "error: immutable source provenance transition is incomplete" >&2
+    exit 2
+  }
+  if [ -e "$required_policy_file" ]; then
+    [ -f "$required_policy_file" ] && [ ! -L "$required_policy_file" ] && \
+      [ "$(cat "$required_policy_file")" = immutable ] || {
+      echo "error: invalid immutable source provenance requirement" >&2
+      exit 2
+    }
+  fi
   [ -f "$policy_file" ] && [ ! -L "$policy_file" ] && \
     [ -f "$home_policy_file" ] && [ ! -L "$home_policy_file" ] || {
     echo "error: immutable source provenance is incomplete" >&2
@@ -87,7 +102,8 @@ if [ "$secondmate_home" = true ] && { [ -e "$policy_file" ] || [ -e "$home_polic
     echo "error: immutable source provenance does not match the secondmate home policy" >&2
     exit 2
   }
-elif [ "$secondmate_home" = false ] && [ -e "$home_policy_file" ]; then
+elif [ "$secondmate_home" = false ] && \
+  { [ -e "$home_policy_file" ] || [ -e "$required_policy_file" ] || [ -e "$pending_policy_file" ]; }; then
   echo "error: immutable source provenance exists outside a secondmate home" >&2
   exit 2
 fi

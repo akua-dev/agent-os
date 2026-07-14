@@ -339,6 +339,8 @@ test_secondmate_persisted_policy_refuses_sanitized_self_update() {
     > "$w/linked/config/agent-os-source-policy"
   printf 'mode=release\ncommit=%s\nsource_sha256=%s\n' "$commit" "$sha" \
     > "$standalone/config/agent-os-source-policy"
+  printf 'immutable\n' > "$w/linked/config/agent-os-source-policy.required"
+  printf 'immutable\n' > "$standalone/config/agent-os-source-policy.required"
 
   for target in "$w/linked" "$standalone"; do
     set +e
@@ -362,6 +364,17 @@ test_secondmate_persisted_policy_refuses_sanitized_self_update() {
     "missing secondmate Git policy fails closed"
   [ "$(git -C "$w/linked" rev-parse HEAD)" = "$before" ] || \
     fail "secondmate moved after immutable Git policy removal"
+  rm "$w/linked/config/agent-os-source-policy"
+  set +e
+  out=$(env -i PATH="$PATH" HOME="$HOME" FM_ROOT_OVERRIDE="$w/linked" FM_HOME="$w/linked" \
+    "$UPDATE" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -eq 2 ] || fail "removed secondmate policy pair exited $status, expected 2"
+  assert_contains "$out" "immutable source provenance is incomplete" \
+    "deletion-evident secondmate policy fails closed after both copies are removed"
+  [ "$(git -C "$w/linked" rev-parse HEAD)" = "$before" ] || \
+    fail "secondmate moved after both immutable policies were removed"
   pass "T14 linked and standalone secondmates persist immutable update policy"
 }
 

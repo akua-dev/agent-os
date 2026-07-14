@@ -271,6 +271,22 @@ assert_grep 'recovering incomplete candidate reservation' "$IMAGE_WORKFLOW" \
   "candidate retries must recover an incomplete reservation under its trusted coordinator"
 assert_grep 'candidate reservation recovered from durable trusted artifact' "$IMAGE_WORKFLOW" \
   "zero-referrer retries must recover durable trusted candidate evidence"
+assert_grep 'candidate reservation recovered from exact build evidence' "$IMAGE_WORKFLOW" \
+  "zero-referrer retries must reuse an owner-bound pushed image digest"
+assert_grep 'agent-os-candidate-build-$GITHUB_SHA' "$IMAGE_WORKFLOW" \
+  "candidate builds must persist their exact digest immediately"
+build_line=$(grep -n 'name: Build release candidate once' "$IMAGE_WORKFLOW" | cut -d: -f1)
+build_evidence_line=$(grep -n 'name: Stage exact candidate build evidence' "$IMAGE_WORKFLOW" | cut -d: -f1)
+record_line=$(grep -n 'name: Prepare immutable release candidate record' "$IMAGE_WORKFLOW" | cut -d: -f1)
+[ -n "$build_line" ] && [ -n "$build_evidence_line" ] && [ -n "$record_line" ] && \
+  [ "$build_line" -lt "$build_evidence_line" ] && [ "$build_evidence_line" -lt "$record_line" ] || \
+  fail "exact build evidence must be durable before candidate record preparation"
+assert_grep '.path == ".github/workflows/agent-os-image.yml"' "$IMAGE_WORKFLOW" \
+  "candidate artifact recovery must bind the authorized workflow"
+assert_grep '.repository.full_name == $repo' "$IMAGE_WORKFLOW" \
+  "candidate artifact recovery must bind the authorized repository"
+assert_grep 'candidate artifact run is outside the authorized claim chain' "$IMAGE_WORKFLOW" \
+  "candidate artifact recovery must bind reservation-owner lineage"
 stage_line=$(grep -n 'name: Stage trusted candidate record evidence' "$IMAGE_WORKFLOW" | cut -d: -f1)
 publish_line=$(grep -n 'name: Publish immutable release candidate record' "$IMAGE_WORKFLOW" | cut -d: -f1)
 [ -n "$stage_line" ] && [ -n "$publish_line" ] && [ "$stage_line" -lt "$publish_line" ] || \
