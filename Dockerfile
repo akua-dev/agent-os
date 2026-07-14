@@ -46,6 +46,7 @@ RUN set -eu; \
   rm -f /tmp/verified-source.tar /tmp/agent-os-source.tar /tmp/agent-os-bootstrap.tar /tmp/agent-os-source.attestation; \
   printf '%s\n' "$AGENT_OS_SOURCE_COMMIT" > /opt/agent-os-source.commit; \
   printf '%s\n' "$AGENT_OS_SOURCE_TREE" > /opt/agent-os-source.tree; \
+  printf '%s\n' "$source_sha" > /opt/agent-os-source.sha256; \
   printf '%s\n' "$AGENT_OS_SOURCE_BRANCH" > /opt/agent-os-source.branch; \
   printf '%s\n' "$AGENT_OS_SOURCE_ORIGIN" > /opt/agent-os-source.origin; \
   printf '%s\n' "$AGENT_OS_SOURCE_MODE" > /opt/agent-os-source.mode; \
@@ -226,6 +227,7 @@ COPY --from=source-bootstrap /opt/agent-os /opt/agent-os
 COPY --from=source-bootstrap /opt/agent-os-bootstrap.git /opt/agent-os-bootstrap.git
 COPY --from=source-bootstrap /opt/agent-os-source.commit /opt/agent-os-source.commit
 COPY --from=source-bootstrap /opt/agent-os-source.tree /opt/agent-os-source.tree
+COPY --from=source-bootstrap /opt/agent-os-source.sha256 /opt/agent-os-source.sha256
 COPY --from=source-bootstrap /opt/agent-os-source.branch /opt/agent-os-source.branch
 COPY --from=source-bootstrap /opt/agent-os-source.origin /opt/agent-os-source.origin
 COPY --from=source-bootstrap /opt/agent-os-source.mode /opt/agent-os-source.mode

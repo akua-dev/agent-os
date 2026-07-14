@@ -291,23 +291,32 @@ test_unsafe_secondmate_home_skipped_before_git_update() {
   pass "T11 unsafe secondmate home is not fast-forwarded"
 }
 
-test_immutable_image_source_refuses_self_update() {
-  local w out status before
-  w=$(new_world t12)
+test_persisted_immutable_source_refuses_sanitized_self_update() {
+  local w runtime commit out status before key
+  w=$(new_world t13)
   bump_origin "$w" instr
-  before=$(git -C "$w/main" rev-parse HEAD)
+  commit=$(git -C "$w/main" rev-parse HEAD)
+  key="$commit-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  runtime="$w/home/runtime-sources/$key"
+  mkdir -p "$w/home/runtime-sources"
+  git clone -q "$w/main" "$runtime"
+  before=$(git -C "$runtime" rev-parse HEAD)
+  printf 'mode=candidate\ncommit=%s\nsource_sha256=%s\n' "$commit" \
+    aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    > "$runtime/.git/agent-os-runtime-source"
 
   set +e
-  out=$(AGENT_OS_SOURCE_UPDATE_POLICY=immutable FM_ROOT_OVERRIDE="$w/main" FM_HOME="$w/home" "$UPDATE" 2>&1)
+  out=$(env -i PATH="$PATH" HOME="$HOME" FM_ROOT_OVERRIDE="$runtime" FM_HOME="$w/home" \
+    "$UPDATE" 2>&1)
   status=$?
   set -e
 
-  [ "$status" -eq 2 ] || fail "immutable image update exited $status, expected 2"
+  [ "$status" -eq 2 ] || fail "persisted immutable source update exited $status, expected 2"
   assert_contains "$out" "self-update is disabled for immutable image source" \
-    "immutable image source blocks moving-main self-update"
-  [ "$(git -C "$w/main" rev-parse HEAD)" = "$before" ] \
-    || fail "immutable image source moved during refused self-update"
-  pass "T12 immutable image source refuses self-update"
+    "persisted immutable provenance blocks sanitized self-update"
+  [ "$(git -C "$runtime" rev-parse HEAD)" = "$before" ] || \
+    fail "persisted immutable runtime source moved during refused self-update"
+  pass "T13 persisted immutable source refuses sanitized self-update"
 }
 
 test_updates_main_and_secondmate
@@ -319,6 +328,6 @@ test_registry_backstop_dedup_and_self_exclusion
 test_firstmate_wrong_branch_skipped
 test_firstmate_detached_head_skipped
 test_unsafe_secondmate_home_skipped_before_git_update
-test_immutable_image_source_refuses_self_update
+test_persisted_immutable_source_refuses_sanitized_self_update
 
 echo "# all fm-update tests passed"

@@ -47,7 +47,29 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
 fi
 [ $# -eq 0 ] || { usage; exit 1; }
 
-case "${AGENT_OS_SOURCE_UPDATE_POLICY:-fast-forward}" in
+persisted_policy=fast-forward
+policy_file="$FM_ROOT/.git/agent-os-runtime-source"
+if [ -f "$policy_file" ]; then
+  policy_mode=$(sed -n 's/^mode=//p' "$policy_file")
+  policy_commit=$(sed -n 's/^commit=//p' "$policy_file")
+  policy_source_sha=$(sed -n 's/^source_sha256=//p' "$policy_file")
+  case "$policy_mode" in candidate|release) ;; *) echo "error: invalid immutable source provenance" >&2; exit 2 ;; esac
+  [[ "$policy_commit" =~ ^[0-9a-f]{40}$ ]] && [[ "$policy_source_sha" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "error: invalid immutable source provenance" >&2
+    exit 2
+  }
+  expected_root="$FM_HOME/runtime-sources/$policy_commit-$policy_source_sha"
+  [ "$(cd "$FM_ROOT" && pwd -P)" = "$(cd "$expected_root" 2>/dev/null && pwd -P)" ] || {
+    echo "error: immutable source provenance does not match FM_ROOT" >&2
+    exit 2
+  }
+  persisted_policy=immutable
+elif [ "${FM_ROOT#"$FM_HOME/runtime-sources/"}" != "$FM_ROOT" ]; then
+  echo "error: immutable source provenance is unavailable" >&2
+  exit 2
+fi
+
+case "$persisted_policy" in
   fast-forward) ;;
   immutable)
     echo "error: self-update is disabled for immutable image source" >&2

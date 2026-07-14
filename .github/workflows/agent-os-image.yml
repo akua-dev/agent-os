@@ -105,6 +105,7 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
       - name: Prepare exact source bundle
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         id: source
         run: |
           set -eu
@@ -119,13 +120,7 @@ jobs:
             AGENT_OS_SOURCE_MODE=event AGENT_OS_SOURCE_EVENT_COMMIT="${{ github.event.pull_request.head.sha }}" \
               bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/source-metadata"
           else
-            if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
-              record_commit=$(trusted_git for-each-ref --format='%(contents)' "$GITHUB_REF" | sed -n 's/^release-record-commit=\([0-9a-f]\{40\}\)$/\1/p')
-              AGENT_OS_SOURCE_MODE=release AGENT_OS_SOURCE_RELEASE_TAG="${GITHUB_REF#refs/tags/}" \
-                AGENT_OS_RELEASE_RECORD_COMMIT="$record_commit" bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/source-metadata"
-            else
-              bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/source-metadata"
-            fi
+            bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/source-metadata"
           fi
           cat "$RUNNER_TEMP/source-metadata" >> "$GITHUB_OUTPUT"
 
@@ -160,6 +155,7 @@ jobs:
     name: Publish linux/amd64 and linux/arm64
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
       packages: write
     steps:
@@ -167,25 +163,6 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-
-      - name: Prepare immutable release source
-        if: startsWith(github.ref, 'refs/tags/')
-        id: release_source
-        run: |
-          set -eu
-          trusted_git() {
-            env -i HOME=/nonexistent PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C \
-              GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
-              /usr/bin/git -c credential.helper= -c core.hooksPath=/dev/null \
-              -c http.proxy= -c https.proxy= "$@"
-          }
-          record_commit=$(trusted_git for-each-ref --format='%(contents)' "$GITHUB_REF" | sed -n 's/^release-record-commit=\([0-9a-f]\{40\}\)$/\1/p')
-          AGENT_OS_SOURCE_MODE=release AGENT_OS_SOURCE_RELEASE_TAG="${GITHUB_REF#refs/tags/}" \
-            AGENT_OS_RELEASE_RECORD_COMMIT="$record_commit" bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/release-source-metadata"
-          trusted_git show "$record_commit:image/releases/${GITHUB_REF#refs/tags/}.json" > "$RUNNER_TEMP/release-record.json"
-          [ "$(sha256sum "$RUNNER_TEMP/release-record.json" | awk '{print $1}')" = \
-            "$(sed -n 's/^release_record_sha256=//p' "$RUNNER_TEMP/release-source-metadata")" ]
-          cat "$RUNNER_TEMP/release-source-metadata" >> "$GITHUB_OUTPUT"
 
       - name: Prepare exact release candidate source
         if: github.ref == 'refs/heads/main'
@@ -211,6 +188,119 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Prepare immutable release source
+        if: startsWith(github.ref, 'refs/tags/')
+        id: release_source
+        run: |
+          set -eu
+          trusted_git() {
+            env -i HOME=/nonexistent PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C \
+              GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+              /usr/bin/git -c credential.helper= -c core.hooksPath=/dev/null \
+              -c http.proxy= -c https.proxy= "$@"
+          }
+          record_commit=$(trusted_git for-each-ref --format='%(contents)' "$GITHUB_REF" | sed -n 's/^release-record-commit=\([0-9a-f]\{40\}\)$/\1/p')
+          trusted_git show "$record_commit:image/releases/${GITHUB_REF#refs/tags/}.json" > "$RUNNER_TEMP/release-record.json"
+          candidate_record_digest=$(jq -er '.candidate_record_digest' "$RUNNER_TEMP/release-record.json")
+          oras manifest fetch "$IMAGE@$candidate_record_digest" > "$RUNNER_TEMP/release-source-candidate-manifest.json"
+          [ "sha256:$(sha256sum "$RUNNER_TEMP/release-source-candidate-manifest.json" | awk '{print $1}')" = "$candidate_record_digest" ]
+          bootstrap_blob=$(jq -er '[.layers[] | select(.mediaType == "application/vnd.akua.agent-os.bootstrap.v1+tar" and .annotations["org.opencontainers.image.title"] == "agent-os-bootstrap.tar")] | select(length == 1) | .[0].digest' "$RUNNER_TEMP/release-source-candidate-manifest.json")
+          oras blob fetch --output "$RUNNER_TEMP/agent-os-bootstrap.tar" "$IMAGE@$bootstrap_blob"
+          [ "$(sha256sum "$RUNNER_TEMP/agent-os-bootstrap.tar" | awk '{print $1}')" = "$(jq -r .bootstrap_archive_sha256 "$RUNNER_TEMP/release-record.json")" ]
+          AGENT_OS_SOURCE_MODE=release AGENT_OS_SOURCE_RELEASE_TAG="${GITHUB_REF#refs/tags/}" \
+            AGENT_OS_RELEASE_RECORD_COMMIT="$record_commit" \
+            AGENT_OS_RELEASE_BOOTSTRAP_ARCHIVE="$RUNNER_TEMP/agent-os-bootstrap.tar" \
+            bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/release-source-metadata"
+          [ "$(sha256sum "$RUNNER_TEMP/release-record.json" | awk '{print $1}')" = \
+            "$(sed -n 's/^release_record_sha256=//p' "$RUNNER_TEMP/release-source-metadata")" ]
+          cat "$RUNNER_TEMP/release-source-metadata" >> "$GITHUB_OUTPUT"
+
+      - name: Reserve or recover commit-indexed release candidate
+        if: github.ref == 'refs/heads/main'
+        id: candidate_reservation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          printf '{}\n' > "$RUNNER_TEMP/candidate-reservation-config.json"
+          jq -cnS \
+            --arg commit '${{ steps.candidate_source.outputs.commit }}' \
+            --arg tree '${{ steps.candidate_source.outputs.tree }}' \
+            --arg source '${{ steps.candidate_source.outputs.source_sha256 }}' \
+            '{schema_version:1,commit:$commit,tree:$tree,source_archive_sha256:$source}' \
+            > "$RUNNER_TEMP/candidate-reservation.json"
+          oras blob push --media-type application/vnd.oci.empty.v1+json --descriptor \
+            "$IMAGE" "$RUNNER_TEMP/candidate-reservation-config.json" > "$RUNNER_TEMP/candidate-reservation-config-descriptor.json"
+          oras blob push --media-type application/vnd.akua.agent-os.candidate-reservation.v1+json --descriptor \
+            "$IMAGE" "$RUNNER_TEMP/candidate-reservation.json" > "$RUNNER_TEMP/candidate-reservation-descriptor.json"
+          config_descriptor=$(jq -cS '{mediaType,digest,size}' "$RUNNER_TEMP/candidate-reservation-config-descriptor.json")
+          reservation_descriptor=$(jq -cS '{mediaType,digest,size,annotations:{"org.opencontainers.image.title":"candidate-reservation.json"}}' "$RUNNER_TEMP/candidate-reservation-descriptor.json")
+          jq -cnS --argjson config "$config_descriptor" --argjson reservation "$reservation_descriptor" \
+            '{schemaVersion:2,mediaType:"application/vnd.oci.image.manifest.v1+json",artifactType:"application/vnd.akua.agent-os.candidate-reservation.v1",config:$config,layers:[$reservation]}' \
+            > "$RUNNER_TEMP/candidate-reservation-manifest.json"
+          reservation_digest="sha256:$(sha256sum "$RUNNER_TEMP/candidate-reservation-manifest.json" | awk '{print $1}')"
+          reservation_size=$(wc -c < "$RUNNER_TEMP/candidate-reservation-manifest.json" | tr -d ' ')
+          existed=false
+          if oras manifest fetch "$IMAGE@$reservation_digest" > "$RUNNER_TEMP/candidate-reservation-existing.json" 2> "$RUNNER_TEMP/candidate-reservation.err"; then
+            cmp "$RUNNER_TEMP/candidate-reservation-manifest.json" "$RUNNER_TEMP/candidate-reservation-existing.json"
+            existed=true
+          elif grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/candidate-reservation.err"; then
+            oras manifest push --descriptor "$IMAGE@$reservation_digest" \
+              "$RUNNER_TEMP/candidate-reservation-manifest.json" > "$RUNNER_TEMP/candidate-reservation-push.json"
+            [ "$(jq -r .digest "$RUNNER_TEMP/candidate-reservation-push.json")" = "$reservation_digest" ]
+          else
+            cat "$RUNNER_TEMP/candidate-reservation.err" >&2
+            exit 1
+          fi
+          oras manifest fetch "$IMAGE@$reservation_digest" > "$RUNNER_TEMP/candidate-reservation-readback.json"
+          cmp "$RUNNER_TEMP/candidate-reservation-manifest.json" "$RUNNER_TEMP/candidate-reservation-readback.json"
+          printf 'reservation_digest=%s\nreservation_size=%s\n' "$reservation_digest" "$reservation_size" >> "$GITHUB_OUTPUT"
+          if [ "$existed" = false ]; then
+            printf 'build=true\nbootstrap_sha256=%s\n' '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          oras discover --distribution-spec v1.1-referrers-api --artifact-type application/vnd.akua.agent-os.release-candidate.v1 \
+            --format json --depth 1 "$IMAGE@$reservation_digest" > "$RUNNER_TEMP/candidate-reservation-referrers.json"
+          referrer_count=$(jq -er '.referrers | length' "$RUNNER_TEMP/candidate-reservation-referrers.json")
+          if [ "$referrer_count" -eq 0 ]; then
+            echo "::error::partial candidate reservation requires trusted recovery"
+            exit 1
+          fi
+          [ "$referrer_count" -eq 1 ] || { echo "::error::candidate reservation has conflicting records"; exit 1; }
+          candidate_record_digest=$(jq -er '.referrers[0].digest' "$RUNNER_TEMP/candidate-reservation-referrers.json")
+          oras manifest fetch "$IMAGE@$candidate_record_digest" > "$RUNNER_TEMP/candidate-recovered-manifest.json"
+          artifact_name="agent-os-candidate-record-$GITHUB_SHA"
+          gh api --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$artifact_name&per_page=100" \
+            > "$RUNNER_TEMP/candidate-trusted-artifacts.json"
+          trusted_artifact_count=$(jq -er --arg sha "$GITHUB_SHA" \
+            '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha)] | length' \
+            "$RUNNER_TEMP/candidate-trusted-artifacts.json")
+          [ "$trusted_artifact_count" -eq 1 ] || {
+            echo "::error::partial candidate reservation requires trusted recovery"
+            exit 1
+          }
+          trusted_artifact_id=$(jq -er --arg sha "$GITHUB_SHA" \
+            '[.artifacts[] | select(.expired == false and .workflow_run.head_sha == $sha)] | .[0].id' \
+            "$RUNNER_TEMP/candidate-trusted-artifacts.json")
+          mkdir "$RUNNER_TEMP/candidate-trusted-artifact"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$trusted_artifact_id/zip" \
+            > "$RUNNER_TEMP/candidate-trusted-artifact.zip"
+          unzip -q "$RUNNER_TEMP/candidate-trusted-artifact.zip" -d "$RUNNER_TEMP/candidate-trusted-artifact"
+          cmp "$RUNNER_TEMP/candidate-trusted-artifact/candidate-manifest.json" \
+            "$RUNNER_TEMP/candidate-recovered-manifest.json"
+          record_blob=$(jq -er '[.layers[] | select(.mediaType == "application/vnd.akua.agent-os.release-candidate.v1+json")] | select(length == 1) | .[0].digest' "$RUNNER_TEMP/candidate-recovered-manifest.json")
+          bootstrap_blob=$(jq -er '[.layers[] | select(.mediaType == "application/vnd.akua.agent-os.bootstrap.v1+tar" and .annotations["org.opencontainers.image.title"] == "agent-os-bootstrap.tar")] | select(length == 1) | .[0].digest' "$RUNNER_TEMP/candidate-recovered-manifest.json")
+          oras blob fetch --output "$RUNNER_TEMP/candidate-recovered-record.json" "$IMAGE@$record_blob"
+          oras blob fetch --output "$RUNNER_TEMP/candidate-recovered-bootstrap.tar" "$IMAGE@$bootstrap_blob"
+          cmp "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json" "$RUNNER_TEMP/candidate-recovered-record.json"
+          cmp "$RUNNER_TEMP/candidate-trusted-artifact/agent-os-bootstrap.tar" "$RUNNER_TEMP/candidate-recovered-bootstrap.tar"
+          cp "$RUNNER_TEMP/candidate-trusted-artifact/agent-os-bootstrap.tar" image/agent-os-bootstrap.tar
+          image_digest=$(jq -er '.image_digest | select(test("^sha256:[0-9a-f]{64}$"))' "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
+          bootstrap_sha=$(jq -er '.bootstrap_archive_sha256 | select(test("^[0-9a-f]{64}$"))' "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
+          [ "$(sha256sum image/agent-os-bootstrap.tar | awk '{print $1}')" = "$bootstrap_sha" ]
+          printf 'build=false\ncandidate_record_digest=%s\nimage_digest=%s\nbootstrap_sha256=%s\n' \
+            "$candidate_record_digest" "$image_digest" "$bootstrap_sha" >> "$GITHUB_OUTPUT"
+
       - name: Reject legacy candidate coordinates
         if: github.ref == 'refs/heads/main'
         run: |
@@ -227,7 +317,7 @@ jobs:
           fi
 
       - name: Build release candidate once
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && steps.candidate_reservation.outputs.build == 'true'
         id: candidate_build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
@@ -250,7 +340,7 @@ jobs:
         if: github.ref == 'refs/heads/main'
         id: candidate_record
         env:
-          CANDIDATE_BUILD_DIGEST: ${{ steps.candidate_build.outputs.digest }}
+          CANDIDATE_BUILD_DIGEST: ${{ steps.candidate_build.outputs.digest || steps.candidate_reservation.outputs.image_digest }}
         run: |
           set -eu
           verify_candidate_attestations() {
@@ -331,7 +421,7 @@ jobs:
             --arg commit '${{ steps.candidate_source.outputs.commit }}' \
             --arg tree '${{ steps.candidate_source.outputs.tree }}' \
             --arg sourceArchive '${{ steps.candidate_source.outputs.source_sha256 }}' \
-            --arg bootstrapArchive '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' \
+            --arg bootstrapArchive '${{ steps.candidate_reservation.outputs.bootstrap_sha256 }}' \
             --arg package "$(sha256sum tools/agent-os/packages/firstmate/package.k | awk '{print $1}')" \
             --arg schema "$(sha256sum tools/agent-os/packages/firstmate/inputs.example.yaml | awk '{print $1}')" \
             --arg quickstart "$(sha256sum docs/kubernetes.md | awk '{print $1}')" \
@@ -344,7 +434,7 @@ jobs:
           jq -e \
             --arg commit '${{ steps.candidate_source.outputs.commit }}' --arg tree '${{ steps.candidate_source.outputs.tree }}' \
             --arg sourceArchive '${{ steps.candidate_source.outputs.source_sha256 }}' \
-            --arg bootstrapArchive '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' \
+            --arg bootstrapArchive '${{ steps.candidate_reservation.outputs.bootstrap_sha256 }}' \
             --arg package "$(sha256sum tools/agent-os/packages/firstmate/package.k | awk '{print $1}')" \
             --arg schema "$(sha256sum tools/agent-os/packages/firstmate/inputs.example.yaml | awk '{print $1}')" \
             --arg quickstart "$(sha256sum docs/kubernetes.md | awk '{print $1}')" \
@@ -362,10 +452,20 @@ jobs:
             "$IMAGE" "$RUNNER_TEMP/candidate-config.json" > "$RUNNER_TEMP/candidate-config-descriptor.json"
           oras blob push --media-type application/vnd.akua.agent-os.release-candidate.v1+json --descriptor \
             "$IMAGE" "$RUNNER_TEMP/candidate-record.json" > "$RUNNER_TEMP/candidate-record-descriptor.json"
+          oras blob push --media-type application/vnd.akua.agent-os.bootstrap.v1+tar --descriptor \
+            "$IMAGE" image/agent-os-bootstrap.tar > "$RUNNER_TEMP/candidate-bootstrap-descriptor.json"
+          [ "$(jq -r .digest "$RUNNER_TEMP/candidate-bootstrap-descriptor.json")" = \
+            "sha256:${{ steps.candidate_reservation.outputs.bootstrap_sha256 }}" ]
           config_descriptor=$(jq -cS '{mediaType,digest,size}' "$RUNNER_TEMP/candidate-config-descriptor.json")
           record_descriptor=$(jq -cS '{mediaType,digest,size,annotations:{"org.opencontainers.image.title":"candidate-record.json"}}' "$RUNNER_TEMP/candidate-record-descriptor.json")
+          bootstrap_descriptor=$(jq -cS '{mediaType,digest,size,annotations:{"org.opencontainers.image.title":"agent-os-bootstrap.tar"}}' "$RUNNER_TEMP/candidate-bootstrap-descriptor.json")
+          reservation_subject=$(jq -cnS \
+            --arg digest '${{ steps.candidate_reservation.outputs.reservation_digest }}' \
+            --argjson size '${{ steps.candidate_reservation.outputs.reservation_size }}' \
+            '{mediaType:"application/vnd.oci.image.manifest.v1+json",digest:$digest,size:$size}')
           jq -cnS --argjson config "$config_descriptor" --argjson record "$record_descriptor" \
-            '{schemaVersion:2,mediaType:"application/vnd.oci.image.manifest.v1+json",artifactType:"application/vnd.akua.agent-os.release-candidate.v1",config:$config,layers:[$record]}' \
+            --argjson bootstrap "$bootstrap_descriptor" --argjson subject "$reservation_subject" \
+            '{schemaVersion:2,mediaType:"application/vnd.oci.image.manifest.v1+json",artifactType:"application/vnd.akua.agent-os.release-candidate.v1",subject:$subject,config:$config,layers:[$record,$bootstrap]}' \
             > "$RUNNER_TEMP/candidate-manifest.json"
           candidate_record_digest="sha256:$(sha256sum "$RUNNER_TEMP/candidate-manifest.json" | awk '{print $1}')"
           if oras manifest fetch "$IMAGE@$candidate_record_digest" > "$RUNNER_TEMP/candidate-existing-manifest.json" 2> "$RUNNER_TEMP/candidate-existing-manifest.err"; then
@@ -383,19 +483,28 @@ jobs:
           fi
           oras manifest fetch "$IMAGE@$candidate_record_digest" > "$RUNNER_TEMP/candidate-readback-manifest.json"
           cmp "$RUNNER_TEMP/candidate-manifest.json" "$RUNNER_TEMP/candidate-readback-manifest.json"
-          record_blob_digest=$(jq -er '.layers | select(length == 1) | .[0].digest' "$RUNNER_TEMP/candidate-readback-manifest.json")
+          record_blob_digest=$(jq -er '[.layers[] | select(.mediaType == "application/vnd.akua.agent-os.release-candidate.v1+json")] | select(length == 1) | .[0].digest' "$RUNNER_TEMP/candidate-readback-manifest.json")
           oras blob fetch --output "$RUNNER_TEMP/candidate-record-readback.json" "$IMAGE@$record_blob_digest"
           cmp "$RUNNER_TEMP/candidate-record.json" "$RUNNER_TEMP/candidate-record-readback.json"
+          oras discover --distribution-spec v1.1-referrers-api --artifact-type application/vnd.akua.agent-os.release-candidate.v1 \
+            --format json --depth 1 "$IMAGE@${{ steps.candidate_reservation.outputs.reservation_digest }}" > "$RUNNER_TEMP/candidate-final-referrers.json"
+          jq -e --arg digest "$candidate_record_digest" '.referrers | length == 1 and .[0].digest == $digest' \
+            "$RUNNER_TEMP/candidate-final-referrers.json" >/dev/null || {
+            echo "::error::candidate reservation does not resolve to exactly one verified record"
+            exit 1
+          }
+          cp image/agent-os-bootstrap.tar "$RUNNER_TEMP/agent-os-bootstrap.tar"
           printf 'candidate_record_digest=%s\nimage_digest=%s\n' "$candidate_record_digest" "$actual_image_digest" >> "$GITHUB_OUTPUT"
 
       - name: Retain candidate record for release preparation
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && steps.candidate_reservation.outputs.build == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: agent-os-candidate-record-${{ github.sha }}
           path: |
             ${{ runner.temp }}/candidate-record.json
             ${{ runner.temp }}/candidate-manifest.json
+            ${{ runner.temp }}/agent-os-bootstrap.tar
           if-no-files-found: error
           retention-days: 90
 
@@ -449,8 +558,8 @@ jobs:
           [ "sha256:$(sha256sum "$RUNNER_TEMP/release-candidate-manifest.json" | awk '{print $1}')" = "$candidate_record_digest" ]
           candidate_record_blob=$(jq -er '
             select(.schemaVersion == 2 and .artifactType == "application/vnd.akua.agent-os.release-candidate.v1")
-            | .layers | select(length == 1) | .[0]
-            | select(.mediaType == "application/vnd.akua.agent-os.release-candidate.v1+json") | .digest' \
+            | [.layers[] | select(.mediaType == "application/vnd.akua.agent-os.release-candidate.v1+json")]
+            | select(length == 1) | .[0].digest' \
             "$RUNNER_TEMP/release-candidate-manifest.json")
           oras blob fetch --output "$RUNNER_TEMP/release-candidate-record.json" "$IMAGE@$candidate_record_blob"
           jq -cS '{schema_version,source_mode,commit,tree,source_archive_sha256,bootstrap_archive_sha256,package_sha256,schema_sha256,quickstart_sha256,image_repository,image_digest,platform_manifests,platform_manifests_sha256,sbom_sha256,provenance_sha256,buildkit_outputs_sha256}' \
@@ -507,24 +616,18 @@ jobs:
           [ "$actual_sbom_sha256" = "$(jq -r .sbom_sha256 "$RUNNER_TEMP/release-record.json")" ]
           [ "$actual_provenance_sha256" = "$(jq -r .provenance_sha256 "$RUNNER_TEMP/release-record.json")" ]
           if oras manifest fetch --descriptor "$IMAGE:$release_tag" > "$RUNNER_TEMP/release-tag-descriptor.json" 2> "$RUNNER_TEMP/release-tag.err"; then
-            [ "$(jq -r .digest "$RUNNER_TEMP/release-tag-descriptor.json")" = "$RELEASE_DIGEST" ] || {
-              echo "::error::release tag coordinate already contains a different manifest"
-              exit 1
-            }
+            echo "::error::release registry tag coordinate already exists"
+            exit 1
           elif grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/release-tag.err"; then
-            oras tag "$IMAGE@$RELEASE_DIGEST" "$release_tag"
+            :
           else
             cat "$RUNNER_TEMP/release-tag.err" >&2
             exit 1
           fi
-          oras manifest fetch --descriptor "$IMAGE:$release_tag" > "$RUNNER_TEMP/release-tag-readback.json"
-          [ "$(jq -r .digest "$RUNNER_TEMP/release-tag-readback.json")" = "$RELEASE_DIGEST" ]
-          docker buildx imagetools inspect --raw "$IMAGE:$release_tag" > "$RUNNER_TEMP/published-tag-index.json"
-          [ "sha256:$(sha256sum "$RUNNER_TEMP/published-tag-index.json" | awk '{print $1}')" = "$RELEASE_DIGEST" ]
           {
             echo '### Agent OS release'
             echo
-            echo "Digest: \`$RELEASE_DIGEST\`"
+            echo "Canonical install digest: \`$IMAGE@$RELEASE_DIGEST\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Record protected-main publication
@@ -537,6 +640,6 @@ jobs:
             echo '### Agent OS image'
             echo
             echo "Digest: \`$BUILD_DIGEST\`"
-            echo "Release candidate: \`${{ steps.candidate_record.outputs.image_digest }}\`"
-            echo "Candidate record: \`${{ steps.candidate_record.outputs.candidate_record_digest }}\`"
+            echo "Release candidate: \`${{ steps.candidate_record.outputs.image_digest || steps.candidate_reservation.outputs.image_digest }}\`"
+            echo "Candidate record: \`${{ steps.candidate_record.outputs.candidate_record_digest || steps.candidate_reservation.outputs.candidate_record_digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"

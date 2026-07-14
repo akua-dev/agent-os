@@ -147,6 +147,11 @@ assert_grep 'tag_ruleset_sha256' "$ROOT/bin/agent-os-source-bundle.sh" \
   "release records must bind the protected tag ruleset"
 assert_grep 'source_archive_sha256' "$ROOT/bin/agent-os-source-bundle.sh" \
   "release records must bind the exact archived source"
+assert_grep 'AGENT_OS_RELEASE_BOOTSTRAP_ARCHIVE' "$ROOT/bin/agent-os-source-bundle.sh" \
+  "release preparation must consume the retained candidate bootstrap artifact"
+assert_grep 'cp -- "$RELEASE_BOOTSTRAP_ARCHIVE" "$BOOTSTRAP_ARCHIVE.tmp.$$"' \
+  "$ROOT/bin/agent-os-source-bundle.sh" \
+  "release preparation must preserve exact candidate bootstrap bytes"
 assert_grep 'GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null' "$ROOT/bin/agent-os-container-entrypoint.sh" \
   "runtime provenance must isolate trusted Git operations"
 assert_grep 'env -i' "$ROOT/bin/agent-os-container-entrypoint.sh" \
@@ -169,6 +174,16 @@ assert_grep 'trusted_git -C "$FM_ROOT" fetch --no-tags --prune "$SOURCE_ORIGIN"'
 assert_no_grep 'checkout --detach' "$ROOT/bin/agent-os-container-entrypoint.sh" \
   "canonical runtime source must remain on the declared default branch"
 assert_grep 'FM_ROOT_OVERRIDE=' "$ROOT/bin/agent-os-container-entrypoint.sh" "runtime must use the persistent canonical Firstmate repository"
+assert_grep 'agent-os-runtime-source.sh' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "immutable runtimes must select a content-addressed source checkout"
+assert_grep 'agent-os-source.sha256' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "immutable runtime source identity must include the exact source archive digest"
+assert_present "$ROOT/bin/agent-os-runtime-source.sh" \
+  "immutable runtime source materialization must have one transactional owner"
+assert_grep 'runtime-sources' "$ROOT/bin/agent-os-runtime-source.sh" \
+  "immutable runtime sources must remain separate from persistent home state"
+assert_grep 'agent-os-runtime-source' "$ROOT/bin/agent-os-runtime-source.sh" \
+  "immutable source selections must persist their verified update policy"
 assert_grep 'agent-os-kubernetes-control.sh' "$ROOT/bin/agent-os-kubernetes.sh" \
   "primary lifecycle paths must share the stable control-namespace lock identity"
 assert_grep 'agent-os-kubernetes-control.sh' "$ROOT/bin/agent-os-akua-auth.sh" \
@@ -234,6 +249,18 @@ assert_no_grep 'EXISTING_CANDIDATE_IMAGE_DIGEST' "$IMAGE_WORKFLOW" \
   "publication must never adopt a pre-existing image from its embedded provenance"
 assert_grep 'oras manifest push --descriptor "$IMAGE@$candidate_record_digest"' "$IMAGE_WORKFLOW" \
   "candidate records must be created only at their content-addressed digest"
+assert_grep 'application/vnd.akua.agent-os.candidate-reservation.v1' "$IMAGE_WORKFLOW" \
+  "candidate builds must first reserve one content-addressed commit coordinate"
+assert_grep 'oras discover --distribution-spec v1.1-referrers-api' "$IMAGE_WORKFLOW" \
+  "candidate retries must resolve the single record attached to their reservation"
+assert_grep 'actions/artifacts?name=$artifact_name' "$IMAGE_WORKFLOW" \
+  "candidate retries must authenticate recovered records through trusted workflow storage"
+assert_grep '.workflow_run.head_sha == $sha' "$IMAGE_WORKFLOW" \
+  "candidate recovery must bind the trusted record to the exact protected-main commit"
+assert_grep 'partial candidate reservation requires trusted recovery' "$IMAGE_WORKFLOW" \
+  "candidate retries must fail closed on an incomplete reservation"
+assert_grep 'org.opencontainers.image.title":"agent-os-bootstrap.tar"' "$IMAGE_WORKFLOW" \
+  "candidate records must retain the exact bootstrap artifact"
 assert_grep 'candidate record coordinate already contains different artifacts' "$IMAGE_WORKFLOW" \
   "candidate record creation must reject immutable coordinate conflicts"
 assert_grep 'release candidate image provenance conflicts with the exact protected-main source' "$IMAGE_WORKFLOW" \
@@ -254,22 +281,24 @@ assert_grep 'buildkit_outputs_sha256' "$IMAGE_WORKFLOW" \
   "candidate records must bind the exact BuildKit output descriptors"
 assert_grep '.bootstrap_archive_sha256 == $bootstrapArchive' "$IMAGE_WORKFLOW" \
   "candidate retries and promotion must enforce the exact bootstrap archive"
-assert_grep 'bootstrap archive differs from the immutable release record' "$ROOT/bin/agent-os-source-bundle.sh" \
-  "release source preparation must regenerate and verify the exact bootstrap archive"
+assert_grep 'retained bootstrap archive differs from the immutable release record' "$ROOT/bin/agent-os-source-bundle.sh" \
+  "release source preparation must verify the retained exact bootstrap archive"
 assert_grep 'actual_image_digest' "$IMAGE_WORKFLOW" \
   "release publication must compare the actual multi-platform image digest"
 assert_grep 'actual_sbom_sha256' "$IMAGE_WORKFLOW" \
   "release publication must compare the actual SBOM artifact set"
 assert_grep 'actual_provenance_sha256' "$IMAGE_WORKFLOW" \
   "release publication must compare the actual provenance artifact set"
-assert_grep 'oras tag "$IMAGE@$RELEASE_DIGEST" "$release_tag"' "$IMAGE_WORKFLOW" \
-  "release publication must alias the exact existing candidate manifest by digest"
+assert_no_grep 'oras tag ' "$IMAGE_WORKFLOW" \
+  "release publication must never create a mutable registry semver tag"
+assert_grep 'release registry tag coordinate already exists' "$IMAGE_WORKFLOW" \
+  "release publication must reject conflicting mutable registry coordinates"
 assert_no_grep 'oras cp --from-oci-layout' "$IMAGE_WORKFLOW" \
   "release publication must not rebuild or re-upload an OCI layout"
 assert_grep 'oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6' "$IMAGE_WORKFLOW" \
   "release publication must pin the OCI transfer implementation"
-assert_grep 'published-tag-index.json' "$IMAGE_WORKFLOW" \
-  "release publication must verify every published tag resolves to the recorded digest"
+assert_grep 'Canonical install digest:' "$IMAGE_WORKFLOW" \
+  "release publication must expose only the immutable install digest"
 assert_grep 'published-platform-subjects' "$IMAGE_WORKFLOW" \
   "release promotion must reverify the per-platform attestation bijection"
 assert_grep 'File.fnmatch?(pattern, ref, File::FNM_PATHNAME)' "$IMAGE_WORKFLOW" \
@@ -349,13 +378,14 @@ assert_grep 'docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051' "$
   "release metadata action must be pinned to the reviewed full SHA"
 assert_grep 'docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8' "$ROOT/.github/workflows/agent-os-image.yml" \
   "release build action must be pinned to the reviewed full SHA"
-assert_grep 'AGENT_OS_SOURCE_UPDATE_POLICY=immutable' "$ROOT/bin/agent-os-container-entrypoint.sh" \
-  "candidate and release runtimes must disable moving-main self-updates"
+assert_grep '.git/agent-os-runtime-source' "$ROOT/bin/fm-update.sh" \
+  "self-update must derive immutable policy from selected source provenance"
 assert_grep 'TRUSTED_SOURCE_REF=$SOURCE_COMMIT' "$ROOT/bin/agent-os-container-entrypoint.sh" \
   "candidate runtime provenance must fetch its immutable commit"
 if grep -E 'uses: (actions/checkout|docker/[^@]+|oras-project/setup-oras)@v[0-9]+' "$ROOT/.github/workflows/agent-os-image.yml" >/dev/null; then
   fail "release workflow must not use mutable major action tags"
 fi
 bash -n "$ROOT/bin/agent-os-container-entrypoint.sh"
+bash -n "$ROOT/bin/agent-os-runtime-source.sh"
 bash -n "$ROOT/bin/agent-os-kubeconfig.sh"
 pass "container files pin dependencies and exclude host credentials"

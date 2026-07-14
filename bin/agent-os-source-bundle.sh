@@ -10,6 +10,7 @@ SOURCE_ORIGIN=https://github.com/akua-dev/agent-os.git
 SOURCE_REF=refs/heads/main
 RELEASE_TAG=${AGENT_OS_SOURCE_RELEASE_TAG:-}
 RELEASE_RECORD_COMMIT=${AGENT_OS_RELEASE_RECORD_COMMIT:-}
+RELEASE_BOOTSTRAP_ARCHIVE=${AGENT_OS_RELEASE_BOOTSTRAP_ARCHIVE:-}
 EVENT_COMMIT=${AGENT_OS_SOURCE_EVENT_COMMIT:-}
 SOURCE_ARCHIVE="$OUTPUT_DIR/agent-os-source.tar"
 BOOTSTRAP_ARCHIVE="$OUTPUT_DIR/agent-os-bootstrap.tar"
@@ -124,6 +125,10 @@ case "$SOURCE_MODE" in
       exit 2
     }
     command -v jq >/dev/null 2>&1 || { echo "error: jq is required for release records" >&2; exit 2; }
+    [ -f "$RELEASE_BOOTSTRAP_ARCHIVE" ] || {
+      echo "error: release mode requires the retained candidate bootstrap archive" >&2
+      exit 2
+    }
     git_isolated --git-dir="$TEMP/bootstrap.git" fetch --depth=1 --no-tags "$SOURCE_ORIGIN" \
       "$RELEASE_RECORD_COMMIT:refs/agent-os/release-record"
     git_isolated --git-dir="$TEMP/bootstrap.git" fetch --depth=1 --no-tags "$SOURCE_ORIGIN" \
@@ -198,13 +203,27 @@ if [ "$SOURCE_MODE" = release ]; then
     exit 2
   }
 fi
-(cd "$TEMP" && find bootstrap.git -exec touch -t 197001010000 {} + && \
-  find bootstrap.git -print | LC_ALL=C sort | COPYFILE_DISABLE=1 tar -cf "$BOOTSTRAP_ARCHIVE.tmp.$$" -T -)
+if [ "$SOURCE_MODE" = release ]; then
+  cp -- "$RELEASE_BOOTSTRAP_ARCHIVE" "$BOOTSTRAP_ARCHIVE.tmp.$$"
+else
+  (cd "$TEMP" && find bootstrap.git -exec touch -t 197001010000 {} + && \
+    find bootstrap.git -print | LC_ALL=C sort | COPYFILE_DISABLE=1 tar -cf "$BOOTSTRAP_ARCHIVE.tmp.$$" -T -)
+fi
 SOURCE_SHA=$(sha256_file "$SOURCE_ARCHIVE.tmp.$$")
 BOOTSTRAP_SHA=$(sha256_file "$BOOTSTRAP_ARCHIVE.tmp.$$")
 if [ "$SOURCE_MODE" = release ] && [ "$BOOTSTRAP_SHA" != "$(jq -r .bootstrap_archive_sha256 "$TEMP/release.json")" ]; then
-  echo "error: bootstrap archive differs from the immutable release record" >&2
+  echo "error: retained bootstrap archive differs from the immutable release record" >&2
   exit 2
+fi
+if [ "$SOURCE_MODE" = release ]; then
+  mkdir "$TEMP/retained-bootstrap"
+  tar -xf "$BOOTSTRAP_ARCHIVE.tmp.$$" -C "$TEMP/retained-bootstrap"
+  [ "$(git_isolated --git-dir="$TEMP/retained-bootstrap/bootstrap.git" rev-parse refs/heads/main)" = "$SOURCE_COMMIT" ] && \
+    [ "$(git_isolated --git-dir="$TEMP/retained-bootstrap/bootstrap.git" rev-parse "$SOURCE_COMMIT^{tree}")" = "$SOURCE_TREE" ] && \
+    [ "$(git_isolated --git-dir="$TEMP/retained-bootstrap/bootstrap.git" remote get-url origin)" = "$SOURCE_ORIGIN" ] || {
+    echo "error: retained bootstrap archive provenance is invalid" >&2
+    exit 2
+  }
 fi
 {
   printf 'mode=%s\ncommit=%s\ntree=%s\nbranch=%s\norigin=%s\nref=%s\n' \
