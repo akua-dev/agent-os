@@ -109,8 +109,10 @@ assert_grep "github.event.workflow_run.event == 'push'" "$ROOT/.github/workflows
   "image publication must reject non-push CI runs"
 assert_grep "github.event.workflow_run.head_branch == 'main'" "$ROOT/.github/workflows/agent-os-image.yml" \
   "image publication must require protected main"
+# shellcheck disable=SC2016 # Match literal GitHub expression.
 assert_grep 'ref: ${{ github.event.workflow_run.head_sha }}' "$ROOT/.github/workflows/agent-os-image.yml" \
   "publication checkout must use the exact CI-approved commit"
+# shellcheck disable=SC2016 # Match literal GitHub expression.
 assert_grep 'SOURCE_REVISION=${{ github.event.workflow_run.head_sha }}' "$ROOT/.github/workflows/agent-os-image.yml" \
   "published OCI provenance must use the exact CI-approved commit"
 assert_grep "github.event_name == 'workflow_run' && 'publish-main'" "$ROOT/.github/workflows/agent-os-image.yml" \
@@ -118,11 +120,14 @@ assert_grep "github.event_name == 'workflow_run' && 'publish-main'" "$ROOT/.gith
 assert_grep 'git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main' \
   "$ROOT/.github/workflows/agent-os-image.yml" \
   "publication must refresh protected main immediately before publishing"
+# shellcheck disable=SC2016 # Match literal shell source.
 assert_grep 'current_main=$(git rev-parse refs/remotes/origin/main)' \
   "$ROOT/.github/workflows/agent-os-image.yml" \
   "publication must resolve the current protected-main commit"
+# shellcheck disable=SC2016 # Match literal shell source.
 assert_grep 'if [ "$CI_HEAD_SHA" != "$current_main" ]; then' "$ROOT/.github/workflows/agent-os-image.yml" \
   "publication must reject an out-of-order stale CI run"
+# shellcheck disable=SC2016 # Match literal GitHub expression.
 assert_grep 'outputs: type=oci,dest=${{ runner.temp }}/agent-os-image.tar' \
   "$ROOT/.github/workflows/agent-os-image.yml" \
   "publication must stage a verified multi-architecture OCI archive"
