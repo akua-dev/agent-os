@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Render contracts for the one portable Agent OS package.
+# Source assertions intentionally use single quotes for literal variable references.
+# shellcheck disable=SC2016
 set -u
 
 # shellcheck source=tests/lib.sh

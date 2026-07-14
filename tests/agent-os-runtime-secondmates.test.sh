@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
+# The generated flock fixture intentionally preserves literal shell variables.
+# shellcheck disable=SC2016
 set -u
 
+# shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 SYNC="$ROOT/bin/agent-os-runtime-secondmates.sh"

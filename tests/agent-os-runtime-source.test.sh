@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
+# shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 MATERIALIZE="$ROOT/bin/agent-os-runtime-source.sh"

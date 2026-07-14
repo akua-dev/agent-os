@@ -105,6 +105,7 @@ trap cleanup EXIT
 trap lock_renewal_failed TERM
 
 secret_record() {
+  # shellcheck disable=SC2016 # Kubernetes JSONPath expands $key and $value.
   target_kube --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get secret "$SECRET" --ignore-not-found \
     -o 'jsonpath={.metadata.name}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}{"\t"}{range $key,$value := .data}{$key}{"\n"}{end}'
 }

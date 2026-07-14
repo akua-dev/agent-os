@@ -320,7 +320,7 @@ test_persisted_immutable_source_refuses_sanitized_self_update() {
 }
 
 test_secondmate_persisted_policy_refuses_sanitized_self_update() {
-  local w linked standalone commit sha linked_gitdir out status target
+  local w standalone commit sha linked_gitdir out status target
   w=$(new_world t14)
   add_sm "$w" linked
   standalone="$w/standalone"

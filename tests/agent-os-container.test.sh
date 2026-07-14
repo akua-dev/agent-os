@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Static reproducibility and credential-boundary tests for the Agent OS image.
+# Source assertions intentionally use single quotes for literal variable references.
+# shellcheck disable=SC2016
 set -u
 
 # shellcheck source=tests/lib.sh

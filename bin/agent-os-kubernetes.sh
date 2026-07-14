@@ -41,7 +41,6 @@ CONTROL_LOCK_VALID_UNTIL=
 REMOVE_CONTROL_ACCESS=0
 STATEFULSET_CAS_ATTEMPTED=0
 STATEFULSET_CAS_UID=
-STATEFULSET_CAS_RV=
 LOCK_DURATION_SECONDS=${AGENT_OS_LOCK_DURATION_SECONDS:-300}
 LOCK_CLOCK_SKEW_SECONDS=${AGENT_OS_LOCK_CLOCK_SKEW_SECONDS:-5}
 LOCK_ACQUIRE_SECONDS=${AGENT_OS_LOCK_ACQUIRE_SECONDS:-30}
@@ -444,7 +443,7 @@ verify_no_runtime_authority() {
 }
 
 transfer_runtime_authority() {
-  local mode=$1 from=$2 to=$3 binding kind scope json uid rv current patch verified
+  local mode=$1 from=$2 to=$3 binding kind scope_args json uid rv current patch verified
   if [ "$mode" = none ]; then
     verify_no_runtime_authority || { echo "error: rollback none-mode authority is not absent" >&2; return 3; }
     return 0
@@ -452,13 +451,13 @@ transfer_runtime_authority() {
   if [ "$mode" = namespace ]; then
     binding=agent-os-firstmate-runtime
     kind=rolebinding
-    scope=(-n "$NAMESPACE")
+    scope_args=(-n "$NAMESPACE")
     verify_runtime_role_rules || { echo "error: rollback runtime Role rules are unverifiable" >&2; return 3; }
     verify_control_role_rules || { echo "error: rollback control Role rules are unverifiable" >&2; return 3; }
   else
     binding="agent-os-firstmate-$NAMESPACE"
     kind=clusterrolebinding
-    scope=()
+    scope_args=()
   fi
   json=$(runtime_binding_json "$mode") || return 3
   if [ "$mode" = namespace ]; then
@@ -486,7 +485,7 @@ transfer_runtime_authority() {
   rv=$(printf '%s' "$json" | jq -er '.metadata.resourceVersion') || return 3
   patch=$(jq -cn --arg uid "$uid" --arg rv "$rv" --arg namespace "$NAMESPACE" --arg account "$to" \
     '{metadata:{uid:$uid,resourceVersion:$rv},subjects:[{kind:"ServiceAccount",name:$account,namespace:$namespace}]}')
-  "$KUBECTL" --context "$CONTEXT" "${scope[@]}" patch "$kind" "$binding" --type=merge -p "$patch" >/dev/null || return 3
+  "$KUBECTL" --context "$CONTEXT" "${scope_args[@]}" patch "$kind" "$binding" --type=merge -p "$patch" >/dev/null || return 3
   verified=$(runtime_binding_json "$mode") || return 3
   printf '%s' "$verified" | jq -e --arg uid "$uid" --arg namespace "$NAMESPACE" --arg account "$to" '
     .metadata.uid == $uid and .subjects == [{kind:"ServiceAccount",name:$account,namespace:$namespace}]' >/dev/null || {
@@ -719,6 +718,7 @@ verified_akua_overlay_secret() {
     return 3
   }
   if [ -n "$secret" ]; then
+    # shellcheck disable=SC2016 # Kubernetes JSONPath expands $key and $value.
     record=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" \
       --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get secret "$secret" --ignore-not-found \
       -o 'jsonpath={.metadata.name}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}{"\t"}{range $key,$value := .data}{$key}{"\n"}{end}') || return 3
@@ -1259,7 +1259,6 @@ mutate_rendered_resource() {
     [ -n "$uid" ] && [ -n "$rv" ] || { echo "error: $kind '$name' lacks CAS identity" >&2; exit 2; }
     if [ "$kind" = StatefulSet ]; then
       STATEFULSET_CAS_UID=$uid
-      STATEFULSET_CAS_RV=$rv
     fi
     if [ "$kind" = StatefulSet ] && [ "$AKUA_OVERLAY_VERIFIED" -eq 1 ]; then
       verified_akua_overlay_secret "$PRESERVED_AKUA_SECRET_RECORD" "$STATEFULSET_CAS_UID" >/dev/null || {
@@ -1296,7 +1295,6 @@ mutate_rendered_resource() {
   fi
   if [ "$kind" = StatefulSet ] && [ -z "$STATEFULSET_CAS_UID" ]; then
     STATEFULSET_CAS_UID=$(printf '%s' "$current" | cut -f4)
-    STATEFULSET_CAS_RV=$(printf '%s' "$current" | cut -f5)
   fi
 }
 
