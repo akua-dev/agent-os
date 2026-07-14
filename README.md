@@ -1,4 +1,4 @@
-<h1 align="center">firstmate</h1>
+<h1 align="center">Build autonomous companies.</h1>
 <p align="center">
   <a
     href="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue?style=flat-square"
@@ -18,7 +18,7 @@
   /></a>
 </p>
 
-<h3 align="center">Talk to one agent. Ship with a crew.</h3>
+<h3 align="center">The product factory for Agentic organizations.</h3>
 
 <p align="center">
   <img alt="firstmate - talk to one agent, ship with a crew" src="assets/banner.png" width="100%" />
@@ -26,12 +26,18 @@
 
 ## What it is
 
+**Build autonomous companies.**
+
+**The product factory for Agentic organizations.**
+
 You can run one coding agent easily.
 But the moment you want three project tasks done in parallel - fixes, investigations, plans, audits - you become a tab-juggler: babysitting sessions, copy-pasting context between repos, forgetting which terminal had the failing test.
 
-firstmate flips the model.
+firstmate (the Agent OS) flips the model.
 You talk to a single agent - the first mate - and it runs the crew for you: spawning autonomous agents in a visible session backend, giving each a clean git worktree, supervising them to completion, and handing you finished PRs, approved local merges, or standalone investigation reports.
 For larger fleets, you can opt in to persistent secondmates: domain supervisors that are still ordinary direct reports, but run from their own isolated firstmate homes.
+
+This is how small teams build and operate entire companies with agents — the product factory that lets organizations run autonomously on infrastructure they own.
 
 firstmate is not a model, not a harness, not a skill, not an MCP server, and not a CLI.
 firstmate is an agent distro for running a crew of agents.
