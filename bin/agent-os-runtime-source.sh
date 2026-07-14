@@ -32,9 +32,59 @@ marker="mode=$SOURCE_MODE
 commit=$SOURCE_COMMIT
 source_sha256=$SOURCE_SHA"
 
+validate_source_config() {
+  local root=$1 config section='' line key value token seen=''
+  config="$root/.git/config"
+  [ -f "$config" ] && [ ! -L "$config" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|'#'*|';'*) continue ;;
+      '[core]') section=core; continue ;;
+      '[remote "origin"]') section=remote.origin; continue ;;
+      "[branch \"$SOURCE_BRANCH\"]") section="branch.$SOURCE_BRANCH"; continue ;;
+      '['*) return 1 ;;
+    esac
+    case "$line" in *=*) ;; *) return 1 ;; esac
+    key=${line%%=*}
+    value=${line#*=}
+    key=$(printf '%s' "$key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    value=$(printf '%s' "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    token="$section.$key"
+    case "|$seen|" in *"|$token|"*) return 1 ;; esac
+    case "$token" in
+      core.repositoryformatversion) [ "$value" = 0 ] ;;
+      core.filemode) [ "$value" = true ] || [ "$value" = false ] ;;
+      core.bare) [ "$value" = false ] ;;
+      core.logallrefupdates) [ "$value" = true ] ;;
+      core.ignorecase) [ "$value" = true ] || [ "$value" = false ] ;;
+      core.precomposeunicode) [ "$value" = true ] || [ "$value" = false ] ;;
+      remote.origin.url) [ "$value" = "$SOURCE_ORIGIN" ] ;;
+      remote.origin.fetch)
+        [ "$value" = '+refs/heads/*:refs/remotes/origin/*' ] ||
+          [ "$value" = "+refs/heads/$SOURCE_BRANCH:refs/remotes/origin/$SOURCE_BRANCH" ]
+        ;;
+      "branch.$SOURCE_BRANCH.remote") [ "$value" = origin ] ;;
+      "branch.$SOURCE_BRANCH.merge") [ "$value" = "refs/heads/$SOURCE_BRANCH" ] ;;
+      *) return 1 ;;
+    esac || return 1
+    seen="${seen:+$seen|}$token"
+  done < "$config"
+  for token in core.repositoryformatversion core.filemode core.bare core.logallrefupdates \
+    remote.origin.url remote.origin.fetch "branch.$SOURCE_BRANCH.remote" "branch.$SOURCE_BRANCH.merge"; do
+    case "|$seen|" in *"|$token|"*) ;; *) return 1 ;; esac
+  done
+}
+
 validate_source() {
   local root=$1 actual_marker
-  [ -d "$root/.git" ] || { echo "error: immutable runtime source Git metadata is unavailable" >&2; return 1; }
+  [ -d "$root/.git" ] && [ ! -L "$root/.git" ] || {
+    echo "error: immutable runtime source Git metadata is unavailable" >&2
+    return 1
+  }
+  validate_source_config "$root" || {
+    echo "error: immutable runtime source Git configuration is invalid" >&2
+    return 1
+  }
   [ "$(trusted_git -C "$root" rev-parse HEAD)" = "$SOURCE_COMMIT" ] || return 1
   [ "$(trusted_git -C "$root" rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE" ] || return 1
   [ "$(trusted_git -C "$root" symbolic-ref --quiet --short HEAD)" = "$SOURCE_BRANCH" ] || return 1
@@ -49,7 +99,6 @@ validate_source() {
 mkdir -p "$runtime_root"
 if [ -e "$target" ]; then
   validate_source "$target" || { echo "error: immutable runtime source failed exact verification" >&2; exit 2; }
-  rmdir "$lock" 2>/dev/null || true
   printf '%s\n' "$target"
   exit 0
 fi
@@ -63,6 +112,8 @@ if ! mkdir "$lock" 2>/dev/null; then
   exit 2
 fi
 
+lock_owner="$SOURCE_COMMIT-$$-$(date +%s)-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+printf '%s\n' "$lock_owner" > "$lock/owner"
 partial="$lock/source"
 if ! trusted_git -c protocol.file.allow=always clone --no-local --branch "$SOURCE_BRANCH" "$IMAGE_SOURCE" "$partial"; then
   echo "error: immutable runtime source materialization failed" >&2
@@ -73,6 +124,11 @@ rm -rf "$partial/.git/hooks"
 printf '%s\n' "$marker" > "$partial/.git/agent-os-runtime-source"
 validate_source "$partial" || { echo "error: materialized immutable runtime source failed exact verification" >&2; exit 2; }
 mv "$partial" "$target"
-rmdir "$lock"
 validate_source "$target" || { echo "error: committed immutable runtime source failed exact verification" >&2; exit 2; }
+if [ -f "$lock/owner" ] && [ "$(cat "$lock/owner")" = "$lock_owner" ]; then
+  rm "$lock/owner"
+  rmdir "$lock"
+else
+  validate_source "$target" || { echo "error: immutable runtime source lock handoff failed" >&2; exit 2; }
+fi
 printf '%s\n' "$target"

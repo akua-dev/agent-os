@@ -194,6 +194,13 @@ find "$FM_ROOT/.git/hooks" -mindepth 1 -print -quit 2>/dev/null | grep -q . && {
   exit 2
 }
 export FM_ROOT_OVERRIDE="$FM_ROOT"
+if [ "$IMMUTABLE_SOURCE" = true ]; then
+  FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" \
+    AGENT_OS_SOURCE_COMMIT="$SOURCE_COMMIT" AGENT_OS_SOURCE_TREE="$SOURCE_TREE" \
+    AGENT_OS_SOURCE_SHA256="$SOURCE_SHA" AGENT_OS_SOURCE_BRANCH="$SOURCE_BRANCH" \
+    AGENT_OS_SOURCE_ORIGIN="$SOURCE_ORIGIN" AGENT_OS_SOURCE_MODE="$SOURCE_MODE" \
+    "$(dirname "$0")/agent-os-runtime-secondmates.sh"
+fi
 ln -sfn "$FM_ROOT/tools/agent-os/src/cli.ts" "$HOME/.local/bin/agent-os"
 
 if [ -n "${AGENT_OS_PI_AUTH_FILE:-}" ]; then

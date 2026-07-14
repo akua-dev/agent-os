@@ -51,6 +51,28 @@ A_AGAIN=$(materialize "$TMP/a.git" "$A_SHA") || fail "release A rollback selecti
 [ "$(cat "$HOME_DIR/data/captain-state")" = persistent ] || fail "persistent home state changed"
 pass "content-addressed sources support A to B to A without changing home state"
 
+FSWATCH_SENTINEL="$TMP/fsmonitor-executed"
+FSWATCH="$TMP/fsmonitor"
+printf '#!/usr/bin/env bash\ntouch %q\n' "$FSWATCH_SENTINEL" > "$FSWATCH"
+chmod +x "$FSWATCH"
+git -C "$A_ROOT" config core.fsmonitor "$FSWATCH"
+if materialize "$TMP/a.git" "$A_SHA" >/dev/null 2>&1; then
+  fail "executable persistent Git configuration was accepted"
+fi
+[ ! -e "$FSWATCH_SENTINEL" ] || fail "persistent Git configuration executed before validation"
+git -C "$A_ROOT" config --unset core.fsmonitor
+pass "persistent Git configuration is rejected before repository access"
+
+LOCK="$HOME_DIR/runtime-sources/.${B_ROOT##*/}.materializing"
+mkdir "$LOCK"
+printf 'other-owner\n' > "$LOCK/owner"
+B_AGAIN=$(materialize "$TMP/b.git" "$B_SHA") || fail "verified source handoff failed"
+[ "$B_AGAIN" = "$B_ROOT" ] || fail "verified source handoff selected the wrong source"
+[ "$(cat "$LOCK/owner")" = other-owner ] || fail "source observer removed another materializer lock"
+rm "$LOCK/owner"
+rmdir "$LOCK"
+pass "verified source observers preserve the materializer owner lock"
+
 PARTIAL_SHA=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 PARTIAL_COMMIT=$(git --git-dir="$TMP/b.git" rev-parse refs/heads/main)
 mkdir -p "$HOME_DIR/runtime-sources/.${PARTIAL_COMMIT}-${PARTIAL_SHA}.materializing"

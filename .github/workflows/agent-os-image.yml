@@ -156,7 +156,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: read
-      contents: read
+      contents: write
       packages: write
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
@@ -222,6 +222,91 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
+          claim_prefix="refs/agent-os/candidate-reservations/$GITHUB_SHA"
+          source_tree_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$GITHUB_SHA" --jq .tree.sha)
+          create_claim() {
+            claim_ref=$1
+            owner_run_id=$2
+            claim_message=$(printf 'agent-os-candidate-reservation-v1\nsource-commit=%s\nowner-run-id=%s' \
+              "$GITHUB_SHA" "$owner_run_id")
+            claim_commit=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/commits" \
+              --raw-field message="$claim_message" --raw-field tree="$source_tree_sha" \
+              --raw-field "parents[]=$GITHUB_SHA" --jq .sha)
+            if gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              --raw-field ref="$claim_ref" --raw-field sha="$claim_commit" \
+              > "$RUNNER_TEMP/candidate-claim-create.json" \
+              2> "$RUNNER_TEMP/candidate-claim-create.err"; then
+              return 0
+            fi
+            if grep -Eiq '422|Reference already exists' "$RUNNER_TEMP/candidate-claim-create.err"; then
+              return 1
+            fi
+            cat "$RUNNER_TEMP/candidate-claim-create.err" >&2
+            exit 1
+          }
+          load_claim() {
+            claim_ref=$1
+            claim_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/${claim_ref#refs/}" --jq .object.sha)
+            gh api "repos/$GITHUB_REPOSITORY/git/commits/$claim_sha" \
+              > "$RUNNER_TEMP/candidate-claim-commit.json"
+            jq -e --arg source "$GITHUB_SHA" --arg tree "$source_tree_sha" \
+              '.tree.sha == $tree and (.parents | length == 1) and .parents[0].sha == $source' \
+              "$RUNNER_TEMP/candidate-claim-commit.json" >/dev/null
+            CLAIM_OWNER=$(jq -r .message "$RUNNER_TEMP/candidate-claim-commit.json" |
+              sed -n 's/^owner-run-id=\([0-9][0-9]*\)$/\1/p')
+            [[ "$CLAIM_OWNER" =~ ^[0-9]+$ ]]
+            expected_message=$(printf 'agent-os-candidate-reservation-v1\nsource-commit=%s\nowner-run-id=%s' \
+              "$GITHUB_SHA" "$CLAIM_OWNER")
+            [ "$(jq -r .message "$RUNNER_TEMP/candidate-claim-commit.json")" = "$expected_message" ]
+          }
+          load_latest_claim() {
+            claim_ref="$claim_prefix/initial"
+            load_claim "$claim_ref"
+            depth=0
+            while [ "$depth" -lt 32 ]; do
+              next_ref="$claim_prefix/recover-$CLAIM_OWNER"
+              if gh api "repos/$GITHUB_REPOSITORY/git/ref/${next_ref#refs/}" \
+                > "$RUNNER_TEMP/candidate-next-claim.json" \
+                2> "$RUNNER_TEMP/candidate-next-claim.err"; then
+                claim_ref=$next_ref
+                load_claim "$claim_ref"
+                depth=$((depth + 1))
+                continue
+              fi
+              if grep -Eiq '404|Not Found' "$RUNNER_TEMP/candidate-next-claim.err"; then
+                return 0
+              fi
+              cat "$RUNNER_TEMP/candidate-next-claim.err" >&2
+              exit 1
+            done
+            echo "::error::candidate reservation recovery chain is invalid"
+            exit 1
+          }
+          ensure_build_owner() {
+            load_latest_claim
+            if [ "$CLAIM_OWNER" = "$GITHUB_RUN_ID" ]; then
+              return 0
+            fi
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CLAIM_OWNER" \
+              > "$RUNNER_TEMP/candidate-owner-run.json"
+            jq -e --arg sha "$GITHUB_SHA" --arg repo "$GITHUB_REPOSITORY" \
+              '.status == "completed" and .head_sha == $sha and .event == "push" and
+               .head_branch == "main" and .repository.full_name == $repo' \
+              "$RUNNER_TEMP/candidate-owner-run.json" >/dev/null || {
+              echo "::error::candidate reservation is owned by a live or foreign workflow run"
+              exit 1
+            }
+            recovery_ref="$claim_prefix/recover-$CLAIM_OWNER"
+            echo "::notice::recovering incomplete candidate reservation from run $CLAIM_OWNER"
+            create_claim "$recovery_ref" "$GITHUB_RUN_ID" || true
+            load_latest_claim
+            [ "$CLAIM_OWNER" = "$GITHUB_RUN_ID" ] || {
+              echo "::error::candidate reservation recovery was claimed by another workflow run"
+              exit 1
+            }
+          }
+          create_claim "$claim_prefix/initial" "$GITHUB_RUN_ID" || true
+          load_latest_claim
           printf '{}\n' > "$RUNNER_TEMP/candidate-reservation-config.json"
           jq -cnS \
             --arg commit '${{ steps.candidate_source.outputs.commit }}' \
@@ -240,10 +325,8 @@ jobs:
             > "$RUNNER_TEMP/candidate-reservation-manifest.json"
           reservation_digest="sha256:$(sha256sum "$RUNNER_TEMP/candidate-reservation-manifest.json" | awk '{print $1}')"
           reservation_size=$(wc -c < "$RUNNER_TEMP/candidate-reservation-manifest.json" | tr -d ' ')
-          existed=false
           if oras manifest fetch "$IMAGE@$reservation_digest" > "$RUNNER_TEMP/candidate-reservation-existing.json" 2> "$RUNNER_TEMP/candidate-reservation.err"; then
             cmp "$RUNNER_TEMP/candidate-reservation-manifest.json" "$RUNNER_TEMP/candidate-reservation-existing.json"
-            existed=true
           elif grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/candidate-reservation.err"; then
             oras manifest push --descriptor "$IMAGE@$reservation_digest" \
               "$RUNNER_TEMP/candidate-reservation-manifest.json" > "$RUNNER_TEMP/candidate-reservation-push.json"
@@ -255,16 +338,13 @@ jobs:
           oras manifest fetch "$IMAGE@$reservation_digest" > "$RUNNER_TEMP/candidate-reservation-readback.json"
           cmp "$RUNNER_TEMP/candidate-reservation-manifest.json" "$RUNNER_TEMP/candidate-reservation-readback.json"
           printf 'reservation_digest=%s\nreservation_size=%s\n' "$reservation_digest" "$reservation_size" >> "$GITHUB_OUTPUT"
-          if [ "$existed" = false ]; then
-            printf 'build=true\nbootstrap_sha256=%s\n' '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           oras discover --distribution-spec v1.1-referrers-api --artifact-type application/vnd.akua.agent-os.release-candidate.v1 \
             --format json --depth 1 "$IMAGE@$reservation_digest" > "$RUNNER_TEMP/candidate-reservation-referrers.json"
           referrer_count=$(jq -er '.referrers | length' "$RUNNER_TEMP/candidate-reservation-referrers.json")
           if [ "$referrer_count" -eq 0 ]; then
-            echo "::error::partial candidate reservation requires trusted recovery"
-            exit 1
+            ensure_build_owner
+            printf 'build=true\nbootstrap_sha256=%s\n' '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           [ "$referrer_count" -eq 1 ] || { echo "::error::candidate reservation has conflicting records"; exit 1; }
           candidate_record_digest=$(jq -er '.referrers[0].digest' "$RUNNER_TEMP/candidate-reservation-referrers.json")

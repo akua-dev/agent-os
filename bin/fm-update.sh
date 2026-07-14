@@ -48,7 +48,26 @@ fi
 [ $# -eq 0 ] || { usage; exit 1; }
 
 persisted_policy=fast-forward
-policy_file="$FM_ROOT/.git/agent-os-runtime-source"
+resolve_policy_git_dir() {
+  local root=$1 pointer
+  if [ -d "$root/.git" ] && [ ! -L "$root/.git" ]; then
+    POLICY_GIT_DIR=$(cd "$root/.git" && pwd -P)
+  elif [ -f "$root/.git" ] && [ ! -L "$root/.git" ]; then
+    [ "$(wc -l < "$root/.git" | tr -d ' ')" -eq 1 ] || return 1
+    pointer=$(sed -n 's/^gitdir: //p' "$root/.git")
+    [ -n "$pointer" ] || return 1
+    case "$pointer" in
+      /*) POLICY_GIT_DIR=$(cd "$pointer" 2>/dev/null && pwd -P) || return 1 ;;
+      *) POLICY_GIT_DIR=$(cd "$root/$(dirname "$pointer")" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$(basename "$pointer")") || return 1 ;;
+    esac
+  else
+    return 1
+  fi
+}
+
+POLICY_GIT_DIR=
+resolve_policy_git_dir "$FM_ROOT" || true
+policy_file=${POLICY_GIT_DIR:+$POLICY_GIT_DIR/agent-os-runtime-source}
 if [ -f "$policy_file" ]; then
   policy_mode=$(sed -n 's/^mode=//p' "$policy_file")
   policy_commit=$(sed -n 's/^commit=//p' "$policy_file")
@@ -58,11 +77,18 @@ if [ -f "$policy_file" ]; then
     echo "error: invalid immutable source provenance" >&2
     exit 2
   }
-  expected_root="$FM_HOME/runtime-sources/$policy_commit-$policy_source_sha"
-  [ "$(cd "$FM_ROOT" && pwd -P)" = "$(cd "$expected_root" 2>/dev/null && pwd -P)" ] || {
-    echo "error: immutable source provenance does not match FM_ROOT" >&2
-    exit 2
-  }
+  if [ "${FM_ROOT#"$FM_HOME/runtime-sources/"}" != "$FM_ROOT" ]; then
+    expected_root="$FM_HOME/runtime-sources/$policy_commit-$policy_source_sha"
+    [ "$(cd "$FM_ROOT" && pwd -P)" = "$(cd "$expected_root" 2>/dev/null && pwd -P)" ] || {
+      echo "error: immutable source provenance does not match FM_ROOT" >&2
+      exit 2
+    }
+  else
+    [ -f "$FM_ROOT/.fm-secondmate-home" ] && [ ! -L "$FM_ROOT/.fm-secondmate-home" ] || {
+      echo "error: immutable source provenance is outside a verified runtime home" >&2
+      exit 2
+    }
+  fi
   persisted_policy=immutable
 elif [ "${FM_ROOT#"$FM_HOME/runtime-sources/"}" != "$FM_ROOT" ]; then
   echo "error: immutable source provenance is unavailable" >&2

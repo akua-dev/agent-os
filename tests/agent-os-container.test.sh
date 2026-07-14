@@ -184,6 +184,10 @@ assert_grep 'runtime-sources' "$ROOT/bin/agent-os-runtime-source.sh" \
   "immutable runtime sources must remain separate from persistent home state"
 assert_grep 'agent-os-runtime-source' "$ROOT/bin/agent-os-runtime-source.sh" \
   "immutable source selections must persist their verified update policy"
+assert_present "$ROOT/bin/agent-os-runtime-secondmates.sh" \
+  "immutable runtimes must converge each secondmate to the exact selected source"
+assert_grep 'agent-os-runtime-secondmates.sh' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "immutable runtimes must select exact source for registered secondmates"
 assert_grep 'agent-os-kubernetes-control.sh' "$ROOT/bin/agent-os-kubernetes.sh" \
   "primary lifecycle paths must share the stable control-namespace lock identity"
 assert_grep 'agent-os-kubernetes-control.sh' "$ROOT/bin/agent-os-akua-auth.sh" \
@@ -251,14 +255,20 @@ assert_grep 'oras manifest push --descriptor "$IMAGE@$candidate_record_digest"' 
   "candidate records must be created only at their content-addressed digest"
 assert_grep 'application/vnd.akua.agent-os.candidate-reservation.v1' "$IMAGE_WORKFLOW" \
   "candidate builds must first reserve one content-addressed commit coordinate"
+assert_grep 'refs/agent-os/candidate-reservations/' "$IMAGE_WORKFLOW" \
+  "candidate builds must use an atomic owner-bound repository coordinator"
+assert_grep 'repos/$GITHUB_REPOSITORY/git/refs' "$IMAGE_WORKFLOW" \
+  "candidate reservation ownership must use atomic Git ref creation"
+assert_grep '.status == "completed"' "$IMAGE_WORKFLOW" \
+  "candidate recovery must require the prior owner run to be terminal"
 assert_grep 'oras discover --distribution-spec v1.1-referrers-api' "$IMAGE_WORKFLOW" \
   "candidate retries must resolve the single record attached to their reservation"
 assert_grep 'actions/artifacts?name=$artifact_name' "$IMAGE_WORKFLOW" \
   "candidate retries must authenticate recovered records through trusted workflow storage"
 assert_grep '.workflow_run.head_sha == $sha' "$IMAGE_WORKFLOW" \
   "candidate recovery must bind the trusted record to the exact protected-main commit"
-assert_grep 'partial candidate reservation requires trusted recovery' "$IMAGE_WORKFLOW" \
-  "candidate retries must fail closed on an incomplete reservation"
+assert_grep 'recovering incomplete candidate reservation' "$IMAGE_WORKFLOW" \
+  "candidate retries must recover an incomplete reservation under its trusted coordinator"
 assert_grep 'org.opencontainers.image.title":"agent-os-bootstrap.tar"' "$IMAGE_WORKFLOW" \
   "candidate records must retain the exact bootstrap artifact"
 assert_grep 'candidate record coordinate already contains different artifacts' "$IMAGE_WORKFLOW" \
@@ -378,8 +388,10 @@ assert_grep 'docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051' "$
   "release metadata action must be pinned to the reviewed full SHA"
 assert_grep 'docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8' "$ROOT/.github/workflows/agent-os-image.yml" \
   "release build action must be pinned to the reviewed full SHA"
-assert_grep '.git/agent-os-runtime-source' "$ROOT/bin/fm-update.sh" \
+assert_grep 'agent-os-runtime-source' "$ROOT/bin/fm-update.sh" \
   "self-update must derive immutable policy from selected source provenance"
+assert_grep 'resolve_policy_git_dir' "$ROOT/bin/fm-update.sh" \
+  "self-update must resolve immutable policy through linked-worktree Git pointers"
 assert_grep 'TRUSTED_SOURCE_REF=$SOURCE_COMMIT' "$ROOT/bin/agent-os-container-entrypoint.sh" \
   "candidate runtime provenance must fetch its immutable commit"
 if grep -E 'uses: (actions/checkout|docker/[^@]+|oras-project/setup-oras)@v[0-9]+' "$ROOT/.github/workflows/agent-os-image.yml" >/dev/null; then
@@ -387,5 +399,6 @@ if grep -E 'uses: (actions/checkout|docker/[^@]+|oras-project/setup-oras)@v[0-9]
 fi
 bash -n "$ROOT/bin/agent-os-container-entrypoint.sh"
 bash -n "$ROOT/bin/agent-os-runtime-source.sh"
+bash -n "$ROOT/bin/agent-os-runtime-secondmates.sh"
 bash -n "$ROOT/bin/agent-os-kubeconfig.sh"
 pass "container files pin dependencies and exclude host credentials"

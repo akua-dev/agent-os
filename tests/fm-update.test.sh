@@ -319,6 +319,36 @@ test_persisted_immutable_source_refuses_sanitized_self_update() {
   pass "T13 persisted immutable source refuses sanitized self-update"
 }
 
+test_secondmate_persisted_policy_refuses_sanitized_self_update() {
+  local w linked standalone commit sha linked_gitdir out status target
+  w=$(new_world t14)
+  add_sm "$w" linked
+  standalone="$w/standalone"
+  git clone -q "$w/main" "$standalone"
+  printf 'standalone\n' > "$standalone/.fm-secondmate-home"
+  mkdir -p "$w/linked/state" "$standalone/state"
+  touch "$w/linked/state/.last-watcher-beat" "$standalone/state/.last-watcher-beat"
+  commit=$(git -C "$w/main" rev-parse HEAD)
+  sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  linked_gitdir=$(git -C "$w/linked" rev-parse --absolute-git-dir)
+  printf 'mode=release\ncommit=%s\nsource_sha256=%s\n' "$commit" "$sha" \
+    > "$linked_gitdir/agent-os-runtime-source"
+  printf 'mode=release\ncommit=%s\nsource_sha256=%s\n' "$commit" "$sha" \
+    > "$standalone/.git/agent-os-runtime-source"
+
+  for target in "$w/linked" "$standalone"; do
+    set +e
+    out=$(env -i PATH="$PATH" HOME="$HOME" FM_ROOT_OVERRIDE="$target" FM_HOME="$target" \
+      "$UPDATE" 2>&1)
+    status=$?
+    set -e
+    [ "$status" -eq 2 ] || fail "secondmate immutable source update exited $status, expected 2"
+    assert_contains "$out" "self-update is disabled for immutable image source" \
+      "secondmate immutable provenance blocks sanitized self-update"
+  done
+  pass "T14 linked and standalone secondmates persist immutable update policy"
+}
+
 test_updates_main_and_secondmate
 test_reread_gate_is_instruction_only
 test_dirty_secondmate_skipped
@@ -329,5 +359,6 @@ test_firstmate_wrong_branch_skipped
 test_firstmate_detached_head_skipped
 test_unsafe_secondmate_home_skipped_before_git_update
 test_persisted_immutable_source_refuses_sanitized_self_update
+test_secondmate_persisted_policy_refuses_sanitized_self_update
 
 echo "# all fm-update tests passed"
