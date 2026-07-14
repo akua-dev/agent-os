@@ -71,6 +71,10 @@ assert_grep '!image/agent-os-source.tar' "$ROOT/.dockerignore" \
 for path in LICENSE THIRD_PARTY_NOTICES.md THIRD_PARTY_SOURCES.md docs/herdr-compliance.md; do
   assert_present "$ROOT/$path" "source package must preserve $path"
 done
+[ ! -e "$ROOT/tools/agent-os/skills-lock.json" ] \
+  || fail "unlicensed vendored Effect skill lock must not be published"
+[ -z "$(find "$ROOT/tools/agent-os/.agents/skills/effect-ts" -type f -print 2>/dev/null)" ] \
+  || fail "unlicensed vendored Effect skill files must not be published"
 
 [ "$(git -C "$ROOT" ls-files -s CLAUDE.md | awk '{print $1}')" = "120000" ] \
   || fail "CLAUDE.md must remain a symlink in Git"
@@ -97,6 +101,31 @@ assert_grep 'SOURCE_REVISION=${{ github.sha }}' "$ROOT/.github/workflows/agent-o
 # shellcheck disable=SC2016 # Match literal GitHub expression.
 assert_grep 'SOURCE_VERSION=${{ steps.metadata.outputs.version }}' "$ROOT/.github/workflows/agent-os-image.yml" \
   "image workflow must bind the OCI version label to metadata-action"
+assert_grep 'workflows: ["CI"]' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "image publication must run only after the full CI workflow"
+assert_grep "github.event.workflow_run.conclusion == 'success'" "$ROOT/.github/workflows/agent-os-image.yml" \
+  "image publication must require successful CI"
+assert_grep "github.event.workflow_run.event == 'push'" "$ROOT/.github/workflows/agent-os-image.yml" \
+  "image publication must reject non-push CI runs"
+assert_grep "github.event.workflow_run.head_branch == 'main'" "$ROOT/.github/workflows/agent-os-image.yml" \
+  "image publication must require protected main"
+assert_grep 'ref: ${{ github.event.workflow_run.head_sha }}' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "publication checkout must use the exact CI-approved commit"
+assert_grep 'SOURCE_REVISION=${{ github.event.workflow_run.head_sha }}' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "published OCI provenance must use the exact CI-approved commit"
+assert_no_grep 'tags: ["v*"]' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "arbitrary tag pushes must not trigger publication"
+for action in \
+  'actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10' \
+  'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02' \
+  'docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130' \
+  'docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f' \
+  'docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9' \
+  'docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051' \
+  'docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8'; do
+  assert_grep "$action" "$ROOT/.github/workflows/agent-os-image.yml" \
+    "publication actions must be pinned to reviewed full commit SHAs"
+done
 
 assert_present "$CONTEXT_TOOL" "clean tracked-file source context tool must exist"
 fixture=$(fm_test_tmproot agent-os-source-fixture)

@@ -1722,6 +1722,27 @@ TXT
   pass "fm-x-link resolves the platform by request_id so a post-cleanup link keeps the Discord budget"
 }
 
+test_link_dry_run_never_uses_relay_lookup() {
+  local home fakebin log meta out rc
+  home="$TMP_ROOT/link-dry-local-only"; mkdir -p "$home/state"
+  fakebin=$(make_fake_curl "$home")
+  log="$home/curl.log"
+  meta="$home/state/dry-local.meta"
+  printf 'window=w\nkind=ship\n' > "$meta"
+  printf 'FMX_PAIRING_TOKEN=tok-dry-link\n' > "$home/.env"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
+    FMX_DRY_RUN=1 FMX_NOW_OVERRIDE=1700000000 FAKE_CURL_LOG="$log" \
+    FAKE_REQCTX_CODE=200 FAKE_REQCTX_BODY='{"platform":"discord","reply_max_chars":1900}' \
+    "$ROOT/bin/fm-x-link.sh" dry-local req-dry-local 2>"$home/err.txt"); rc=$?
+  expect_code 0 "$rc" "dry-run link exit"
+  [ "$out" = "linked dry-local to X request req-dry-local" ] \
+    || fail "dry-run link must still record the local preview binding (got: $out)"
+  [ ! -e "$log" ] || [ ! -s "$log" ] || fail "dry-run link must never contact the relay"
+  assert_grep "x_request=req-dry-local" "$meta" "dry-run link must record the request locally"
+  assert_no_grep "x_platform=" "$meta" "dry-run must not use relay-only platform context"
+  pass "fm-x-link dry-run stays network-silent with credentials and incomplete local context"
+}
+
 # Criterion 2 loud-warning branch: when the inbox and relay cannot resolve both
 # axes, the link is still recorded but fm-x-link warns loudly and every follow-up
 # is refused.
@@ -2258,6 +2279,7 @@ test_dismiss_usage_error
 test_link_records_request_and_timestamp
 test_link_records_discord_platform_for_followups
 test_link_resolves_platform_by_request_id_after_inbox_cleanup
+test_link_dry_run_never_uses_relay_lookup
 test_link_warns_loudly_when_platform_unresolvable
 test_link_carry_count_and_ts_preserve_followup_binding
 test_link_recovery_relink_carries_discord_context_after_inbox_drain

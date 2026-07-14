@@ -15,8 +15,7 @@ Keep `.bun-version`, `packageManager`, and the matching Bun type definitions ali
 
 Use Effect for effectful workflows whose failure modes, dependencies, cleanup, concurrency, retries, or observability benefit from typed composition.
 Keep small total functions and straightforward value transformations in plain TypeScript.
-Load the scoped `effect-ts` skill installed from `Effect-TS/skills` before changing Effect code.
-Use the ignored `.repos/effect` checkout for source verification when the skill's focused guides do not answer the question.
+Use official Effect documentation and the ignored `.repos/effect` checkout for source verification before changing Effect code.
 Do not copy that checkout into the container image or commit it as a source snapshot.
 
 ## Addresses

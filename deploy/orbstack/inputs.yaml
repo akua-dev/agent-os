@@ -1,5 +1,6 @@
 # Local profile for OrbStack's image store and isolated demo cluster.
 namespace: agent-os-demo
+installationId: 51c6db40-e8f6-4667-8548-0bd4d004d4ad
 image: agent-os:dev
 imagePullPolicy: Never
 allowMutableImage: true
