@@ -258,6 +258,31 @@ jobs:
             expected_message=$(printf 'agent-os-candidate-reservation-v1\nsource-commit=%s\nowner-run-id=%s' \
               "$GITHUB_SHA" "$CLAIM_OWNER")
             [ "$(jq -r .message "$RUNNER_TEMP/candidate-claim-commit.json")" = "$expected_message" ]
+            CLAIM_SHA=$claim_sha
+          }
+          load_build_attempt() {
+            owner_run_id=$1
+            expected_claim_sha=$2
+            expected_reservation_digest=$3
+            attempt_ref="refs/agent-os/candidate-build-attempts/$GITHUB_SHA/$owner_run_id"
+            if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/${attempt_ref#refs/}" \
+              > "$RUNNER_TEMP/candidate-build-attempt-ref.json" \
+              2> "$RUNNER_TEMP/candidate-build-attempt-ref.err"; then
+              if grep -Eiq '404|Not Found' "$RUNNER_TEMP/candidate-build-attempt-ref.err"; then
+                return 1
+              fi
+              cat "$RUNNER_TEMP/candidate-build-attempt-ref.err" >&2
+              exit 1
+            fi
+            attempt_sha=$(jq -er .object.sha "$RUNNER_TEMP/candidate-build-attempt-ref.json")
+            gh api "repos/$GITHUB_REPOSITORY/git/commits/$attempt_sha" \
+              > "$RUNNER_TEMP/candidate-build-attempt-commit.json"
+            jq -e --arg source_tree "$source_tree_sha" --arg claim "$expected_claim_sha" \
+              '.tree.sha == $source_tree and (.parents | length == 1) and .parents[0].sha == $claim' \
+              "$RUNNER_TEMP/candidate-build-attempt-commit.json" >/dev/null
+            expected_attempt_message=$(printf 'agent-os-candidate-build-attempt-v1\nsource-commit=%s\nsource-tree=%s\nreservation-digest=%s\nowner-run-id=%s\nclaim-commit=%s' \
+              "$GITHUB_SHA" "$source_tree_sha" "$expected_reservation_digest" "$owner_run_id" "$expected_claim_sha")
+            [ "$(jq -r .message "$RUNNER_TEMP/candidate-build-attempt-commit.json")" = "$expected_attempt_message" ]
           }
           load_latest_claim() {
             claim_ref="$claim_prefix/initial"
@@ -366,7 +391,7 @@ jobs:
           referrer_count=$(jq -er '.referrers | length' "$RUNNER_TEMP/candidate-reservation-referrers.json")
           if [ "$referrer_count" -eq 0 ]; then
             artifact_owner=$CLAIM_OWNER
-            ensure_build_owner
+            artifact_claim_sha=$CLAIM_SHA
             artifact_name="agent-os-candidate-record-$GITHUB_SHA"
             gh api --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$artifact_name&per_page=100" \
               > "$RUNNER_TEMP/candidate-trusted-artifacts.json"
@@ -415,6 +440,7 @@ jobs:
               cp "$RUNNER_TEMP/candidate-trusted-artifact/agent-os-bootstrap.tar" image/agent-os-bootstrap.tar
               image_digest=$(jq -er .image_digest "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
               bootstrap_sha=$(jq -er .bootstrap_archive_sha256 "$RUNNER_TEMP/candidate-trusted-artifact/candidate-record.json")
+              ensure_build_owner
               printf 'build=false\nrecord_artifact=true\ncandidate_record_digest=%s\nimage_digest=%s\nbootstrap_sha256=%s\n' \
                 "$candidate_record_digest" "$image_digest" "$bootstrap_sha" >> "$GITHUB_OUTPUT"
               echo "::notice::candidate reservation recovered from durable trusted artifact"
@@ -453,12 +479,19 @@ jobs:
               archive_sha=$(jq -er .oci_archive_sha256 "$RUNNER_TEMP/candidate-build-artifact/candidate-build.json")
               [ "$(sha256sum "$RUNNER_TEMP/candidate-build-artifact/candidate-image.tar" | awk '{print $1}')" = "$archive_sha" ]
               cp "$RUNNER_TEMP/candidate-build-artifact/candidate-image.tar" "$RUNNER_TEMP/candidate-image.tar"
+              ensure_build_owner
               printf 'build=false\npublish_image=true\nrecord_artifact=false\nimage_digest=%s\nbootstrap_sha256=%s\n' \
                 "$image_digest" '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' >> "$GITHUB_OUTPUT"
               echo "::notice::candidate reservation recovered from exact build evidence"
               exit 0
             fi
-            printf 'build=true\nrecord_artifact=false\nbootstrap_sha256=%s\n' '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' >> "$GITHUB_OUTPUT"
+            if load_build_attempt "$artifact_owner" "$artifact_claim_sha" "$reservation_digest"; then
+              echo "::error::candidate build attempt has no durable exact evidence; refusing rebuild"
+              exit 1
+            fi
+            ensure_build_owner
+            printf 'build=true\nrecord_artifact=false\nbootstrap_sha256=%s\nclaim_sha=%s\nclaim_owner=%s\n' \
+              '${{ steps.candidate_source.outputs.bootstrap_sha256 }}' "$CLAIM_SHA" "$CLAIM_OWNER" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           [ "$referrer_count" -eq 1 ] || { echo "::error::candidate reservation has conflicting records"; exit 1; }
@@ -514,6 +547,42 @@ jobs:
             cat "$RUNNER_TEMP/legacy-candidate.err" >&2
             exit 1
           fi
+
+      - name: Claim owner-bound candidate build attempt
+        if: github.ref == 'refs/heads/main' && steps.candidate_reservation.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          claim_sha='${{ steps.candidate_reservation.outputs.claim_sha }}'
+          claim_owner='${{ steps.candidate_reservation.outputs.claim_owner }}'
+          reservation_digest='${{ steps.candidate_reservation.outputs.reservation_digest }}'
+          [[ "$claim_sha" =~ ^[0-9a-f]{40}$ ]]
+          [ "$claim_owner" = "$GITHUB_RUN_ID" ]
+          [[ "$reservation_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          source_tree_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$GITHUB_SHA" --jq .tree.sha)
+          [ "$source_tree_sha" = '${{ steps.candidate_source.outputs.tree }}' ]
+          attempt_ref="refs/agent-os/candidate-build-attempts/$GITHUB_SHA/$GITHUB_RUN_ID"
+          attempt_message=$(printf 'agent-os-candidate-build-attempt-v1\nsource-commit=%s\nsource-tree=%s\nreservation-digest=%s\nowner-run-id=%s\nclaim-commit=%s' \
+            "$GITHUB_SHA" "$source_tree_sha" "$reservation_digest" "$GITHUB_RUN_ID" "$claim_sha")
+          attempt_commit=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/commits" \
+            --raw-field message="$attempt_message" --raw-field tree="$source_tree_sha" \
+            --raw-field "parents[]=$claim_sha" --jq .sha)
+          if ! gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            --raw-field ref="$attempt_ref" --raw-field sha="$attempt_commit" \
+            > "$RUNNER_TEMP/candidate-build-attempt-create.json" \
+            2> "$RUNNER_TEMP/candidate-build-attempt-create.err"; then
+            cat "$RUNNER_TEMP/candidate-build-attempt-create.err" >&2
+            echo "::error::candidate build attempt already exists or could not be reserved; refusing rebuild"
+            exit 1
+          fi
+          readback_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/${attempt_ref#refs/}" --jq .object.sha)
+          [ "$readback_sha" = "$attempt_commit" ]
+          gh api "repos/$GITHUB_REPOSITORY/git/commits/$readback_sha" \
+            > "$RUNNER_TEMP/candidate-build-attempt-readback.json"
+          jq -e --arg tree "$source_tree_sha" --arg claim "$claim_sha" --arg message "$attempt_message" \
+            '.tree.sha == $tree and (.parents | length == 1) and .parents[0].sha == $claim and .message == $message' \
+            "$RUNNER_TEMP/candidate-build-attempt-readback.json" >/dev/null
 
       - name: Build release candidate once
         if: github.ref == 'refs/heads/main' && steps.candidate_reservation.outputs.build == 'true'
