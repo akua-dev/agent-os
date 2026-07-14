@@ -9,6 +9,27 @@ CLI="$ROOT/bin/agent-os-local.sh"
 TMP=$(fm_test_tmproot agent-os-local)
 FAKEBIN=$(fm_fakebin "$TMP")
 LOG="$TMP/calls.log"
+BUILD_ROOT="$TMP/source"
+
+test_git() {
+  env -i HOME=/nonexistent PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+    /usr/bin/git -c credential.helper= -c core.hooksPath=/dev/null \
+    -c http.proxy= -c https.proxy= "$@"
+}
+
+SOURCE_COMMIT=$(test_git -C "$ROOT" rev-parse --verify HEAD)
+SOURCE_TREE=$(test_git -C "$ROOT" rev-parse --verify 'HEAD^{tree}')
+test_git clone --no-hardlinks --no-checkout "$ROOT" "$BUILD_ROOT" >/dev/null || \
+  fail "local build fixture must clone the exact source checkout"
+test_git -C "$BUILD_ROOT" checkout --detach "$SOURCE_COMMIT" >/dev/null || \
+  fail "local build fixture must bind the exact source commit"
+while IFS= read -r key; do
+  test_git -C "$BUILD_ROOT" config --local --unset-all "$key"
+done < <(test_git -C "$BUILD_ROOT" config --local --name-only --get-regexp '^branch\.' || true)
+test_git -C "$BUILD_ROOT" remote set-url origin https://github.com/akua-dev/agent-os.git
+[ -z "$(test_git -C "$BUILD_ROOT" status --porcelain --untracked-files=all)" ] || \
+  fail "local build fixture must use a clean isolated checkout"
 
 make_fake() {
   local name=$1
@@ -22,24 +43,6 @@ SH
 }
 
 make_fake docker
-cat > "$FAKEBIN/git" <<'SH'
-#!/usr/bin/env bash
-case " $* " in
-  *" remote get-url origin "*) printf 'https://github.com/akua-dev/agent-os.git\n' ;;
-  *" status --porcelain --untracked-files=all "*) ;;
-  *" init --bare "*) destination=${!#}; mkdir -p "$destination"; printf 'shallow\n' > "$destination/shallow" ;;
-  *" fetch --depth=1 --no-tags "*) ;;
-  *" rev-parse --verify "*"^{tree}"*) printf '2222222222222222222222222222222222222222\n' ;;
-  *" rev-parse --verify "*) printf '1111111111111111111111111111111111111111\n' ;;
-  *" archive --format=tar --output="*)
-    for arg in "$@"; do
-      case "$arg" in --output=*) : > "${arg#--output=}" ;; esac
-    done
-    ;;
-  *) ;;
-esac
-SH
-chmod +x "$FAKEBIN/git"
 cat > "$FAKEBIN/docker" <<'SH'
 #!/usr/bin/env bash
 printf '%s' "$(basename "$0")" >> "$AGENT_OS_TEST_LOG"
@@ -105,6 +108,9 @@ if [[ " $* " = *" get statefulset agent-os-firstmate -o json "* ]] && [ "$statef
   printf '{"metadata":{"name":"agent-os-firstmate","uid":"uid-statefulset","resourceVersion":"rv-statefulset","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:%s"}},"spec":{"template":{"spec":{"serviceAccountName":"agent-os-firstmate","containers":[{"name":"firstmate","env":[],"volumeMounts":[]}],"volumes":[]}}},"status":{"currentRevision":"revision-current","updateRevision":"revision-current"}}\n' "$namespace"
 fi
 if [[ " $* " = *" get controllerrevisions.apps -o json "* ]]; then
+  printf '%s\n' '{"items":[]}'
+fi
+if [[ " $* " = *" get serviceaccounts -o json "* ]]; then
   printf '%s\n' '{"items":[]}'
 fi
 if [[ " $* " = *" get ServiceAccount agent-os-firstmate --ignore-not-found -o jsonpath="* ]] && [ "$stateful_present" -eq 1 ]; then
@@ -204,6 +210,13 @@ run_cli() {
     AGENT_OS_TEST_IMAGE_ID="${AGENT_OS_TEST_IMAGE_ID:-sha256:default}" "$CLI" "$@"
 }
 
+run_build_cli() {
+  PATH="$FAKEBIN:$PATH" AGENT_OS_TEST_LOG="$LOG" \
+    AGENT_OS_TEST_IMAGE_ID="${AGENT_OS_TEST_IMAGE_ID:-sha256:default}" \
+    AGENT_OS_SOURCE_MODE=event GITHUB_EVENT_NAME=pull_request \
+    AGENT_OS_SOURCE_EVENT_COMMIT="$SOURCE_COMMIT" "$BUILD_ROOT/bin/agent-os-local.sh" build
+}
+
 assert_call() {
   grep -Fqx -- "$1" "$LOG" || fail "$2 (missing exact call: $1)"
 }
@@ -236,13 +249,16 @@ test_deploy_starts_local_kubernetes_and_renders_the_orbstack_profile() {
 
 test_rebuild_deploy_uses_a_new_immutable_local_tag() {
   : > "$LOG"
-  AGENT_OS_TEST_IMAGE_ID=sha256:stale run_cli build
-  AGENT_OS_TEST_IMAGE_ID=sha256:rebuilt run_cli build
+  AGENT_OS_TEST_IMAGE_ID=sha256:stale run_build_cli
+  AGENT_OS_TEST_IMAGE_ID=sha256:rebuilt run_build_cli
   AGENT_OS_TEST_IMAGE_ID=sha256:rebuilt run_cli deploy
 
-  grep -F 'docker build ' "$LOG" | grep -F -- '--build-arg AGENT_OS_SOURCE_COMMIT=' | \
-    grep -F -- '--build-arg AGENT_OS_SOURCE_TREE=' | grep -F -- '--build-arg AGENT_OS_SOURCE_BRANCH=main' | \
-    grep -F -- '--build-arg AGENT_OS_SOURCE_MODE=main' | grep -F -- '--build-arg AGENT_OS_SOURCE_REF=refs/heads/main' | \
+  grep -F 'docker build ' "$LOG" | grep -F -- "--build-arg AGENT_OS_SOURCE_COMMIT=$SOURCE_COMMIT" | \
+    grep -F -- "--build-arg AGENT_OS_SOURCE_TREE=$SOURCE_TREE" | \
+    grep -F -- '--build-arg AGENT_OS_SOURCE_BRANCH=main' | \
+    grep -F -- '--build-arg AGENT_OS_SOURCE_ORIGIN=https://github.com/akua-dev/agent-os.git' | \
+    grep -F -- '--build-arg AGENT_OS_SOURCE_MODE=event' | \
+    grep -F -- "--build-arg AGENT_OS_SOURCE_REF=event:$SOURCE_COMMIT" | \
     grep -F -- '-t agent-os:dev .' >/dev/null || \
     fail "build must pass verified exact-source arguments"
   assert_call 'docker tag agent-os:dev agent-os:local-rebuilt' \
@@ -276,7 +292,7 @@ test_namespace_override_updates_the_rendered_profile() {
 
 test_explicit_image_override_is_used_without_retagging() {
   : > "$LOG"
-  AGENT_OS_IMAGE=example.test/agent-os:custom run_cli build
+  AGENT_OS_IMAGE=example.test/agent-os:custom run_build_cli
   AGENT_OS_IMAGE=example.test/agent-os:custom run_cli deploy
 
   grep -F 'docker build ' "$LOG" | grep -F -- '-t example.test/agent-os:custom .' >/dev/null || \
@@ -291,7 +307,7 @@ test_explicit_image_override_is_used_without_retagging() {
 
 test_empty_image_override_uses_content_addressed_default() {
   : > "$LOG"
-  AGENT_OS_IMAGE='' AGENT_OS_TEST_IMAGE_ID=sha256:empty-default run_cli build
+  AGENT_OS_IMAGE='' AGENT_OS_TEST_IMAGE_ID=sha256:empty-default run_build_cli
   AGENT_OS_IMAGE='' AGENT_OS_TEST_IMAGE_ID=sha256:empty-default run_cli deploy
 
   grep -F 'docker build ' "$LOG" | grep -F -- '-t agent-os:dev .' >/dev/null || \
