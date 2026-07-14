@@ -11,9 +11,10 @@ INSTALLATION_ID="agent-os-firstmate:$NAMESPACE"
 OPERATION_ID=${AGENT_OS_OPERATION_ID:-"$(date -u '+%Y%m%d%H%M%S')-$$-$RANDOM"}
 LOCK_NONCE=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
 LOCK_HOLDER_ID="$OPERATION_ID.$LOCK_NONCE"
-LOCK=agent-os-firstmate-lifecycle
-LOCK_NAMESPACE=$NAMESPACE
-EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"primary"$'\t'"$INSTALLATION_ID"
+LOCK=
+LOCK_NAMESPACE=
+LOCK_INSTALLATION_ID=
+EXPECTED_LOCK=
 LOCK_UID=
 LOCK_RV=
 LOCK_RENEW_PID=
@@ -32,6 +33,10 @@ case "$NAMESPACE" in ''|*[!a-z0-9-]*|-*|*-) echo "error: invalid Kubernetes name
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
 
 kube() {
+  "$KUBECTL" --context "$CONTEXT" -n "$LOCK_NAMESPACE" "$@"
+}
+
+target_kube() {
   "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" "$@"
 }
 
@@ -51,14 +56,14 @@ apiVersion: coordination.k8s.io/v1
 kind: Lease
 metadata:
   name: $LOCK
-  namespace: $NAMESPACE
+  namespace: $LOCK_NAMESPACE
 ${uid:+  uid: $uid_value}
 ${rv:+  resourceVersion: $rv_value}
   labels:
     app.kubernetes.io/managed-by: agent-os
     agent-os.dev/lifecycle: primary
   annotations:
-    agent-os.dev/installation-id: $INSTALLATION_ID
+    agent-os.dev/installation-id: $LOCK_INSTALLATION_ID
 spec:
   holderIdentity: $LOCK_HOLDER_ID
   acquireTime: $acquired_at
@@ -67,6 +72,7 @@ spec:
 YAML
 }
 
+. "$ROOT/bin/agent-os-kubernetes-control.sh"
 . "$ROOT/bin/agent-os-kubernetes-lease.sh"
 
 cleanup() {
@@ -82,12 +88,26 @@ trap cleanup EXIT
 trap lock_renewal_failed TERM
 
 secret_record() {
-  kube --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get secret "$SECRET" --ignore-not-found \
+  target_kube --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get secret "$SECRET" --ignore-not-found \
     -o 'jsonpath={.metadata.name}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}{"\t"}{range $key,$value := .data}{$key}{"\n"}{end}'
 }
 
 statefulset_json() {
-  kube --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get statefulset agent-os-firstmate -o json
+  target_kube --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get statefulset agent-os-firstmate -o json
+}
+
+require_no_active_rollback_checkpoint() {
+  local checkpoint
+  checkpoint=$(printf '%s' "$STATE" | jq -er '
+    [(.metadata.annotations["agent-os.dev/rollback-operation"] // ""),
+     (.metadata.annotations["agent-os.dev/rollback-target-name"] // ""),
+     (.metadata.annotations["agent-os.dev/rollback-target-uid"] // ""),
+     (.metadata.annotations["agent-os.dev/rollback-target-digest"] // "")]
+    | @tsv') || { echo "error: StatefulSet rollback checkpoint state is unverifiable" >&2; exit 3; }
+  [ -z "${checkpoint//$'\t'/}" ] || {
+    echo "error: active rollback checkpoint blocks authorization mutation" >&2
+    exit 3
+  }
 }
 
 verify_overlay() {
@@ -110,8 +130,12 @@ verify_overlay() {
         ([.spec.template.spec.volumes[]? | select(.name == "akua-auth")] | length) == 0
       end)' >/dev/null || { echo "error: Akua authorization overlay verification failed" >&2; exit 3; }
   secret_record_after=$(secret_record)
-  [ "$secret_record_after" = "$SECRET_RECORD" ] || { echo "error: Akua authorization Secret reference changed during mutation" >&2; exit 3; }
-  pod=$(kube --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get pod agent-os-firstmate-0 -o json)
+  [ "$secret_record_after" = "$SECRET_RECORD" ] || {
+    echo "incomplete: Akua authorization Secret identity changed after rollout" >&2
+    echo "safe recovery: rerun '$COMMAND' only after the exact Secret reference is stable" >&2
+    exit 3
+  }
+  pod=$(target_kube --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get pod agent-os-firstmate-0 -o json)
   printf '%s' "$pod" | jq -e --arg uid "$state_uid" --arg secret "$SECRET" --arg expected "$expected" '
     any(.metadata.ownerReferences[]?; .apiVersion == "apps/v1" and .kind == "StatefulSet" and .name == "agent-os-firstmate" and .uid == $uid and .controller == true) and
     (if $expected == "present" then
@@ -125,6 +149,13 @@ verify_overlay() {
     end)' >/dev/null || { echo "error: Firstmate Pod authorization overlay verification failed" >&2; exit 3; }
 }
 
+configure_control_lock
+LOCK=$CONTROL_LOCK
+LOCK_NAMESPACE=$CONTROL_NAMESPACE
+LOCK_INSTALLATION_ID=$CONTROL_LOCK_INSTALLATION_ID
+EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"primary"$'\t'"$LOCK_INSTALLATION_ID"
+acquire_lock
+
 SECRET_RECORD=$(secret_record)
 [ "$(printf '%s' "$SECRET_RECORD" | cut -f1)" = "$SECRET" ] && \
   [ -n "$(printf '%s' "$SECRET_RECORD" | cut -f2)" ] && [ -n "$(printf '%s' "$SECRET_RECORD" | cut -f3)" ] && \
@@ -133,7 +164,6 @@ SECRET_RECORD=$(secret_record)
   exit 2
 }
 
-acquire_lock
 STATE=$(statefulset_json)
 STATE_UID=$(printf '%s' "$STATE" | jq -er --arg installation "$INSTALLATION_ID" '
   select(.metadata.name == "agent-os-firstmate")
@@ -141,6 +171,7 @@ STATE_UID=$(printf '%s' "$STATE" | jq -er --arg installation "$INSTALLATION_ID" 
   | select(.metadata.annotations["agent-os.dev/installation-id"] == $installation)
   | .metadata.uid') || { echo "error: StatefulSet ownership is unverifiable" >&2; exit 2; }
 STATE_RV=$(printf '%s' "$STATE" | jq -er '.metadata.resourceVersion') || { echo "error: StatefulSet resourceVersion is unavailable" >&2; exit 2; }
+require_no_active_rollback_checkpoint
 
 PATCH_FILE=$(mktemp)
 TEMPLATE="$ROOT/deploy/akua/firstmate-auth-$COMMAND.yaml"
@@ -150,8 +181,12 @@ sed "s/__AKUA_AUTH_SECRET__/$SECRET/g" "$TEMPLATE" | awk -v uid="$uid_value" -v 
   $1 == "metadata:" && !inserted { print; print "  uid: " uid; print "  resourceVersion: " rv; inserted=1; next }
   { print }
 ' > "$PATCH_FILE"
-kube patch statefulset agent-os-firstmate --type=strategic --patch-file "$PATCH_FILE" >/dev/null
-kube rollout status statefulset/agent-os-firstmate --timeout=180s
+[ "$(secret_record)" = "$SECRET_RECORD" ] || {
+  echo "error: Akua authorization Secret identity changed before StatefulSet CAS" >&2
+  exit 3
+}
+target_kube patch statefulset agent-os-firstmate --type=strategic --patch-file "$PATCH_FILE" >/dev/null
+target_kube rollout status statefulset/agent-os-firstmate --timeout=180s
 if [ "$COMMAND" = grant ]; then
   verify_overlay present "$STATE_UID"
 else

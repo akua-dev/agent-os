@@ -5,10 +5,14 @@ set -eu
 FM_HOME=${FM_HOME:-/home/agent}
 export FM_HOME HOME="$FM_HOME"
 FM_ROOT=${FM_ROOT_OVERRIDE:-$FM_HOME/firstmate}
-IMAGE_SOURCE=${AGENT_OS_IMAGE_SOURCE:-/opt/agent-os-bootstrap}
+IMAGE_SOURCE=${AGENT_OS_IMAGE_SOURCE:-/opt/agent-os-bootstrap.git}
 SOURCE_COMMIT=$(cat /opt/agent-os-source.commit)
 SOURCE_TREE=$(cat /opt/agent-os-source.tree)
+SOURCE_BRANCH=$(cat /opt/agent-os-source.branch)
 SOURCE_ORIGIN=$(cat /opt/agent-os-source.origin)
+case "$SOURCE_BRANCH" in ''|*[!A-Za-z0-9._/-]*|/*|*/|*..*) echo "error: image source branch provenance is invalid" >&2; exit 2 ;; esac
+TRUSTED_REF="refs/remotes/origin/$SOURCE_BRANCH"
+IMAGE_REF="refs/remotes/agent-os-image/$SOURCE_BRANCH"
 
 mkdir -p \
   "$FM_HOME/config" \
@@ -24,8 +28,11 @@ mkdir -p \
 
 if [ ! -e "$FM_ROOT/.git" ]; then
   [ ! -e "$FM_ROOT" ] || { echo "error: canonical FM_ROOT exists without Git provenance" >&2; exit 2; }
-  git clone --no-local "$IMAGE_SOURCE" "$FM_ROOT"
-  git -C "$FM_ROOT" checkout --detach "$SOURCE_COMMIT"
+  git clone --no-local --branch "$SOURCE_BRANCH" "$IMAGE_SOURCE" "$FM_ROOT"
+  [ "$(git -C "$FM_ROOT" rev-parse HEAD)" = "$SOURCE_COMMIT" ] || {
+    echo "error: canonical FM_ROOT bootstrap commit provenance failed" >&2
+    exit 2
+  }
   git -C "$FM_ROOT" remote set-url origin "$SOURCE_ORIGIN"
   rm -rf "$FM_ROOT/.git/hooks"
 else
@@ -35,15 +42,54 @@ else
     exit 2
   }
   [ -z "$(git -C "$FM_ROOT" status --porcelain)" ] || { echo "error: canonical FM_ROOT is not clean" >&2; exit 2; }
-  if git -C "$FM_ROOT" merge-base --is-ancestor HEAD "$SOURCE_COMMIT"; then
-    git -C "$FM_ROOT" fetch --no-tags "$IMAGE_SOURCE" "$SOURCE_COMMIT"
-    git -C "$FM_ROOT" merge --ff-only "$SOURCE_COMMIT"
+  git -C "$FM_ROOT" fetch --no-tags "$IMAGE_SOURCE" \
+    "refs/heads/$SOURCE_BRANCH:$IMAGE_REF"
+  [ "$(git -C "$FM_ROOT" rev-parse "$IMAGE_REF")" = "$SOURCE_COMMIT" ] || {
+    echo "error: image source trusted ref provenance failed" >&2
+    exit 2
+  }
+  [ "$(git -C "$FM_ROOT" rev-parse "$IMAGE_REF^{tree}")" = "$SOURCE_TREE" ] || {
+    echo "error: image source trusted tree provenance failed" >&2
+    exit 2
+  }
+  current_branch=$(git -C "$FM_ROOT" symbolic-ref --quiet --short HEAD || true)
+  if [ -z "$current_branch" ]; then
+    git -C "$FM_ROOT" merge-base --is-ancestor HEAD "$IMAGE_REF" || {
+      echo "error: detached canonical FM_ROOT lacks trusted fast-forward provenance" >&2
+      exit 2
+    }
+    if git -C "$FM_ROOT" show-ref --verify --quiet "refs/heads/$SOURCE_BRANCH"; then
+      [ "$(git -C "$FM_ROOT" rev-parse "refs/heads/$SOURCE_BRANCH")" = "$(git -C "$FM_ROOT" rev-parse HEAD)" ] || {
+        echo "error: canonical default branch conflicts with detached provenance" >&2
+        exit 2
+      }
+    else
+      git -C "$FM_ROOT" branch "$SOURCE_BRANCH" HEAD
+    fi
+    git -C "$FM_ROOT" checkout "$SOURCE_BRANCH"
+  fi
+  [ "$(git -C "$FM_ROOT" symbolic-ref --short HEAD)" = "$SOURCE_BRANCH" ] || {
+    echo "error: canonical FM_ROOT is not on the declared default branch" >&2
+    exit 2
+  }
+  if git -C "$FM_ROOT" merge-base --is-ancestor HEAD "$IMAGE_REF"; then
+    git -C "$FM_ROOT" merge --ff-only "$IMAGE_REF"
+    git -C "$FM_ROOT" update-ref "$TRUSTED_REF" "$SOURCE_COMMIT"
   elif ! git -C "$FM_ROOT" merge-base --is-ancestor "$SOURCE_COMMIT" HEAD; then
     echo "error: canonical FM_ROOT source transition is not fast-forward compatible" >&2
     exit 2
   fi
+  git -C "$FM_ROOT" update-ref -d "$IMAGE_REF"
 fi
 
+[ "$(git -C "$FM_ROOT" symbolic-ref --short HEAD)" = "$SOURCE_BRANCH" ] || {
+  echo "error: canonical FM_ROOT is not on the declared default branch" >&2
+  exit 2
+}
+[ "$(git -C "$FM_ROOT" rev-parse HEAD)" = "$(git -C "$FM_ROOT" rev-parse "$TRUSTED_REF")" ] || {
+  echo "error: canonical FM_ROOT HEAD is not the exact trusted remote ref" >&2
+  exit 2
+}
 [ "$(git -C "$FM_ROOT" rev-parse "$SOURCE_COMMIT^{tree}")" = "$SOURCE_TREE" ] || {
   echo "error: canonical FM_ROOT image source tree provenance failed" >&2
   exit 2

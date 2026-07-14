@@ -12,15 +12,13 @@ IMAGE=${AGENT_OS_IMAGE:-}
 IMAGE_PULL_POLICY=${AGENT_OS_IMAGE_PULL_POLICY:-IfNotPresent}
 AI_SECRET=${AGENT_OS_AI_SECRET:-}
 KUBECTL=${AGENT_OS_KUBECTL:-kubectl}
-TEMPLATE=${AGENT_OS_CREWMATE_TEMPLATE:-/opt/agent-os/tools/agent-os/packages/firstmate/crewmate.yaml}
+TEMPLATE=${AGENT_OS_CREWMATE_TEMPLATE:-"$ROOT/tools/agent-os/packages/firstmate/crewmate.yaml"}
 INSTALLATION_ID="agent-os-firstmate:$NAMESPACE"
 OPERATION_ID=${AGENT_OS_OPERATION_ID:-"$(date -u '+%Y%m%d%H%M%S')-$$-$RANDOM"}
 LOCK_NONCE=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
 LOCK_HOLDER_ID="$OPERATION_ID.$LOCK_NONCE"
 
-if [ ! -f "$TEMPLATE" ]; then
-  TEMPLATE="$ROOT/tools/agent-os/packages/firstmate/crewmate.yaml"
-fi
+[ -f "$TEMPLATE" ] || { echo "error: crewmate template is unavailable in canonical source" >&2; exit 2; }
 
 case "$ID" in
   ''|*[!a-z0-9-]*|-*|*-) echo "error: invalid crewmate id '$ID'" >&2; exit 2 ;;

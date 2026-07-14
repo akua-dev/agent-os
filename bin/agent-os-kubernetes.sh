@@ -20,6 +20,9 @@ DELETE_NAMESPACE=0
 MANAGES_NAMESPACE=0
 DESIRED_RBAC=none
 INSTALLATION_ID=
+LEGACY_CLUSTER_BINDING_PRESENT=0
+PRESERVED_AKUA_SECRET_RECORD=
+AKUA_OVERLAY_VERIFIED=0
 OPERATION_ID=${AGENT_OS_OPERATION_ID:-"$(date -u '+%Y%m%d%H%M%S')-$$-$RANDOM"}
 LOCK_NONCE=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
 LOCK_HOLDER_ID="$OPERATION_ID.$LOCK_NONCE"
@@ -30,6 +33,10 @@ EXPECTED_LOCK=
 LOCK_UID=
 LOCK_RV=
 LOCK_RENEW_PID=
+CONTROL_LOCK_UID=
+CONTROL_LOCK_RV=
+CONTROL_LOCK_RENEW_PID=
+CONTROL_LOCK_VALID_UNTIL=
 LOCK_DURATION_SECONDS=${AGENT_OS_LOCK_DURATION_SECONDS:-300}
 LOCK_CLOCK_SKEW_SECONDS=${AGENT_OS_LOCK_CLOCK_SKEW_SECONDS:-5}
 LOCK_ACQUIRE_SECONDS=${AGENT_OS_LOCK_ACQUIRE_SECONDS:-30}
@@ -44,12 +51,13 @@ done
 [ "$LOCK_REQUEST_CEILING_SECONDS" -ge 1 ] || { echo "error: lifecycle Lease request ceiling must be at least 1 second" >&2; exit 2; }
 [ "$RESOURCE_REQUEST_CEILING_SECONDS" -ge 1 ] || { echo "error: resource request ceiling must be at least 1 second" >&2; exit 2; }
 
+. "$ROOT/bin/agent-os-kubernetes-control.sh"
 . "$ROOT/bin/agent-os-kubernetes-lease.sh"
 
 cleanup() {
   local status=$?
   trap - EXIT
-  if ! release_lock && [ "$status" -eq 0 ]; then
+  if ! release_primary_locks && [ "$status" -eq 0 ]; then
     status=3
   fi
   rm -rf "$OUT" "$RENDER_INPUTS"
@@ -197,7 +205,7 @@ ${rv:+  resourceVersion: $rv_value}
     app.kubernetes.io/managed-by: agent-os
     agent-os.dev/lifecycle: primary
   annotations:
-    agent-os.dev/installation-id: $INSTALLATION_ID
+    agent-os.dev/installation-id: ${LOCK_INSTALLATION_ID:-$INSTALLATION_ID}
 spec:
   holderIdentity: $LOCK_HOLDER_ID
   acquireTime: $acquired_at
@@ -207,20 +215,51 @@ YAML
 }
 
 acquire_primary_lock() {
-  if [ -n "$(namespace_name)" ]; then
-    LOCK_NAMESPACE=$NAMESPACE
-    LOCK=agent-os-firstmate-lifecycle
-  elif [ "$COMMAND" = cleanup-cluster-rbac ]; then
-    LOCK_NAMESPACE=${AGENT_OS_CLUSTER_LOCK_NAMESPACE:-kube-system}
-    LOCK="agent-os-firstmate-lifecycle-$(sha256_text "$NAMESPACE" | cut -c1-16)"
-  elif [ "$COMMAND" = uninstall ]; then
-    return 0
-  else
-    echo "error: namespace '$NAMESPACE' is absent after namespace preparation" >&2
-    exit 2
-  fi
-  EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"primary"$'\t'"$INSTALLATION_ID"
+  configure_control_lock
+  LOCK_NAMESPACE=$CONTROL_NAMESPACE
+  LOCK=$CONTROL_LOCK
+  LOCK_INSTALLATION_ID=$CONTROL_LOCK_INSTALLATION_ID
+  EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"primary"$'\t'"$LOCK_INSTALLATION_ID"
   acquire_lock
+  CONTROL_LOCK_UID=$LOCK_UID
+  CONTROL_LOCK_RV=$LOCK_RV
+  CONTROL_LOCK_RENEW_PID=$LOCK_RENEW_PID
+  CONTROL_LOCK_VALID_UNTIL=$LOCK_VALID_UNTIL
+  if [ -n "$(namespace_name)" ]; then
+    acquire_namespace_lock
+  fi
+}
+
+acquire_namespace_lock() {
+  [ -z "${NAMESPACE_LOCK_UID:-}" ] || return 0
+  LOCK_NAMESPACE=$NAMESPACE
+  LOCK=agent-os-firstmate-lifecycle
+  LOCK_INSTALLATION_ID=$INSTALLATION_ID
+  EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"primary"$'\t'"$INSTALLATION_ID"
+  LOCK_UID=
+  LOCK_RV=
+  LOCK_RENEW_PID=
+  LOCK_VALID_UNTIL=
+  acquire_lock
+  NAMESPACE_LOCK_UID=$LOCK_UID
+}
+
+release_primary_locks() {
+  local status=0
+  release_lock || status=$?
+  if [ -n "$CONTROL_LOCK_UID" ]; then
+    LOCK_NAMESPACE=$CONTROL_NAMESPACE
+    LOCK=$CONTROL_LOCK
+    LOCK_INSTALLATION_ID=$CONTROL_LOCK_INSTALLATION_ID
+    EXPECTED_LOCK="$LOCK"$'\t'"agent-os"$'\t'"primary"$'\t'"$LOCK_INSTALLATION_ID"
+    LOCK_UID=$CONTROL_LOCK_UID
+    LOCK_RV=$CONTROL_LOCK_RV
+    LOCK_RENEW_PID=$CONTROL_LOCK_RENEW_PID
+    LOCK_VALID_UNTIL=$CONTROL_LOCK_VALID_UNTIL
+    release_lock || status=$?
+    CONTROL_LOCK_UID=
+  fi
+  return "$status"
 }
 
 require_namespace_contract() {
@@ -299,10 +338,26 @@ preflight_legacy_cluster_binding() {
     echo "error: ClusterRoleBinding '$binding' does not have the exact Agent OS installation identity" >&2
     exit 2
   fi
+  [ -z "$identity" ] || LEGACY_CLUSTER_BINDING_PRESENT=1
   if [ -n "$identity" ] && [ "$allow_owned" -ne 1 ] && [ "$DESIRED_RBAC" != cluster-admin ]; then
     echo "error: stale ClusterRoleBinding '$binding' must be removed through separately authorized cleanup before installation" >&2
     exit 3
   fi
+}
+
+verify_revision_service_account() {
+  local revision=$1 account identity expected
+  account=$(printf '%s' "$revision" | jq -er '.data.spec.template.spec.serviceAccountName') || {
+    echo "error: rollback target ServiceAccount dependency is unavailable" >&2
+    exit 3
+  }
+  case "$account" in agent-os-firstmate|agent-os-firstmate-[a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9]) ;; *) echo "error: rollback target ServiceAccount dependency is invalid" >&2; exit 3 ;; esac
+  identity=$(live_resource_identity ServiceAccount "$account")
+  expected="$account"$'\t'"agent-os"$'\t'"$INSTALLATION_ID"
+  [ "$identity" = "$expected" ] || {
+    echo "error: rollback target ServiceAccount dependency is missing or changed" >&2
+    exit 3
+  }
 }
 
 require_no_active_rollback_checkpoint() {
@@ -598,8 +653,8 @@ resource_observation() {
 
 lifecycle_command() {
   local action=${1:-$COMMAND}
-  printf 'AGENT_OS_CONTEXT=%q AGENT_OS_NAMESPACE=%q AGENT_OS_PACKAGE=%q AGENT_OS_INPUTS=%q AGENT_OS_AKUA=%q AGENT_OS_KUBECTL=%q %q %q' \
-    "$CONTEXT" "$NAMESPACE" "$PACKAGE" "$INPUTS" "$AKUA" "$KUBECTL" "$0" "$action"
+  printf 'AGENT_OS_CONTEXT=%q AGENT_OS_NAMESPACE=%q AGENT_OS_CONTROL_NAMESPACE=%q AGENT_OS_PACKAGE=%q AGENT_OS_INPUTS=%q AGENT_OS_AKUA=%q AGENT_OS_KUBECTL=%q %q %q' \
+    "$CONTEXT" "$NAMESPACE" "${CONTROL_NAMESPACE:-${AGENT_OS_CONTROL_NAMESPACE:-kube-system}}" "$PACKAGE" "$INPUTS" "$AKUA" "$KUBECTL" "$0" "$action"
 }
 
 report_partial_observation() {
@@ -870,6 +925,12 @@ mutate_rendered_resource() {
     uid=$(printf '%s' "$record" | cut -f4)
     rv=$(printf '%s' "$record" | cut -f5)
     [ -n "$uid" ] && [ -n "$rv" ] || { echo "error: $kind '$name' lacks CAS identity" >&2; exit 2; }
+    if [ "$kind" = StatefulSet ] && [ "$AKUA_OVERLAY_VERIFIED" -eq 1 ]; then
+      verified_akua_overlay_secret "$PRESERVED_AKUA_SECRET_RECORD" >/dev/null || {
+        echo "incomplete: Akua authorization changed before StatefulSet CAS; no template mutation attempted" >&2
+        return 3
+      }
+    fi
     patch_file=$(cas_patch_file "$file" "$uid" "$rv")
     if [ "$scope" = cluster ]; then
       if ! "$KUBECTL" --context "$CONTEXT" patch "$kind" "$name" --type=merge --patch-file "$patch_file" >/dev/null; then
@@ -937,8 +998,8 @@ verify_desired_rbac() {
 }
 
 cleanup_command() {
-  printf 'AGENT_OS_CONTEXT=%q AGENT_OS_NAMESPACE=%q AGENT_OS_PACKAGE=%q AGENT_OS_INPUTS=%q AGENT_OS_AKUA=%q AGENT_OS_KUBECTL=%q %q cleanup-cluster-rbac --yes' \
-    "$CONTEXT" "$NAMESPACE" "$PACKAGE" "$INPUTS" "$AKUA" "$KUBECTL" "$0"
+  printf 'AGENT_OS_CONTEXT=%q AGENT_OS_NAMESPACE=%q AGENT_OS_CONTROL_NAMESPACE=%q AGENT_OS_PACKAGE=%q AGENT_OS_INPUTS=%q AGENT_OS_AKUA=%q AGENT_OS_KUBECTL=%q %q cleanup-cluster-rbac --yes' \
+    "$CONTEXT" "$NAMESPACE" "${CONTROL_NAMESPACE:-${AGENT_OS_CONTROL_NAMESPACE:-kube-system}}" "$PACKAGE" "$INPUTS" "$AKUA" "$KUBECTL" "$0"
 }
 
 report_cluster_cleanup() {
@@ -1181,8 +1242,10 @@ case "$COMMAND" in
     [ "$CONFIRMED" -eq 0 ] && [ "$DELETE_NAMESPACE" -eq 0 ] || usage
     render
     require_namespace_contract
-    create_managed_namespace_if_absent
     acquire_primary_lock
+    require_namespace_contract
+    create_managed_namespace_if_absent
+    acquire_namespace_lock
     require_namespace_contract
     preflight_rendered_resources 1
     previous=$(workload_state)
@@ -1217,9 +1280,15 @@ case "$COMMAND" in
     esac
     preflight_legacy_cluster_binding 1
     require_no_active_rollback_checkpoint
-    preserved_akua_secret_record=$(verified_akua_overlay_secret)
+    PRESERVED_AKUA_SECRET_RECORD=$(verified_akua_overlay_secret)
+    AKUA_OVERLAY_VERIFIED=1
     previous_mode=$(printf '%s' "$previous" | cut -f2)
     previous_cleanup=$(printf '%s' "$previous" | cut -f3)
+    if [ "$DESIRED_RBAC" != cluster-admin ] && [ "$LEGACY_CLUSTER_BINDING_PRESENT" -eq 1 ]; then
+      patch_workload_annotations '{"agent-os.dev/cluster-rbac-cleanup":"required"}'
+      report_cluster_cleanup
+      exit 3
+    fi
     cleanup_required=0
     if [ "$DESIRED_RBAC" != cluster-admin ] && \
       { [ "$previous_mode" = cluster-admin ] || [ -z "$previous_mode" ] || [ "$previous_cleanup" = required ]; }; then
@@ -1227,9 +1296,12 @@ case "$COMMAND" in
       patch_workload_annotations '{"agent-os.dev/cluster-rbac-cleanup":"required"}'
     fi
     apply_rendered
-    verified_akua_overlay_secret "$preserved_akua_secret_record" >/dev/null
-    if [ "$previous_service_account" != "$SERVICE_ACCOUNT_NAME" ]; then
-      delete_owned_resource namespaced ServiceAccount "$previous_service_account" 180
+    if ! verified_akua_overlay_secret "$PRESERVED_AKUA_SECRET_RECORD" >/dev/null; then
+      echo "incomplete: upgrade applied but Akua authorization postcondition changed" >&2
+      report_partial_observation StatefulSet agent-os-firstmate namespaced
+      report_partial_observation Pod agent-os-firstmate-0 namespaced
+      echo "safe recovery: $(lifecycle_command upgrade)" >&2
+      exit 3
     fi
     verify_desired_rbac
     if [ "$DESIRED_RBAC" != namespace ]; then
@@ -1312,6 +1384,7 @@ case "$COMMAND" in
       rollback_target_uid=$(printf '%s' "$rollback_target" | jq -r '.metadata.uid')
       rollback_target_revision=$(printf '%s' "$rollback_target" | jq -r '.revision')
       rollback_target_digest=$rollback_checkpoint_digest
+      verify_revision_service_account "$rollback_target"
       rollback_mode='patch'
       if [ "$rollback_update_revision" = "$rollback_target_name" ]; then
         rollback_mode=resume
@@ -1346,6 +1419,7 @@ case "$COMMAND" in
       rollback_target_revision=$(printf '%s' "$rollback_selection" | jq -r '.revision')
       rollback_target_digest=$(printf '%s' "$rollback_selection" | jq -cS '.data.spec.template' | template_digest)
       rollback_target=$rollback_selection
+      verify_revision_service_account "$rollback_target"
       rollback_checkpoint_operation=$OPERATION_ID
       rollback_checkpoint_name=$rollback_target_name
       rollback_checkpoint_uid=$rollback_target_uid

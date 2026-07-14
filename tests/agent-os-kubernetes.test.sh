@@ -60,6 +60,10 @@ if [ "${*: -2}" = "-f -" ]; then
   printf '%s\n' "$stdin_data" >> "${AGENT_OS_STDIN_LOG:-$AGENT_OS_TEST_LOG.stdin}"
   stdin_kind=$(printf '%s\n' "$stdin_data" | awk '$1 == "kind:" { print $2; exit }')
   printf 'stdin-kind %s\n' "$stdin_kind" >> "$AGENT_OS_TEST_LOG"
+  if [ "$stdin_kind" = Lease ]; then
+    stdin_name=$(printf '%s\n' "$stdin_data" | awk '$1 == "name:" { print $2; exit }')
+    printf 'stdin-lease %s\n' "$stdin_name" >> "$AGENT_OS_TEST_LOG"
+  fi
 fi
 if [ "${AGENT_OS_TEST_FAIL_APPLY:-0}" = 1 ] && [[ " $* " = *" create -f - "* ]] && \
   [ "$stdin_kind" = Pod ]; then
@@ -231,12 +235,19 @@ case " $* " in
         ;;
     esac
     ;;
-  *get\ lease\ agent-os-firstmate-lifecycle*--ignore-not-found*-o\ jsonpath=*)
+  *get\ lease\ agent-os-firstmate-lifecycle*--ignore-not-found*-o\ jsonpath=*|\
+  *get\ lease\ agent-os-lifecycle-*--ignore-not-found*-o\ jsonpath=*)
     lock_name=$(printf '%s\n' "$*" | sed -n 's/.* get lease \([^ ]*\) .*/\1/p')
-    last_lock_write=$(grep -Fn 'stdin-kind Lease' "$AGENT_OS_TEST_LOG" | tail -n 1 | cut -d: -f1)
+    last_lock_write=$(grep -Fn "stdin-lease $lock_name" "$AGENT_OS_TEST_LOG" | tail -n 1 | cut -d: -f1)
     last_lock_delete=$(grep -Fn "/leases/$lock_name" "$AGENT_OS_TEST_LOG" | grep 'delete --raw' | tail -n 1 | cut -d: -f1)
+    lock_installation="agent-os-firstmate:${AGENT_OS_TEST_NAMESPACE:-${AGENT_OS_NAMESPACE:-portable-agent-os}}"
+    if [[ "$lock_name" = agent-os-lifecycle-* ]]; then
+      control_digest=$(printf 'agent-os-installation:%s' "${AGENT_OS_TEST_NAMESPACE:-${AGENT_OS_NAMESPACE:-portable-agent-os}}" | shasum -a 256 | awk '{print $1}')
+      control_uuid="${control_digest:0:8}-${control_digest:8:4}-5${control_digest:13:3}-8${control_digest:17:3}-${control_digest:20:12}"
+      lock_installation="agent-os-control:$control_uuid"
+    fi
     if [ "${AGENT_OS_TEST_PRIMARY_LOCK_STATE:-free}" = expired ] && ! grep -F ' replace -f -' "$AGENT_OS_TEST_LOG" >/dev/null; then
-      printf '%s\tagent-os\tprimary\tagent-os-firstmate:%s\tother-operation\t2000-01-01T00:00:00Z\t2000-01-01T00:00:00Z\t300\tuid-primary-lock\t%s' "$lock_name" "${AGENT_OS_TEST_NAMESPACE:-${AGENT_OS_NAMESPACE:-portable-agent-os}}" "${AGENT_OS_TEST_PRIMARY_LOCK_RV:-rv-primary-lock}"
+      printf '%s\tagent-os\tprimary\t%s\tother-operation\t2000-01-01T00:00:00Z\t2000-01-01T00:00:00Z\t300\tuid-primary-lock\t%s' "$lock_name" "$lock_installation" "${AGENT_OS_TEST_PRIMARY_LOCK_RV:-rv-primary-lock}"
     elif [ -n "$last_lock_write" ] && { [ -z "$last_lock_delete" ] || [ "$last_lock_write" -gt "$last_lock_delete" ]; }; then
       lock_stdin=${AGENT_OS_STDIN_LOG:-$AGENT_OS_TEST_LOG.stdin}
       lock_holder=$(awk '/holderIdentity:/ { holder=$2 } END { print holder }' "$lock_stdin")
@@ -246,8 +257,8 @@ case " $* " in
       if grep -F ' replace -f -' "$AGENT_OS_TEST_LOG" >/dev/null; then
         lock_rv=rv-primary-lock-renewed
       fi
-      printf '%s\tagent-os\tprimary\tagent-os-firstmate:%s\t%s\t%s\t%s\t%s\tuid-primary-lock\t%s' \
-        "$lock_name" "${AGENT_OS_TEST_NAMESPACE:-${AGENT_OS_NAMESPACE:-portable-agent-os}}" "$lock_holder" "$lock_acquired" "$lock_renewed" \
+      printf '%s\tagent-os\tprimary\t%s\t%s\t%s\t%s\t%s\tuid-primary-lock\t%s' \
+        "$lock_name" "$lock_installation" "$lock_holder" "$lock_acquired" "$lock_renewed" \
         "${AGENT_OS_LOCK_DURATION_SECONDS:-300}" "$lock_rv"
     fi
     ;;
@@ -398,9 +409,9 @@ case " $* " in
     ;;
   *" get controllerrevisions.apps -o json "*)
     if [ "${AGENT_OS_TEST_ROLLBACK_RENUMBERED:-0}" = 1 ]; then
-      printf '%s\n' '{"items":[{"metadata":{"name":"agent-os-firstmate-previous","uid":"uid-revision-previous","ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"agent-os-firstmate","uid":"uid-statefulset","controller":true}]},"revision":1,"data":{"spec":{"template":{"metadata":{"labels":{"rollback":"previous"}}}}}},{"metadata":{"name":"agent-os-firstmate-current","uid":"uid-revision-current","ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"agent-os-firstmate","uid":"uid-statefulset","controller":true}]},"revision":2,"data":{"spec":{"template":{"metadata":{"labels":{"rollback":"current"}}}}}},{"metadata":{"name":"agent-os-firstmate-renumbered","uid":"uid-revision-renumbered","ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"agent-os-firstmate","uid":"uid-statefulset","controller":true}]},"revision":3,"data":{"spec":{"template":{"metadata":{"labels":{"rollback":"previous"}}}}}}]}'
+      printf '%s\n' '{"items":[{"metadata":{"name":"agent-os-firstmate-previous","uid":"uid-revision-previous","ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"agent-os-firstmate","uid":"uid-statefulset","controller":true}]},"revision":1,"data":{"spec":{"template":{"metadata":{"labels":{"rollback":"previous"}},"spec":{"serviceAccountName":"agent-os-firstmate"}}}}},{"metadata":{"name":"agent-os-firstmate-current","uid":"uid-revision-current","ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"agent-os-firstmate","uid":"uid-statefulset","controller":true}]},"revision":2,"data":{"spec":{"template":{"metadata":{"labels":{"rollback":"current"}},"spec":{"serviceAccountName":"agent-os-firstmate"}}}}},{"metadata":{"name":"agent-os-firstmate-renumbered","uid":"uid-revision-renumbered","ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"agent-os-firstmate","uid":"uid-statefulset","controller":true}]},"revision":3,"data":{"spec":{"template":{"metadata":{"labels":{"rollback":"previous"}},"spec":{"serviceAccountName":"agent-os-firstmate"}}}}}]}'
     else
-      printf '%s\n' '{"items":[{"metadata":{"name":"agent-os-firstmate-previous","uid":"uid-revision-previous","ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"agent-os-firstmate","uid":"uid-statefulset","controller":true}]},"revision":1,"data":{"spec":{"template":{"metadata":{"labels":{"rollback":"previous"}}}}}},{"metadata":{"name":"agent-os-firstmate-current","uid":"uid-revision-current","ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"agent-os-firstmate","uid":"uid-statefulset","controller":true}]},"revision":2,"data":{"spec":{"template":{"metadata":{"labels":{"rollback":"current"}}}}}}]}'
+      printf '%s\n' '{"items":[{"metadata":{"name":"agent-os-firstmate-previous","uid":"uid-revision-previous","ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"agent-os-firstmate","uid":"uid-statefulset","controller":true}]},"revision":1,"data":{"spec":{"template":{"metadata":{"labels":{"rollback":"previous"}},"spec":{"serviceAccountName":"agent-os-firstmate"}}}}},{"metadata":{"name":"agent-os-firstmate-current","uid":"uid-revision-current","ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"agent-os-firstmate","uid":"uid-statefulset","controller":true}]},"revision":2,"data":{"spec":{"template":{"metadata":{"labels":{"rollback":"current"}},"spec":{"serviceAccountName":"agent-os-firstmate"}}}}}]}'
     fi
     ;;
   *" get role agent-os-firstmate-runtime -o json "*)
@@ -1512,7 +1523,7 @@ pass "all RBAC modes preflight deterministic stale resources"
 : > "$CALLS"
 active_checkpoint_out=''
 active_checkpoint_rc=0
-active_checkpoint_digest=$(printf '%s' '{"metadata":{"labels":{"rollback":"previous"}}}' | jq -cS . | shasum -a 256 | awk '{print $1}')
+active_checkpoint_digest=$(printf '%s' '{"metadata":{"labels":{"rollback":"previous"}},"spec":{"serviceAccountName":"agent-os-firstmate"}}' | jq -cS . | shasum -a 256 | awk '{print $1}')
 active_checkpoint_out=$(AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_RESOURCE_STATE=owned \
   AGENT_OS_TEST_WORKLOAD_STATE=namespace AGENT_OS_TEST_ROLLBACK_CHECKPOINT_DIGEST="$active_checkpoint_digest" \
   run_generic upgrade 2>&1) || active_checkpoint_rc=$?
@@ -1535,6 +1546,12 @@ assert_no_grep 'authorization.*Bearer\|auth.json' "$STDIN_LOG" \
   "upgrade evidence must never contain Secret bytes"
 pass "upgrade preserves verified Akua Secret-reference overlays"
 
+statefulset_patch_line=$(grep -Fn 'patch StatefulSet agent-os-firstmate --type=strategic --patch-file' "$CALLS" | head -n 1 | cut -d: -f1)
+secret_reads_before_patch=$(sed -n "1,${statefulset_patch_line}p" "$CALLS" | grep -Fc 'get secret akua-auth --ignore-not-found')
+[ -n "$statefulset_patch_line" ] && [ "$secret_reads_before_patch" -ge 2 ] || \
+  fail "upgrade must revalidate the exact Secret identity immediately before StatefulSet CAS"
+pass "upgrade revalidates authorization immediately before CAS"
+
 : > "$CALLS"
 AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_RESOURCE_STATE=owned \
   AGENT_OS_TEST_WORKLOAD_STATE=namespace \
@@ -1544,6 +1561,13 @@ AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_RESOURCE_STATE=owned \
 assert_no_grep '/serviceaccounts/agent-os-firstmate-bbbbbbbbbbbb' "$CALLS" \
   "upgrade retries must not delete their active installation ServiceAccount"
 pass "upgrade reuses fresh installation ServiceAccount identity"
+
+: > "$CALLS"
+AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_RESOURCE_STATE=owned \
+  AGENT_OS_TEST_WORKLOAD_STATE=namespace run_generic upgrade
+assert_no_grep '/serviceaccounts/agent-os-firstmate ' "$CALLS" \
+  "upgrade must retain a legacy ServiceAccount referenced by rollback history"
+pass "upgrade retains rollback ServiceAccount dependencies"
 
 : > "$CALLS"
 AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_RESOURCE_STATE=owned \
@@ -1586,7 +1610,7 @@ assert_contains "$checkpoint_read_race_out" 'rollback checkpoint did not persist
   "checkpoint persistence failure must preserve an explicit retained-state error"
 pass "rollback checkpoint read-back verifies immutable identity"
 
-previous_template_digest=$(printf '%s' '{"metadata":{"labels":{"rollback":"previous"}}}' | jq -cS . | shasum -a 256 | awk '{print $1}')
+previous_template_digest=$(printf '%s' '{"metadata":{"labels":{"rollback":"previous"}},"spec":{"serviceAccountName":"agent-os-firstmate"}}' | jq -cS . | shasum -a 256 | awk '{print $1}')
 : > "$CALLS"
 renumbered_out=''
 renumbered_rc=0

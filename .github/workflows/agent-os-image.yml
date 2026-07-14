@@ -64,9 +64,8 @@ jobs:
         id: source
         run: |
           set -eu
-          git bundle create image/agent-os-source.bundle HEAD
-          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "tree=$(git rev-parse HEAD^{tree})" >> "$GITHUB_OUTPUT"
+          bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/source-metadata"
+          cat "$RUNNER_TEMP/source-metadata" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
 
@@ -85,6 +84,8 @@ jobs:
           build-args: |
             AGENT_OS_SOURCE_COMMIT=${{ steps.source.outputs.commit }}
             AGENT_OS_SOURCE_TREE=${{ steps.source.outputs.tree }}
+            AGENT_OS_SOURCE_BRANCH=${{ steps.source.outputs.branch }}
+            AGENT_OS_SOURCE_ORIGIN=${{ steps.source.outputs.origin }}
 
   publish:
     if: github.event_name == 'push'
@@ -103,9 +104,8 @@ jobs:
         id: source
         run: |
           set -eu
-          git bundle create image/agent-os-source.bundle HEAD
-          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "tree=$(git rev-parse HEAD^{tree})" >> "$GITHUB_OUTPUT"
+          bin/agent-os-source-bundle.sh > "$RUNNER_TEMP/source-metadata"
+          cat "$RUNNER_TEMP/source-metadata" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
 
@@ -144,6 +144,8 @@ jobs:
           build-args: |
             AGENT_OS_SOURCE_COMMIT=${{ steps.source.outputs.commit }}
             AGENT_OS_SOURCE_TREE=${{ steps.source.outputs.tree }}
+            AGENT_OS_SOURCE_BRANCH=${{ steps.source.outputs.branch }}
+            AGENT_OS_SOURCE_ORIGIN=${{ steps.source.outputs.origin }}
 
       - name: Record published image digest
         run: |

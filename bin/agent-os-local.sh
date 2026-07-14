@@ -56,7 +56,21 @@ cd "$ROOT"
 
 case "$COMMAND" in
   build)
-    docker build -t "$IMAGE" .
+    source_metadata=$("$ROOT/bin/agent-os-source-bundle.sh")
+    source_commit=$(printf '%s\n' "$source_metadata" | awk -F= '$1 == "commit" { print $2 }')
+    source_tree=$(printf '%s\n' "$source_metadata" | awk -F= '$1 == "tree" { print $2 }')
+    source_branch=$(printf '%s\n' "$source_metadata" | awk -F= '$1 == "branch" { print $2 }')
+    source_origin=$(printf '%s\n' "$source_metadata" | awk -F= '$1 == "origin" { sub(/^[^=]*=/, ""); print }')
+    [ -n "$source_commit" ] && [ -n "$source_tree" ] && [ -n "$source_branch" ] && [ -n "$source_origin" ] || {
+      echo "error: exact-source bundle metadata is incomplete" >&2
+      exit 2
+    }
+    docker build \
+      --build-arg "AGENT_OS_SOURCE_COMMIT=$source_commit" \
+      --build-arg "AGENT_OS_SOURCE_TREE=$source_tree" \
+      --build-arg "AGENT_OS_SOURCE_BRANCH=$source_branch" \
+      --build-arg "AGENT_OS_SOURCE_ORIGIN=$source_origin" \
+      -t "$IMAGE" .
     if [ -z "$IMAGE_IS_OVERRIDE" ]; then
       docker tag "$IMAGE" "$(local_image_tag)"
     fi

@@ -114,10 +114,30 @@ assert_grep '.repos' "$ROOT/.dockerignore" "development source checkouts must st
 assert_grep '!.pi/extensions/fm-primary-pi-watch.ts' "$ROOT/.dockerignore" "tracked Pi supervision controls must enter the image"
 assert_grep '!.codex/hooks.json' "$ROOT/.dockerignore" "tracked Codex supervision controls must enter the image"
 assert_grep '!.opencode/plugins/fm-primary-watch-arm.js' "$ROOT/.dockerignore" "tracked OpenCode supervision controls must enter the image"
+assert_grep '.pi/extensions/*' "$ROOT/.dockerignore" "Pi harness controls must use a nested default-deny rule"
+assert_grep '.grok/hooks/*' "$ROOT/.dockerignore" "Grok harness controls must use a nested default-deny rule"
+assert_grep '.opencode/plugins/*' "$ROOT/.dockerignore" "OpenCode harness controls must use a nested default-deny rule"
 assert_grep 'agent-os-source.bundle' "$ROOT/Dockerfile" "image must bootstrap an exact source commit without host Git metadata"
-assert_grep 'rev-parse HEAD^{tree}' "$ROOT/Dockerfile" "image source bootstrap must verify its exact tree"
+assert_grep 'rev-parse "$AGENT_OS_SOURCE_COMMIT^{tree}"' "$ROOT/Dockerfile" "image source bootstrap must verify its exact tree"
+assert_grep 'AS source-bootstrap' "$ROOT/Dockerfile" "source bundle processing must stay in an isolated build stage"
+assert_no_grep 'COPY image/agent-os-source.bundle /opt/agent-os-source.bundle' "$ROOT/Dockerfile" \
+  "the final image must not retain a duplicate source bundle"
 assert_grep 'merge --ff-only' "$ROOT/bin/agent-os-container-entrypoint.sh" "persistent source transitions must be fast-forward only"
+assert_grep 'TRUSTED_REF="refs/remotes/origin/$SOURCE_BRANCH"' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "canonical runtime source must match the declared trusted remote branch"
+assert_no_grep 'checkout --detach' "$ROOT/bin/agent-os-container-entrypoint.sh" \
+  "canonical runtime source must remain on the declared default branch"
 assert_grep 'FM_ROOT_OVERRIDE=' "$ROOT/bin/agent-os-container-entrypoint.sh" "runtime must use the persistent canonical Firstmate repository"
+assert_grep 'agent-os-kubernetes-control.sh' "$ROOT/bin/agent-os-kubernetes.sh" \
+  "primary lifecycle paths must share the stable control-namespace lock identity"
+assert_grep 'agent-os-kubernetes-control.sh' "$ROOT/bin/agent-os-akua-auth.sh" \
+  "authorization mutations must share the stable control-namespace lock identity"
+assert_grep 'require_no_active_rollback_checkpoint' "$ROOT/bin/agent-os-akua-auth.sh" \
+  "authorization mutations must reject unresolved rollback checkpoints"
+auth_lock_line=$(grep -n '^acquire_lock$' "$ROOT/bin/agent-os-akua-auth.sh" | tail -n 1 | cut -d: -f1)
+auth_secret_line=$(grep -n '^SECRET_RECORD=' "$ROOT/bin/agent-os-akua-auth.sh" | cut -d: -f1)
+[ -n "$auth_lock_line" ] && [ -n "$auth_secret_line" ] && [ "$auth_lock_line" -lt "$auth_secret_line" ] || \
+  fail "authorization mutation must acquire the control lock before Secret metadata"
 assert_grep 'https://github.com/ogulcancelik/herdr/tree/v0.7.3' "$ROOT/THIRD_PARTY_NOTICES.md" \
   "Herdr's exact corresponding source must be named"
 assert_present "$ROOT/THIRD_PARTY_SOURCES.md" \

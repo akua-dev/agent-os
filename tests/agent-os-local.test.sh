@@ -42,6 +42,12 @@ if [ "${*: -2}" = '-f -' ]; then
   stdin_data=$(cat)
   stdin_kind=$(printf '%s\n' "$stdin_data" | awk '$1 == "kind:" { print $2; exit }')
   printf 'stdin-kind %s\n' "$stdin_kind" >> "$AGENT_OS_TEST_LOG"
+  if [ "$stdin_kind" = Lease ]; then
+    printf 'stdin-lease %s\n' "$(printf '%s\n' "$stdin_data" | awk '$1 == "name:" { print $2; exit }')" >> "$AGENT_OS_TEST_LOG"
+    printf 'stdin-holder %s\n' "$(printf '%s\n' "$stdin_data" | awk '$1 == "holderIdentity:" { print $2; exit }')" >> "$AGENT_OS_TEST_LOG"
+    printf 'stdin-acquired %s\n' "$(printf '%s\n' "$stdin_data" | awk '$1 == "acquireTime:" { print $2; exit }')" >> "$AGENT_OS_TEST_LOG"
+    printf 'stdin-renewed %s\n' "$(printf '%s\n' "$stdin_data" | awk '$1 == "renewTime:" { print $2; exit }')" >> "$AGENT_OS_TEST_LOG"
+  fi
 fi
 namespace=${AGENT_OS_NAMESPACE:-agent-os-demo}
 operation=$(grep 'akua-input-operation ' "$AGENT_OS_TEST_LOG" | tail -n 1 | awk '{print $2}')
@@ -84,11 +90,22 @@ if { [[ " $* " = *" get clusterrolebinding agent-os-firstmate-"*" --ignore-not-f
     [[ " $* " != *'.metadata.resourceVersion'* ]] || printf '\tuid-clusterrolebinding\trv-clusterrolebinding\t%s' "$operation"
   fi
 fi
-if [[ " $* " = *" get lease agent-os-firstmate-lifecycle --ignore-not-found -o jsonpath="* ]]; then
-  last_write=$(grep -Fn 'stdin-kind Lease' "$AGENT_OS_TEST_LOG" | tail -n 1 | cut -d: -f1)
-  last_delete=$(grep -Fn '/leases/agent-os-firstmate-lifecycle' "$AGENT_OS_TEST_LOG" | grep 'delete --raw' | tail -n 1 | cut -d: -f1)
+if [[ " $* " = *" get lease agent-os-firstmate-lifecycle --ignore-not-found -o jsonpath="* ]] || \
+   [[ " $* " = *" get lease agent-os-lifecycle-"*" --ignore-not-found -o jsonpath="* ]]; then
+  lock_name=$(printf '%s\n' "$*" | sed -n 's/.* get lease \([^ ]*\) .*/\1/p')
+  last_write=$(grep -Fn "stdin-lease $lock_name" "$AGENT_OS_TEST_LOG" | tail -n 1 | cut -d: -f1)
+  last_delete=$(grep -Fn "/leases/$lock_name" "$AGENT_OS_TEST_LOG" | grep 'delete --raw' | tail -n 1 | cut -d: -f1)
   if [ -n "$last_write" ] && { [ -z "$last_delete" ] || [ "$last_write" -gt "$last_delete" ]; }; then
-    printf 'agent-os-firstmate-lifecycle\tagent-os\tprimary\tagent-os-firstmate:%s\t%s\t2026-07-13T00:00:00Z\t2026-07-13T00:00:00Z\t300\tuid-lock\trv-lock' "$namespace" "$operation"
+    lock_installation="agent-os-firstmate:$namespace"
+    if [[ "$lock_name" = agent-os-lifecycle-* ]]; then
+      digest=$(printf 'agent-os-installation:%s' "$namespace" | shasum -a 256 | awk '{print $1}')
+      uuid="${digest:0:8}-${digest:8:4}-5${digest:13:3}-8${digest:17:3}-${digest:20:12}"
+      lock_installation="agent-os-control:$uuid"
+    fi
+    lock_holder=$(grep '^stdin-holder ' "$AGENT_OS_TEST_LOG" | tail -n 1 | cut -d' ' -f2-)
+    lock_acquired=$(grep '^stdin-acquired ' "$AGENT_OS_TEST_LOG" | tail -n 1 | cut -d' ' -f2-)
+    lock_renewed=$(grep '^stdin-renewed ' "$AGENT_OS_TEST_LOG" | tail -n 1 | cut -d' ' -f2-)
+    printf '%s\tagent-os\tprimary\t%s\t%s\t%s\t%s\t300\tuid-lock\trv-lock' "$lock_name" "$lock_installation" "$lock_holder" "$lock_acquired" "$lock_renewed"
   fi
 fi
 SH
@@ -193,7 +210,10 @@ test_rebuild_deploy_uses_a_new_immutable_local_tag() {
   AGENT_OS_TEST_IMAGE_ID=sha256:rebuilt run_cli build
   AGENT_OS_TEST_IMAGE_ID=sha256:rebuilt run_cli deploy
 
-  assert_call 'docker build -t agent-os:dev .' "build must retain the local demo image tag"
+  grep -F 'docker build ' "$LOG" | grep -F -- '--build-arg AGENT_OS_SOURCE_COMMIT=' | \
+    grep -F -- '--build-arg AGENT_OS_SOURCE_TREE=' | grep -F -- '--build-arg AGENT_OS_SOURCE_BRANCH=main' | \
+    grep -F -- '-t agent-os:dev .' >/dev/null || \
+    fail "build must pass verified exact-source arguments"
   assert_call 'docker tag agent-os:dev agent-os:local-rebuilt' \
     "build must assign the rebuilt image a unique local tag"
   assert_call 'akua-input-image agent-os:local-rebuilt' \
@@ -228,8 +248,8 @@ test_explicit_image_override_is_used_without_retagging() {
   AGENT_OS_IMAGE=example.test/agent-os:custom run_cli build
   AGENT_OS_IMAGE=example.test/agent-os:custom run_cli deploy
 
-  assert_call 'docker build -t example.test/agent-os:custom .' \
-    "build must preserve an explicit image override"
+  grep -F 'docker build ' "$LOG" | grep -F -- '-t example.test/agent-os:custom .' >/dev/null || \
+    fail "build must preserve an explicit image override"
   assert_call 'akua-input-image example.test/agent-os:custom' \
     "the rendered OrbStack profile must preserve an explicit image override"
   if grep -F 'docker tag example.test/agent-os:custom' "$LOG" >/dev/null; then
@@ -243,8 +263,8 @@ test_empty_image_override_uses_content_addressed_default() {
   AGENT_OS_IMAGE='' AGENT_OS_TEST_IMAGE_ID=sha256:empty-default run_cli build
   AGENT_OS_IMAGE='' AGENT_OS_TEST_IMAGE_ID=sha256:empty-default run_cli deploy
 
-  assert_call 'docker build -t agent-os:dev .' \
-    "an empty image override must use the local demo default"
+  grep -F 'docker build ' "$LOG" | grep -F -- '-t agent-os:dev .' >/dev/null || \
+    fail "an empty image override must use the local demo default"
   assert_call 'docker tag agent-os:dev agent-os:local-empty-default' \
     "an empty image override must still receive a content-addressed tag"
   assert_call 'akua-input-image agent-os:local-empty-default' \
