@@ -30,11 +30,16 @@ LOCK_RENEW_PID=
 LOCK_DURATION_SECONDS=${AGENT_OS_LOCK_DURATION_SECONDS:-300}
 LOCK_CLOCK_SKEW_SECONDS=${AGENT_OS_LOCK_CLOCK_SKEW_SECONDS:-5}
 LOCK_ACQUIRE_SECONDS=${AGENT_OS_LOCK_ACQUIRE_SECONDS:-30}
+LOCK_REQUEST_CEILING_SECONDS=${AGENT_OS_LOCK_REQUEST_CEILING_SECONDS:-5}
+RESOURCE_REQUEST_CEILING_SECONDS=${AGENT_OS_RESOURCE_REQUEST_CEILING_SECONDS:-5}
 
-for seconds in "$LOCK_DURATION_SECONDS" "$LOCK_CLOCK_SKEW_SECONDS" "$LOCK_ACQUIRE_SECONDS"; do
+for seconds in "$LOCK_DURATION_SECONDS" "$LOCK_CLOCK_SKEW_SECONDS" "$LOCK_ACQUIRE_SECONDS" "$LOCK_REQUEST_CEILING_SECONDS" "$RESOURCE_REQUEST_CEILING_SECONDS"; do
   case "$seconds" in ''|*[!0-9]*) echo "error: lifecycle Lease timing must use whole seconds" >&2; exit 2 ;; esac
 done
 [ "$LOCK_DURATION_SECONDS" -ge 3 ] || { echo "error: lifecycle Lease duration must be at least 3 seconds" >&2; exit 2; }
+[ "$LOCK_ACQUIRE_SECONDS" -ge 1 ] || { echo "error: lifecycle Lease acquisition must allow at least 1 second" >&2; exit 2; }
+[ "$LOCK_REQUEST_CEILING_SECONDS" -ge 1 ] || { echo "error: lifecycle Lease request ceiling must be at least 1 second" >&2; exit 2; }
+[ "$RESOURCE_REQUEST_CEILING_SECONDS" -ge 1 ] || { echo "error: resource request ceiling must be at least 1 second" >&2; exit 2; }
 
 . "$ROOT/bin/agent-os-kubernetes-lease.sh"
 
@@ -162,7 +167,9 @@ kube() {
 }
 
 lock_record() {
-  kube get lease "$LOCK" --ignore-not-found \
+  local deadline=${1:-}
+  [ -n "$deadline" ] || deadline=$(lock_default_deadline)
+  lock_kube "$deadline" get lease "$LOCK" --ignore-not-found \
     -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/lifecycle}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.spec.holderIdentity}{"\t"}{.spec.acquireTime}{"\t"}{.spec.renewTime}{"\t"}{.spec.leaseDurationSeconds}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}'
 }
 
@@ -267,14 +274,61 @@ live_resource_identity() {
 }
 
 live_resource_record() {
-  local scope=$1 kind=$2 name=$3
+  local scope=$1 kind=$2 name=$3 request_timeout=${4:-}
+  local request_args=()
+  [ -z "$request_timeout" ] || request_args=(--request-timeout="$request_timeout")
   if [ "$scope" = cluster ]; then
-    "$KUBECTL" --context "$CONTEXT" get "$kind" "$name" --ignore-not-found \
+    "$KUBECTL" --context "$CONTEXT" "${request_args[@]}" get "$kind" "$name" --ignore-not-found \
       -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}{"\t"}{.metadata.labels.agent-os\.dev/operation-id}'
   else
-    "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get "$kind" "$name" --ignore-not-found \
+    "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" "${request_args[@]}" get "$kind" "$name" --ignore-not-found \
       -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}{"\t"}{.metadata.labels.agent-os\.dev/operation-id}'
   fi
+}
+
+operation_remaining_seconds() {
+  local deadline=$1 remaining
+  remaining=$((deadline - $(date -u '+%s')))
+  [ "$remaining" -gt 0 ] || return 1
+  printf '%s' "$remaining"
+}
+
+operation_request_seconds() {
+  local deadline=$1 remaining seconds
+  remaining=$(operation_remaining_seconds "$deadline") || return 1
+  seconds=$RESOURCE_REQUEST_CEILING_SECONDS
+  [ "$seconds" -le "$remaining" ] || seconds=$remaining
+  [ "$seconds" -gt 0 ] || return 1
+  printf '%s' "$seconds"
+}
+
+reconcile_deleted_resource() {
+  local scope=$1 kind=$2 name=$3 uid=$4 rv=$5 timeout=$6 started=$7 phase=$8 class=$9
+  local deadline=${10} request_seconds current current_uid current_rv elapsed
+  request_seconds=$(operation_request_seconds "$deadline") || {
+    elapsed=$(($(date -u '+%s') - started))
+    bounded_delete_failure "$kind/$name" "$phase" "$class" "$timeout" "$elapsed" "$uid"
+    return $?
+  }
+  if ! current=$(live_resource_record "$scope" "$kind" "$name" "${request_seconds}s"); then
+    elapsed=$(($(date -u '+%s') - started))
+    bounded_delete_failure "$kind/$name" reconcile transport "$timeout" "$elapsed" "$uid"
+    return $?
+  fi
+  if [ -z "$current" ]; then
+    echo "confirmed absent: $kind/$name captured uid=$uid after delete-$phase failure=$class" >&2
+    return 0
+  fi
+  current_uid=$(printf '%s' "$current" | cut -f4)
+  current_rv=$(printf '%s' "$current" | cut -f5)
+  elapsed=$(($(date -u '+%s') - started))
+  if [ "$current_uid" != "$uid" ]; then
+    echo "error: $kind/$name replacement uid=${current_uid:-unknown} retained after ambiguous delete of captured uid=$uid resourceVersion=$rv" >&2
+    bounded_delete_failure "$kind/$name" reconcile replacement "$timeout" "$elapsed" "$uid"
+    return $?
+  fi
+  echo "error: $kind/$name captured uid=$uid remains at resourceVersion=${current_rv:-unknown} after delete-$phase failure=$class" >&2
+  bounded_delete_failure "$kind/$name" "$phase" "$class" "$timeout" "$elapsed" "$uid"
 }
 
 resource_api_path() {
@@ -294,7 +348,7 @@ resource_api_path() {
 }
 
 delete_owned_resource() {
-  local scope=$1 kind=$2 name=$3 timeout=$4 record expected uid rv path output started elapsed class
+  local scope=$1 kind=$2 name=$3 timeout=$4 record expected uid rv path output started deadline class request_seconds remaining reserve wait_budget
   record=$(live_resource_record "$scope" "$kind" "$name")
   [ -n "$record" ] || return 0
   expected="$name"$'\t'"agent-os"$'\t'"$INSTALLATION_ID"
@@ -307,24 +361,34 @@ delete_owned_resource() {
   [ -n "$uid" ] && [ -n "$rv" ] || { echo "error: $kind '$name' lacks deletion preconditions" >&2; exit 2; }
   path=$(resource_api_path "$scope" "$kind" "$name")
   started=$(date -u '+%s')
+  deadline=$((started + timeout))
+  request_seconds=$(operation_request_seconds "$deadline") || {
+    bounded_delete_failure "$kind/$name" request timeout "$timeout" 0 "$uid"
+    return $?
+  }
   if ! output=$(printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s","resourceVersion":"%s"}}\n' "$uid" "$rv" | \
-    "$KUBECTL" --context "$CONTEXT" delete --raw "$path" -f - 2>&1 >/dev/null); then
-    elapsed=$(($(date -u '+%s') - started))
+    "$KUBECTL" --context "$CONTEXT" --request-timeout="${request_seconds}s" delete --raw "$path" -f - 2>&1 >/dev/null); then
     class=$(delete_failure_class "$output")
-    bounded_delete_failure "$kind/$name" request "$class" "$timeout" "$elapsed" "$uid"
+    reconcile_deleted_resource "$scope" "$kind" "$name" "$uid" "$rv" "$timeout" "$started" request "$class" "$deadline"
     return $?
   fi
+  remaining=$(operation_remaining_seconds "$deadline") || remaining=0
+  if [ "$remaining" -lt 2 ]; then
+    reconcile_deleted_resource "$scope" "$kind" "$name" "$uid" "$rv" "$timeout" "$started" wait timeout "$deadline"
+    return $?
+  fi
+  reserve=$RESOURCE_REQUEST_CEILING_SECONDS
+  [ "$reserve" -lt "$remaining" ] || reserve=$((remaining - 1))
+  wait_budget=$((remaining - reserve))
   if [ "$scope" = cluster ]; then
-    if ! output=$("$KUBECTL" --context "$CONTEXT" wait --for=delete "$kind/$name" --timeout="${timeout}s" 2>&1 >/dev/null); then
-      elapsed=$(($(date -u '+%s') - started))
+    if ! output=$("$KUBECTL" --context "$CONTEXT" --request-timeout="${wait_budget}s" wait --for=delete "$kind/$name" --timeout="${wait_budget}s" 2>&1 >/dev/null); then
       class=$(delete_failure_class "$output")
-      bounded_delete_failure "$kind/$name" wait "$class" "$timeout" "$elapsed" "$uid"
+      reconcile_deleted_resource "$scope" "$kind" "$name" "$uid" "$rv" "$timeout" "$started" wait "$class" "$deadline"
     fi
   else
-    if ! output=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" wait --for=delete "$kind/$name" --timeout="${timeout}s" 2>&1 >/dev/null); then
-      elapsed=$(($(date -u '+%s') - started))
+    if ! output=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" --request-timeout="${wait_budget}s" wait --for=delete "$kind/$name" --timeout="${wait_budget}s" 2>&1 >/dev/null); then
       class=$(delete_failure_class "$output")
-      bounded_delete_failure "$kind/$name" wait "$class" "$timeout" "$elapsed" "$uid"
+      reconcile_deleted_resource "$scope" "$kind" "$name" "$uid" "$rv" "$timeout" "$started" wait "$class" "$deadline"
     fi
   fi
 }
@@ -443,6 +507,28 @@ report_partial_observation() {
     details="ready=$ready reasons=$(printf '%s' "$record" | cut -f8-)"
   fi
   echo "$prefix: $kind/$name uid=$uid operation=$operation $details ownership=$managed installation=$installation finalizers=$finalizers" >&2
+}
+
+report_rollback_failure() {
+  local target_name=$1 target_revision=$2 state references lease deadline
+  echo "incomplete: rollback target=$target_name revision=$target_revision did not complete" >&2
+  if state=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get statefulset agent-os-firstmate -o json 2>/dev/null) && \
+    references=$(printf '%s' "$state" | jq -er '[.status.currentRevision, .status.updateRevision] | select(all(.[]; type == "string" and length > 0)) | @tsv' 2>/dev/null); then
+    echo "rollback observed: current-revision=$(printf '%s' "$references" | cut -f1) update-revision=$(printf '%s' "$references" | cut -f2)" >&2
+  else
+    echo "rollback observed: StatefulSet revision evidence unavailable" >&2
+  fi
+  report_partial_observation Pod agent-os-firstmate-0 namespaced
+  deadline=$(lock_default_deadline)
+  if lease=$(lock_record "$deadline" 2>/dev/null) && [ -n "$lease" ]; then
+    echo "rollback retained: lifecycle-lease=$LOCK uid=$(printf '%s' "$lease" | cut -f9) holder=$(printf '%s' "$lease" | cut -f5)" >&2
+  else
+    echo "rollback retained: lifecycle-lease=$LOCK evidence=unavailable" >&2
+  fi
+  printf 'safe recovery: %q --context %q -n %q rollout status statefulset/agent-os-firstmate --timeout=180s\n' \
+    "$KUBECTL" "$CONTEXT" "$NAMESPACE" >&2
+  echo "safe recovery condition: continue only while updateRevision remains '$target_name'; do not invoke rollback again while revisions differ" >&2
+  return 3
 }
 
 partial_install_is_applicable() {
@@ -1000,7 +1086,7 @@ case "$COMMAND" in
       ') || { echo "error: StatefulSet changed before rollback revision resolution" >&2; exit 3; }
     rollback_current_revision=$(printf '%s' "$rollback_references" | cut -f1)
     rollback_update_revision=$(printf '%s' "$rollback_references" | cut -f2)
-    rollback_patch=$(printf '%s' "$rollback_revisions" | jq -ce \
+    rollback_selection=$(printf '%s' "$rollback_revisions" | jq -ce \
       --arg current "$rollback_current_revision" --arg update "$rollback_update_revision" \
       --arg uid "$rollback_uid" --arg rv "$rollback_rv" '
         def owned:
@@ -1014,27 +1100,40 @@ case "$COMMAND" in
         | select($update_items | length == 1)
         | $current_items[0] as $current_revision
         | $update_items[0] as $update_revision
+        | select($current_revision.revision | type == "number")
         | select($update_revision.revision | type == "number")
-        | (if $current != $update then
-             $current_revision
+        | (if $current != $update and $update_revision.revision < $current_revision.revision then
+             {mode:"resume", target:$update_revision}
+           elif $current != $update then
+             {mode:"patch", target:$current_revision}
            else
-             ($owned | map(select((.revision | type) == "number" and .revision < $update_revision.revision)) | sort_by(.revision) | last)
-           end) as $target
-        | select($target != null and ($target.data | type) == "object")
-        | $target.data * {metadata:{uid:$uid,resourceVersion:$rv}}
+             {mode:"patch", target:($owned | map(select((.revision | type) == "number" and .revision < $update_revision.revision)) | sort_by(.revision) | last)}
+           end) as $selection
+        | select($selection.target != null and ($selection.target.data | type) == "object")
+        | {mode:$selection.mode, targetName:$selection.target.metadata.name, targetRevision:$selection.target.revision,
+           patch:($selection.target.data * {metadata:{uid:$uid,resourceVersion:$rv}})}
       ') || { echo "error: no exact-owned previous ControllerRevision is available for rollback" >&2; exit 2; }
-    if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" patch StatefulSet agent-os-firstmate \
-      --type=strategic -p "$rollback_patch" >/dev/null; then
-      echo "error: StatefulSet rollback CAS conflicted; no rollout-undo fallback attempted" >&2
+    rollback_mode=$(printf '%s' "$rollback_selection" | jq -r '.mode')
+    rollback_target_name=$(printf '%s' "$rollback_selection" | jq -r '.targetName')
+    rollback_target_revision=$(printf '%s' "$rollback_selection" | jq -r '.targetRevision')
+    rollback_patch=$(printf '%s' "$rollback_selection" | jq -c '.patch')
+    if [ "$rollback_mode" = patch ]; then
+      if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" patch StatefulSet agent-os-firstmate \
+        --type=strategic -p "$rollback_patch" >/dev/null; then
+        echo "error: StatefulSet rollback CAS conflicted; no rollout-undo fallback attempted" >&2
+        exit 3
+      fi
+      rollback_current=$(live_resource_record namespaced StatefulSet agent-os-firstmate)
+      if [ "$(printf '%s' "$rollback_current" | cut -f1-4)" != \
+        "$(printf '%s' "$rollback_record" | cut -f1-4)" ]; then
+        echo "error: StatefulSet UID or ownership changed during rollback" >&2
+        exit 3
+      fi
+    fi
+    if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" rollout status statefulset/agent-os-firstmate --timeout=180s; then
+      report_rollback_failure "$rollback_target_name" "$rollback_target_revision"
       exit 3
     fi
-    rollback_current=$(live_resource_record namespaced StatefulSet agent-os-firstmate)
-    if [ "$(printf '%s' "$rollback_current" | cut -f1-4)" != \
-      "$(printf '%s' "$rollback_record" | cut -f1-4)" ]; then
-      echo "error: StatefulSet UID or ownership changed during rollback" >&2
-      exit 3
-    fi
-    "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" rollout status statefulset/agent-os-firstmate --timeout=180s
     ;;
   status)
     [ "$CONFIRMED" -eq 0 ] && [ "$DELETE_NAMESPACE" -eq 0 ] || usage

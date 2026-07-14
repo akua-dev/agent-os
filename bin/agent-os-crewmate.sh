@@ -49,11 +49,16 @@ LOCK_RENEW_PID=
 LOCK_DURATION_SECONDS=${AGENT_OS_LOCK_DURATION_SECONDS:-300}
 LOCK_CLOCK_SKEW_SECONDS=${AGENT_OS_LOCK_CLOCK_SKEW_SECONDS:-5}
 LOCK_ACQUIRE_SECONDS=${AGENT_OS_LOCK_ACQUIRE_SECONDS:-30}
+LOCK_REQUEST_CEILING_SECONDS=${AGENT_OS_LOCK_REQUEST_CEILING_SECONDS:-5}
+RESOURCE_REQUEST_CEILING_SECONDS=${AGENT_OS_RESOURCE_REQUEST_CEILING_SECONDS:-5}
 
-for seconds in "$LOCK_DURATION_SECONDS" "$LOCK_CLOCK_SKEW_SECONDS" "$LOCK_ACQUIRE_SECONDS"; do
+for seconds in "$LOCK_DURATION_SECONDS" "$LOCK_CLOCK_SKEW_SECONDS" "$LOCK_ACQUIRE_SECONDS" "$LOCK_REQUEST_CEILING_SECONDS" "$RESOURCE_REQUEST_CEILING_SECONDS"; do
   case "$seconds" in ''|*[!0-9]*) echo "error: lifecycle Lease timing must use whole seconds" >&2; exit 2 ;; esac
 done
 [ "$LOCK_DURATION_SECONDS" -ge 3 ] || { echo "error: lifecycle Lease duration must be at least 3 seconds" >&2; exit 2; }
+[ "$LOCK_ACQUIRE_SECONDS" -ge 1 ] || { echo "error: lifecycle Lease acquisition must allow at least 1 second" >&2; exit 2; }
+[ "$LOCK_REQUEST_CEILING_SECONDS" -ge 1 ] || { echo "error: lifecycle Lease request ceiling must be at least 1 second" >&2; exit 2; }
+[ "$RESOURCE_REQUEST_CEILING_SECONDS" -ge 1 ] || { echo "error: resource request ceiling must be at least 1 second" >&2; exit 2; }
 
 kube() {
   "$KUBECTL" "${KUBECTL_ARGS[@]}" -n "$NAMESPACE" "$@"
@@ -67,7 +72,7 @@ resource_identity() {
 
 pod_record() {
   kube get pod "$POD" --ignore-not-found \
-    -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.labels.agent-os\.dev/operation-id}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}'
+    -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.labels.agent-os\.dev/operation-id}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}{"\t"}{range .spec.volumes[?(@.name=="home")]}{.persistentVolumeClaim.claimName}{end}'
 }
 
 pvc_record() {
@@ -76,7 +81,9 @@ pvc_record() {
 }
 
 lock_record() {
-  kube get lease "$LOCK" --ignore-not-found \
+  local deadline=${1:-}
+  [ -n "$deadline" ] || deadline=$(lock_default_deadline)
+  lock_kube "$deadline" get lease "$LOCK" --ignore-not-found \
     -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.spec.holderIdentity}{"\t"}{.spec.acquireTime}{"\t"}{.spec.renewTime}{"\t"}{.spec.leaseDurationSeconds}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}'
 }
 
@@ -198,7 +205,7 @@ cleanup_new_owned_pod() {
   fi
   echo "partial state: removing newly created owned Pod '$POD' uid=$after_uid; persistent home retained" >&2
   if ! printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s"}}\n' "$after_uid" | \
-    kube delete --raw "/api/v1/namespaces/$NAMESPACE/pods/$POD" -f -; then
+    kube --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" delete --raw "/api/v1/namespaces/$NAMESPACE/pods/$POD" -f -; then
     echo "partial state: UID-precondition rejected; replacement or ownership mismatch retained" >&2
     return
   fi
@@ -206,7 +213,7 @@ cleanup_new_owned_pod() {
 }
 
 create_and_wait() {
-  local pvc_before pvc_current pvc_identity pvc_uid pvc_current_uid pvc_rv pod pod_uid pod_rv
+  local pvc_before pvc_current pvc_identity pvc_uid pvc_current_uid pvc_rv pod pod_current pod_uid pod_rv pod_claim
   pvc_before=$(require_owned_pvc_or_absent)
   if [ -z "$pvc_before" ]; then
     if ! render_pvc | kube create -f - >/dev/null; then
@@ -249,8 +256,9 @@ create_and_wait() {
   fi
   pod_uid=$(printf '%s' "$pod" | cut -f6)
   pod_rv=$(printf '%s' "$pod" | cut -f7)
-  if [ -z "$pod_uid" ] || [ -z "$pod_rv" ]; then
-    echo "error: created Pod lacks exact UID or resourceVersion evidence" >&2
+  pod_claim=$(printf '%s' "$pod" | cut -f8)
+  if [ -z "$pod_uid" ] || [ -z "$pod_rv" ] || [ "$pod_claim" != "$PVC" ]; then
+    echo "error: created Pod lacks exact UID, resourceVersion, or PVC relationship evidence" >&2
     exit 1
   fi
   pvc_current=$(require_owned_pvc_or_absent)
@@ -263,6 +271,20 @@ create_and_wait() {
     cleanup_new_owned_pod "$pod_uid"
     echo "error: crewmate Pod did not become ready with the authorized AI Secret" >&2
     exit 1
+  fi
+  pod_current=$(pod_record)
+  if [ "$(printf '%s' "$pod_current" | cut -f1-5)" != "$EXPECTED_POD"$'\t'"$OPERATION_ID" ] || \
+    [ "$(printf '%s' "$pod_current" | cut -f6)" != "$pod_uid" ] || \
+    [ "$(printf '%s' "$pod_current" | cut -f8)" != "$PVC" ]; then
+    pvc_current=$(pvc_record)
+    pvc_identity=$(printf '%s' "$pvc_current" | cut -f1-4)
+    if [ "$pvc_identity" = "$EXPECTED_PVC" ]; then
+      if ! invalidate_checkpoint_evidence; then
+        echo "partial state: checkpoint invalidation failed after Pod continuity loss; persistent claims retained" >&2
+      fi
+    fi
+    echo "error: Pod identity changed after readiness; captured uid=$pod_uid observed uid=$(printf '%s' "$pod_current" | cut -f6); replacement retained and persistent claims retained" >&2
+    exit 3
   fi
   pvc_current=$(pvc_record)
   pvc_identity=$(printf '%s' "$pvc_current" | cut -f1-4)
@@ -323,7 +345,7 @@ stop_owned_pod() {
     exit 2
   fi
   printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s"}}\n' "$uid" | \
-    kube delete --raw "/api/v1/namespaces/$NAMESPACE/pods/$POD" -f -
+    kube --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" delete --raw "/api/v1/namespaces/$NAMESPACE/pods/$POD" -f -
   kube wait --for=delete "pod/$POD" --timeout=180s
 }
 
@@ -502,7 +524,7 @@ case "$COMMAND" in
     record_purge purge-requested "$checkpoint_at"
     printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s","resourceVersion":"%s"}}\n' \
       "$pvc_uid" "$pvc_rv" | \
-      kube delete --raw "/api/v1/namespaces/$NAMESPACE/persistentvolumeclaims/$PVC" -f -
+      kube --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" delete --raw "/api/v1/namespaces/$NAMESPACE/persistentvolumeclaims/$PVC" -f -
     kube wait --for=delete "pvc/$PVC" --timeout=180s
     record_purge purge-complete "$checkpoint_at"
     ;;

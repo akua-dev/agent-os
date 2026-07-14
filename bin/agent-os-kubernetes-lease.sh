@@ -10,6 +10,31 @@ yaml_string() {
   printf '"%s"' "$value"
 }
 
+lock_default_deadline() {
+  printf '%s' "$(($(date -u '+%s') + LOCK_REQUEST_CEILING_SECONDS))"
+}
+
+lock_request_seconds() {
+  local deadline=$1 now remaining validity seconds
+  now=$(date -u '+%s')
+  remaining=$((deadline - now))
+  [ "$remaining" -gt 0 ] || return 1
+  validity=$((LOCK_DURATION_SECONDS / 3))
+  [ "$validity" -gt 0 ] || validity=1
+  seconds=$LOCK_REQUEST_CEILING_SECONDS
+  [ "$seconds" -le "$validity" ] || seconds=$validity
+  [ "$seconds" -le "$remaining" ] || seconds=$remaining
+  [ "$seconds" -gt 0 ] || return 1
+  printf '%s' "$seconds"
+}
+
+lock_kube() {
+  local deadline=$1 seconds
+  shift
+  seconds=$(lock_request_seconds "$deadline") || return 124
+  kube --request-timeout="${seconds}s" "$@"
+}
+
 rfc3339_epoch() {
   local value=${1%%.*}
   value=${value%Z}Z
@@ -36,16 +61,22 @@ verify_lock_record() {
 }
 
 renew_lock_once() {
-  local record acquired uid rv now current
-  record=$(lock_record) || return 1
+  local record acquired uid rv now current deadline
+  deadline=$(lock_default_deadline)
+  record=$(lock_record "$deadline") || return 1
   verify_lock_record "$record" || return 1
   acquired=$(printf '%s' "$record" | cut -f6)
   uid=$(printf '%s' "$record" | cut -f9)
   rv=$(printf '%s' "$record" | cut -f10)
   [ -n "$acquired" ] && [ -n "$rv" ] || return 1
   now=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-  render_lock "$acquired" "$now" "$uid" "$rv" | kube replace -f - >/dev/null || return 1
-  current=$(lock_record) || return 1
+  if ! render_lock "$acquired" "$now" "$uid" "$rv" | lock_kube "$deadline" replace -f - >/dev/null; then
+    current=$(lock_record "$deadline") || return 1
+    verify_lock_record "$current" || return 1
+    [ "$(printf '%s' "$current" | cut -f9)" = "$uid" ] || return 1
+    [ "$(printf '%s' "$current" | cut -f10)" != "$rv" ] || return 1
+  fi
+  current=$(lock_record "$deadline") || return 1
   verify_lock_record "$current" || return 1
   [ "$(printf '%s' "$current" | cut -f9)" = "$uid" ] || return 1
   LOCK_RV=$(printf '%s' "$current" | cut -f10)
@@ -76,10 +107,11 @@ stop_lock_renewal() {
 }
 
 release_lock() {
-  local record identity holder uid rv after after_holder after_uid
+  local record identity holder uid rv after after_holder after_uid deadline
   stop_lock_renewal
   [ -n "$LOCK_UID" ] || return 0
-  if ! record=$(lock_record); then
+  deadline=$(lock_default_deadline)
+  if ! record=$(lock_record "$deadline"); then
     echo "error: lifecycle Lease '$LOCK' could not be verified for release" >&2
     return 1
   fi
@@ -94,11 +126,21 @@ release_lock() {
     return 1
   fi
   if ! printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s","resourceVersion":"%s"}}\n' "$uid" "$rv" | \
-    kube delete --raw "/apis/coordination.k8s.io/v1/namespaces/$LOCK_NAMESPACE/leases/$LOCK" -f - >/dev/null; then
-    echo "error: lifecycle Lease '$LOCK' release precondition failed; retained" >&2
-    return 1
+    lock_kube "$deadline" delete --raw "/apis/coordination.k8s.io/v1/namespaces/$LOCK_NAMESPACE/leases/$LOCK" -f - >/dev/null; then
+    after=$(lock_record "$deadline") || {
+      echo "error: lifecycle Lease '$LOCK' release result is ambiguous; retained" >&2
+      return 1
+    }
+    if [ -n "$after" ] && [ "$(printf '%s' "$after" | cut -f9)" = "$uid" ] && \
+      [ "$(printf '%s' "$after" | cut -f5)" = "$OPERATION_ID" ]; then
+      echo "error: lifecycle Lease '$LOCK' release precondition failed; retained" >&2
+      return 1
+    fi
+    LOCK_UID=
+    LOCK_RV=
+    return 0
   fi
-  after=$(lock_record) || return 1
+  after=$(lock_record "$deadline") || return 1
   if [ -n "$after" ]; then
     after_holder=$(printf '%s' "$after" | cut -f5)
     after_uid=$(printf '%s' "$after" | cut -f9)
@@ -115,13 +157,27 @@ acquire_lock() {
   local record identity holder now deadline acquired uid rv current
   now=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
   deadline=$(($(date -u '+%s') + LOCK_ACQUIRE_SECONDS))
-  while ! render_lock "$now" "$now" | kube create -f - >/dev/null; do
-    record=$(lock_record)
+  holder=unknown
+  while :; do
+    if [ "$(date -u '+%s')" -ge "$deadline" ]; then
+      echo "error: lifecycle operation '$holder' still holds Lease '$LOCK' after ${LOCK_ACQUIRE_SECONDS}s" >&2
+      exit 3
+    fi
+    if render_lock "$now" "$now" | lock_kube "$deadline" create -f - >/dev/null; then
+      break
+    fi
+    record=$(lock_record "$deadline") || {
+      echo "error: lifecycle Lease '$LOCK' create result could not be reconciled before the acquisition deadline" >&2
+      exit 3
+    }
     identity=$(printf '%s' "$record" | cut -f1-4)
     holder=$(printf '%s' "$record" | cut -f5)
     if [ -z "$record" ] || [ "$identity" != "$EXPECTED_LOCK" ]; then
       echo "error: lifecycle Lease '$LOCK' is absent or has foreign ownership after create conflict" >&2
       exit 2
+    fi
+    if verify_lock_record "$record"; then
+      break
     fi
     if lease_is_expired "$record"; then
       uid=$(printf '%s' "$record" | cut -f9)
@@ -131,7 +187,14 @@ acquire_lock() {
         exit 2
       fi
       now=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-      if render_lock "$now" "$now" "$uid" "$rv" | kube replace -f - >/dev/null; then
+      if render_lock "$now" "$now" "$uid" "$rv" | lock_kube "$deadline" replace -f - >/dev/null; then
+        break
+      fi
+      record=$(lock_record "$deadline") || {
+        echo "error: lifecycle Lease '$LOCK' takeover result could not be reconciled before the acquisition deadline" >&2
+        exit 3
+      }
+      if verify_lock_record "$record" && [ "$(printf '%s' "$record" | cut -f9)" = "$uid" ]; then
         break
       fi
     fi
@@ -142,7 +205,7 @@ acquire_lock() {
     sleep 1
     now=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
   done
-  record=$(lock_record)
+  record=$(lock_record "$deadline")
   if ! verify_lock_record "$record"; then
     LOCK_UID=
     echo "error: lifecycle Lease '$LOCK' did not verify after acquisition" >&2
@@ -156,7 +219,7 @@ acquire_lock() {
     echo "error: lifecycle Lease '$LOCK' lacks complete renewal evidence" >&2
     exit 2
   fi
-  current=$(lock_record)
+  current=$(lock_record "$deadline")
   if [ "$current" != "$record" ]; then
     LOCK_UID=
     echo "error: lifecycle Lease '$LOCK' changed after acquisition" >&2

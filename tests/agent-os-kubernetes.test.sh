@@ -42,6 +42,11 @@ cat > "$FAKEBIN/kubectl" <<'SH'
 printf 'kubectl' >> "$AGENT_OS_TEST_LOG"
 printf ' %s' "$@" >> "$AGENT_OS_TEST_LOG"
 printf '\n' >> "$AGENT_OS_TEST_LOG"
+filtered_args=()
+for argument in "$@"; do
+  [[ "$argument" = --request-timeout=* ]] || filtered_args+=("$argument")
+done
+set -- "${filtered_args[@]}"
 stdin_data=''
 previous=''
 for argument in "$@"; do
@@ -124,15 +129,25 @@ case " $* " in
       absent) ;;
       owned)
         printf 'agent-os-crewmate-%s\tagent-os\t%s\tagent-os-firstmate:agent-os-demo' "$id" "$id"
-        [[ " $* " != *'.metadata.uid'* ]] || printf '\toperation-test\tuid-owned\trv-pod-owned'
+        [[ " $* " != *'.metadata.uid'* ]] || printf '\toperation-test\tuid-owned\trv-pod-owned\tagent-os-crewmate-%s-home' "$id"
         ;;
       replacement)
         printf 'agent-os-crewmate-%s\tagent-os\t%s\tagent-os-firstmate:agent-os-demo' "$id" "$id"
-        [[ " $* " != *'.metadata.uid'* ]] || printf '\tother-operation\tuid-replacement\trv-pod-replacement'
+        [[ " $* " != *'.metadata.uid'* ]] || printf '\tother-operation\tuid-replacement\trv-pod-replacement\tagent-os-crewmate-%s-home' "$id"
+        ;;
+      replaced-after-ready)
+        printf 'agent-os-crewmate-%s\tagent-os\t%s\tagent-os-firstmate:agent-os-demo' "$id" "$id"
+        if [[ " $* " = *'.metadata.uid'* ]]; then
+          if grep -F 'wait --for=condition=Ready pod/' "$AGENT_OS_TEST_LOG" >/dev/null; then
+            printf '\tother-operation\tuid-replacement\trv-pod-replacement\tagent-os-crewmate-%s-home' "$id"
+          else
+            printf '\toperation-test\tuid-owned\trv-pod-owned\tagent-os-crewmate-%s-home' "$id"
+          fi
+        fi
         ;;
       foreign)
         printf 'agent-os-crewmate-%s\tother\tother\tother-installation' "$id"
-        [[ " $* " != *'.metadata.uid'* ]] || printf '\tother-operation\tuid-foreign\trv-pod-foreign'
+        [[ " $* " != *'.metadata.uid'* ]] || printf '\tother-operation\tuid-foreign\trv-pod-foreign\tforeign-home'
         ;;
     esac
     ;;
@@ -169,7 +184,7 @@ case " $* " in
         ;;
     esac
     ;;
-  *" get lease agent-os-crewmate-"*" --ignore-not-found -o jsonpath="*)
+  *get\ lease\ agent-os-crewmate-*--ignore-not-found*-o\ jsonpath=*)
     id=${AGENT_OS_TEST_CREWMATE_ID:-scout-1}
     case "${AGENT_OS_TEST_LOCK_STATE:-free}" in
       held) printf 'agent-os-crewmate-%s-lifecycle\tagent-os\t%s\tagent-os-firstmate:agent-os-demo\tother-operation\t2099-01-01T00:00:00Z\t2099-01-01T00:00:00Z\t300\tuid-lock-other\trv-lock-other' "$id" "$id" ;;
@@ -197,7 +212,7 @@ case " $* " in
         ;;
     esac
     ;;
-  *" get lease agent-os-firstmate-lifecycle"*" --ignore-not-found -o jsonpath="*)
+  *get\ lease\ agent-os-firstmate-lifecycle*--ignore-not-found*-o\ jsonpath=*)
     lock_name=$(printf '%s\n' "$*" | sed -n 's/.* get lease \([^ ]*\) .*/\1/p')
     last_lock_write=$(grep -Fn 'stdin-kind Lease' "$AGENT_OS_TEST_LOG" | tail -n 1 | cut -d: -f1)
     last_lock_delete=$(grep -Fn "/leases/$lock_name" "$AGENT_OS_TEST_LOG" | grep 'delete --raw' | tail -n 1 | cut -d: -f1)
@@ -302,8 +317,10 @@ case " $* " in
     esac
     ;;
   *" get statefulset agent-os-firstmate -o json "*)
-    printf '{"metadata":{"name":"agent-os-firstmate","uid":"uid-statefulset","resourceVersion":"%s","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}},"status":{"currentRevision":"agent-os-firstmate-previous","updateRevision":"agent-os-firstmate-current"}}\n' \
-      "${AGENT_OS_TEST_RESOURCE_RV:-rv-statefulset}"
+    printf '{"metadata":{"name":"agent-os-firstmate","uid":"uid-statefulset","resourceVersion":"%s","labels":{"app.kubernetes.io/managed-by":"agent-os"},"annotations":{"agent-os.dev/installation-id":"agent-os-firstmate:portable-agent-os"}},"status":{"currentRevision":"%s","updateRevision":"%s"}}\n' \
+      "${AGENT_OS_TEST_RESOURCE_RV:-rv-statefulset}" \
+      "${AGENT_OS_TEST_ROLLBACK_CURRENT:-agent-os-firstmate-previous}" \
+      "${AGENT_OS_TEST_ROLLBACK_UPDATE:-agent-os-firstmate-current}"
     ;;
   *" get controllerrevisions.apps -o json "*)
     printf '%s\n' '{"items":[{"metadata":{"name":"agent-os-firstmate-previous","ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"agent-os-firstmate","uid":"uid-statefulset","controller":true}]},"revision":1,"data":{"spec":{"template":{"metadata":{"labels":{"rollback":"previous"}}}}}},{"metadata":{"name":"agent-os-firstmate-current","ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":"agent-os-firstmate","uid":"uid-statefulset","controller":true}]},"revision":2,"data":{"spec":{"template":{"metadata":{"labels":{"rollback":"current"}}}}}}]}'
@@ -332,6 +349,10 @@ case " $* " in
   *" get clusterrolebinding agent-os-firstmate-"*" --ignore-not-found -o jsonpath="*|\
   *" get ClusterRoleBinding agent-os-firstmate-"*" --ignore-not-found -o jsonpath="*)
     cluster_state=${AGENT_OS_TEST_CLUSTER_RBAC_STATE:-absent}
+    if grep -F '/clusterrolebindings/agent-os-firstmate-portable-agent-os' "$AGENT_OS_TEST_LOG" | grep -F 'delete --raw' >/dev/null && \
+      [ -n "${AGENT_OS_TEST_DELETE_READBACK_STATE:-}" ]; then
+      cluster_state=$AGENT_OS_TEST_DELETE_READBACK_STATE
+    fi
     if [ -n "${AGENT_OS_TEST_CLUSTER_RBAC_AFTER_APPLY:-}" ] && \
       { grep -E ' create -f .+\.yaml' "$AGENT_OS_TEST_LOG" >/dev/null || grep -F ' --patch-file ' "$AGENT_OS_TEST_LOG" >/dev/null; }; then
       cluster_state=$AGENT_OS_TEST_CLUSTER_RBAC_AFTER_APPLY
@@ -351,6 +372,10 @@ case " $* " in
         elif [[ " $* " = *'.metadata.uid'* ]]; then
           printf '\tuid-clusterrolebinding\toperation-test\tTrue\t[]'
         fi
+        ;;
+      replacement)
+        printf 'agent-os-firstmate-%s\tagent-os\tagent-os-firstmate:%s\tuid-clusterrolebinding-replacement\trv-clusterrolebinding-replacement\tother-operation' \
+          "${AGENT_OS_TEST_NAMESPACE:-portable-agent-os}" "${AGENT_OS_TEST_NAMESPACE:-portable-agent-os}"
         ;;
       foreign) printf 'agent-os-firstmate-portable-agent-os\tother\tother-installation' ;;
     esac
@@ -391,7 +416,7 @@ run_launcher() {
     AGENT_OS_IN_CLUSTER=1 AGENT_OS_NAMESPACE=agent-os-demo AGENT_OS_IMAGE=agent-os:local-test \
     AGENT_OS_IMAGE_PULL_POLICY=Never AGENT_OS_AI_SECRET=scout-1-ai-auth \
     AGENT_OS_OPERATION_ID=operation-test AGENT_OS_PURGE_EVIDENCE_FILE="$PURGE_EVIDENCE" \
-    AGENT_OS_LOCK_ACQUIRE_SECONDS=0 \
+    AGENT_OS_LOCK_ACQUIRE_SECONDS=2 \
     "$LAUNCHER" "$@"
 }
 
@@ -467,7 +492,7 @@ pass "crewmate create requires an explicit AI Secret grant"
 if AGENT_OS_TEST_FAIL_WAIT=1 AGENT_OS_TEST_POD_AFTER_APPLY=owned run_launcher create scout-1 >/dev/null 2>&1; then
   fail "crewmate create must fail when its authorized Secret cannot produce a ready Pod"
 fi
-grep -Fqx 'kubectl -n agent-os-demo delete --raw /api/v1/namespaces/agent-os-demo/pods/agent-os-crewmate-scout-1 -f -' "$CALLS" || \
+grep -Fqx 'kubectl -n agent-os-demo --request-timeout=5s delete --raw /api/v1/namespaces/agent-os-demo/pods/agent-os-crewmate-scout-1 -f -' "$CALLS" || \
   fail "failed create must use an atomic UID-preconditioned delete"
 assert_grep '"uid":"uid-owned"' "$STDIN_LOG" \
   "failed create must precondition deletion on the observed Pod UID"
@@ -475,6 +500,20 @@ if grep -F 'delete pvc agent-os-crewmate-scout-1-home' "$CALLS" >/dev/null; then
   fail "failed create must retain the crewmate PVC for an authorized retry"
 fi
 pass "crewmate create fails closed while retaining its persistent home"
+
+: > "$CALLS"
+pod_replacement_out=''
+pod_replacement_rc=0
+pod_replacement_out=$(AGENT_OS_TEST_POD_AFTER_APPLY=replaced-after-ready \
+  run_launcher create scout-1 2>&1) || pod_replacement_rc=$?
+[ "$pod_replacement_rc" -eq 3 ] || \
+  fail "post-ready Pod replacement must exit incomplete: $pod_replacement_out"
+assert_contains "$pod_replacement_out" 'captured uid=uid-owned observed uid=uid-replacement' \
+  "post-ready continuity failure must report both Pod identities"
+if grep -F '/pods/agent-os-crewmate-scout-1' "$CALLS" | grep -F 'delete --raw' >/dev/null; then
+  fail "post-ready continuity failure must retain a same-name replacement Pod"
+fi
+pass "crewmate readiness verifies the original Pod identity"
 
 : > "$CALLS"
 partial_out=''
@@ -486,7 +525,7 @@ assert_contains "$partial_out" 'uid-owned' \
   "partial apply cleanup must report the exact newly created Pod UID"
 assert_grep 'metadata.uid' "$CALLS" \
   "partial apply cleanup must collect exact Pod UID evidence"
-grep -Fqx 'kubectl -n agent-os-demo delete --raw /api/v1/namespaces/agent-os-demo/pods/agent-os-crewmate-scout-1 -f -' "$CALLS" || \
+grep -Fqx 'kubectl -n agent-os-demo --request-timeout=5s delete --raw /api/v1/namespaces/agent-os-demo/pods/agent-os-crewmate-scout-1 -f -' "$CALLS" || \
   fail "partial apply cleanup must use an atomic UID-preconditioned delete"
 assert_grep '"uid":"uid-owned"' "$STDIN_LOG" \
   "partial apply cleanup must bind deletion to the observed Pod UID"
@@ -548,7 +587,7 @@ fi
 
 : > "$CALLS"
 AGENT_OS_TEST_POD_STATE=owned AGENT_OS_TEST_PVC_STATE=owned run_launcher stop scout-1
-grep -Fqx 'kubectl -n agent-os-demo delete --raw /api/v1/namespaces/agent-os-demo/pods/agent-os-crewmate-scout-1 -f -' "$CALLS" || \
+grep -Fqx 'kubectl -n agent-os-demo --request-timeout=5s delete --raw /api/v1/namespaces/agent-os-demo/pods/agent-os-crewmate-scout-1 -f -' "$CALLS" || \
   fail "stop must UID-precondition deletion of the exactly owned crewmate Pod"
 grep -Fqx 'kubectl -n agent-os-demo wait --for=delete pod/agent-os-crewmate-scout-1 --timeout=180s' "$CALLS" || \
   fail "stop must prove Pod absence before checkpointing can begin"
@@ -635,7 +674,7 @@ assert_no_grep 'delete pvc agent-os-crewmate-scout-1-home' "$CALLS" \
 AGENT_OS_TEST_POD_STATE=absent AGENT_OS_TEST_PVC_STATE=clean run_launcher purge scout-1 --yes
 assert_no_grep 'delete pod agent-os-crewmate-scout-1' "$CALLS" \
   "purge must accept checkpoint evidence only after the Pod is absent"
-grep -Fqx 'kubectl -n agent-os-demo delete --raw /api/v1/namespaces/agent-os-demo/persistentvolumeclaims/agent-os-crewmate-scout-1-home -f -' "$CALLS" || \
+grep -Fqx 'kubectl -n agent-os-demo --request-timeout=5s delete --raw /api/v1/namespaces/agent-os-demo/persistentvolumeclaims/agent-os-crewmate-scout-1-home -f -' "$CALLS" || \
   fail "purge must atomically delete the exactly owned persistent home"
 assert_grep '"uid":"uid-pvc-owned","resourceVersion":"rv-pvc-owned"' "$STDIN_LOG" \
   "purge must precondition deletion on the captured PVC UID and resourceVersion"
@@ -668,7 +707,7 @@ lock_out=''
 lock_rc=0
 lock_out=$(AGENT_OS_TEST_LOCK_STATE=held run_launcher stop scout-1 2>&1) || lock_rc=$?
 [ "$lock_rc" -eq 3 ] || fail "bounded lifecycle lock contention must exit incomplete: $lock_out"
-assert_contains "$lock_out" "still holds Lease 'agent-os-crewmate-scout-1-lifecycle' after 0s" \
+assert_contains "$lock_out" "still holds Lease 'agent-os-crewmate-scout-1-lifecycle' after 2s" \
   "lifecycle contention must report the exact holder and bounded timeout"
 pass "crewmate lifecycle operations use a bounded coordination lock"
 
@@ -679,6 +718,15 @@ expired_lock_out=$(AGENT_OS_TEST_LOCK_STATE=expired AGENT_OS_TEST_PVC_STATE=owne
 grep -F 'replace -f -' "$CALLS" >/dev/null || \
   fail "expired exact-owned lifecycle Leases must use resourceVersion-CAS takeover"
 pass "crewmate lifecycle can recover exact-owned expired Leases"
+
+: > "$CALLS"
+ambiguous_lock_out=''
+ambiguous_lock_rc=0
+ambiguous_lock_out=$(AGENT_OS_TEST_LOCK_STATE=ambiguous-create AGENT_OS_TEST_PVC_STATE=owned \
+  run_launcher stop scout-1 2>&1) || ambiguous_lock_rc=$?
+[ "$ambiguous_lock_rc" -eq 0 ] || \
+  fail "ambiguous Lease create must accept verified own-holder read-back: $ambiguous_lock_out"
+pass "crewmate Lease acquisition reconciles ambiguous create success"
 
 : > "$CALLS"
 : > "$STDIN_LOG"
@@ -694,6 +742,15 @@ AGENT_OS_LOCK_DURATION_SECONDS=3 AGENT_OS_TEST_READY_DELAY=2 \
 grep -F 'replace -f -' "$CALLS" >/dev/null || \
   fail "active lifecycle operations must renew their exact-owned Lease"
 pass "crewmate lifecycle renews its Lease while active"
+
+lease_call_without_timeout=$(awk '
+  /^kubectl / { call=$0 }
+  / get lease | delete --raw .*\/leases\// { if ($0 !~ /--request-timeout=/) print }
+  /^stdin-kind Lease$/ { if (call !~ /--request-timeout=/) print call }
+' "$CALLS")
+[ -z "$lease_call_without_timeout" ] || \
+  fail "every Lease request must carry a bounded request timeout: $lease_call_without_timeout"
+pass "crewmate Lease requests are bounded within lock validity"
 
 : > "$CALLS"
 AGENT_OS_TEST_POD_STATE=absent AGENT_OS_TEST_PVC_STATE=owned \
@@ -1078,9 +1135,17 @@ grep -F '/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/agent-os-firstma
   fail "privileged cleanup must UID-delete only the exact owned ClusterRoleBinding"
 assert_grep '"uid":"uid-clusterrolebinding","resourceVersion":"rv-clusterrolebinding"' "$STDIN_LOG" \
   "privileged cleanup must bind deletion to the observed grant identity"
-grep -F 'wait --for=delete ClusterRoleBinding/agent-os-firstmate-portable-agent-os --timeout=60s' "$CALLS" >/dev/null || \
+grep -F 'wait --for=delete ClusterRoleBinding/agent-os-firstmate-portable-agent-os --timeout=55s' "$CALLS" >/dev/null || \
   fail "privileged cleanup must produce deletion evidence for the exact binding"
+grep -F 'wait --for=delete ClusterRoleBinding/agent-os-firstmate-portable-agent-os --timeout=55s' "$CALLS" | \
+  grep -F -- '--request-timeout=55s' >/dev/null || \
+  fail "delete wait must reserve five seconds for bounded identity reconciliation"
 pass "privileged cleanup verifies ownership and deletes one exact binding"
+
+cleanup_delete_call=$(grep -F '/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/agent-os-firstmate-portable-agent-os' "$CALLS" | \
+  grep -F 'delete --raw' | tail -n 1)
+assert_contains "$cleanup_delete_call" '--request-timeout=' \
+  "raw delete requests must be bounded before the operation wait begins"
 
 : > "$CALLS"
 cleanup_stale_out=''
@@ -1111,6 +1176,33 @@ assert_contains "$cleanup_delete_out" 'retained: ClusterRoleBinding/agent-os-fir
 assert_contains "$cleanup_delete_out" 'safe retry:' \
   "privileged cleanup failure must print exact retry evidence"
 pass "privileged cleanup failures report retained grant evidence"
+
+: > "$CALLS"
+not_found_out=''
+not_found_rc=0
+not_found_out=$(AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_WORKLOAD_STATE=pending \
+  AGENT_OS_TEST_CLUSTER_RBAC_STATE=owned AGENT_OS_TEST_DELETE_READBACK_STATE=absent \
+  AGENT_OS_TEST_FAIL_DELETE_TARGET=clusterrolebindings/agent-os-firstmate-portable-agent-os \
+  AGENT_OS_TEST_DELETE_ERROR='Error from server (NotFound): object disappeared' \
+  run_generic cleanup-cluster-rbac --yes 2>&1) || not_found_rc=$?
+[ "$not_found_rc" -eq 0 ] || fail "NotFound with confirmed absence must complete: $not_found_out"
+assert_contains "$not_found_out" 'clusterrolebinding/agent-os-firstmate-portable-agent-os absent' \
+  "NotFound reconciliation must emit confirmed absence evidence"
+pass "delete NotFound races reconcile confirmed absence"
+
+: > "$CALLS"
+replacement_delete_out=''
+replacement_delete_rc=0
+replacement_delete_out=$(AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_WORKLOAD_STATE=pending \
+  AGENT_OS_TEST_CLUSTER_RBAC_STATE=owned AGENT_OS_TEST_DELETE_READBACK_STATE=replacement \
+  AGENT_OS_TEST_FAIL_DELETE_TARGET=clusterrolebindings/agent-os-firstmate-portable-agent-os \
+  AGENT_OS_TEST_DELETE_ERROR='transport timeout' \
+  run_generic cleanup-cluster-rbac --yes 2>&1) || replacement_delete_rc=$?
+[ "$replacement_delete_rc" -eq 1 ] || \
+  fail "ambiguous delete with replacement must remain incomplete: $replacement_delete_out"
+assert_contains "$replacement_delete_out" 'replacement uid=uid-clusterrolebinding-replacement retained' \
+  "ambiguous delete reconciliation must report and retain a replacement UID"
+pass "ambiguous deletes retain same-name replacements"
 
 : > "$CALLS"
 active_cleanup_rc=0
@@ -1211,6 +1303,42 @@ grep -Fq 'akua render --no-agent-mode' "$CALLS" || \
 assert_grep 'get controllerrevisions.apps -o json' "$CALLS" \
   "rollback must resolve the exact-owned revision history"
 pass "generic rollback applies a revision-derived StatefulSet CAS update"
+
+: > "$CALLS"
+rollback_failure_out=''
+rollback_failure_rc=0
+rollback_failure_out=$(AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_RESOURCE_STATE=owned \
+  AGENT_OS_TEST_WORKLOAD_STATE=namespace AGENT_OS_TEST_PRIMARY_POD_STATE=owned \
+  AGENT_OS_TEST_FAIL_ROLLOUT=1 run_generic rollback 2>&1) || rollback_failure_rc=$?
+[ "$rollback_failure_rc" -eq 3 ] || fail "failed rollback rollout must exit incomplete: $rollback_failure_out"
+assert_contains "$rollback_failure_out" 'rollback target=agent-os-firstmate-previous revision=1' \
+  "rollback failure must preserve its selected revision"
+assert_contains "$rollback_failure_out" 'current-revision=agent-os-firstmate-previous update-revision=agent-os-firstmate-current' \
+  "rollback failure must report observed revision state"
+assert_contains "$rollback_failure_out" 'Pod/agent-os-firstmate-0 uid=uid-pod' \
+  "rollback failure must report Pod UID and readiness evidence"
+assert_contains "$rollback_failure_out" 'lifecycle-lease=agent-os-firstmate-lifecycle uid=uid-primary-lock holder=operation-test' \
+  "rollback failure must preserve exact lifecycle Lease evidence"
+assert_contains "$rollback_failure_out" 'safe recovery:' \
+  "rollback failure must print an exact non-reversing recovery command"
+pass "failed rollback rollout preserves recovery evidence"
+
+: > "$CALLS"
+rollback_resume_out=''
+rollback_resume_rc=0
+rollback_resume_out=$(AGENT_OS_TEST_NAMESPACE_STATE=owned AGENT_OS_TEST_RESOURCE_STATE=owned \
+  AGENT_OS_TEST_WORKLOAD_STATE=namespace AGENT_OS_TEST_PRIMARY_POD_STATE=owned \
+  AGENT_OS_TEST_ROLLBACK_CURRENT=agent-os-firstmate-current \
+  AGENT_OS_TEST_ROLLBACK_UPDATE=agent-os-firstmate-previous \
+  AGENT_OS_TEST_FAIL_ROLLOUT=1 run_generic rollback 2>&1) || rollback_resume_rc=$?
+[ "$rollback_resume_rc" -eq 3 ] || fail "in-progress rollback retry must remain incomplete: $rollback_resume_out"
+assert_no_grep 'patch StatefulSet agent-os-firstmate' "$CALLS" \
+  "in-progress rollback retry must not reverse the selected target"
+assert_contains "$rollback_resume_out" 'rollback target=agent-os-firstmate-previous revision=1' \
+  "in-progress rollback retry must preserve the lower selected revision"
+assert_contains "$rollback_resume_out" "do not invoke rollback again while revisions differ" \
+  "in-progress rollback retry must provide non-reversing recovery guidance"
+pass "rollback retry resumes an existing lower-revision target"
 
 : > "$CALLS"
 foreign_rollback_rc=0
