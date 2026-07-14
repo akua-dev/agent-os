@@ -307,12 +307,12 @@ reconcile_deleted_resource() {
   local deadline=${10} request_seconds current current_uid current_rv elapsed
   request_seconds=$(operation_request_seconds "$deadline") || {
     elapsed=$(($(date -u '+%s') - started))
-    bounded_delete_failure "$kind/$name" "$phase" "$class" "$timeout" "$elapsed" "$uid"
+    bounded_delete_failure "$kind/$name" "$phase" "$class" "$timeout" "$elapsed" "$uid" "$deadline"
     return $?
   }
   if ! current=$(live_resource_record "$scope" "$kind" "$name" "${request_seconds}s"); then
     elapsed=$(($(date -u '+%s') - started))
-    bounded_delete_failure "$kind/$name" reconcile transport "$timeout" "$elapsed" "$uid"
+    bounded_delete_failure "$kind/$name" reconcile transport "$timeout" "$elapsed" "$uid" "$deadline"
     return $?
   fi
   if [ -z "$current" ]; then
@@ -324,11 +324,11 @@ reconcile_deleted_resource() {
   elapsed=$(($(date -u '+%s') - started))
   if [ "$current_uid" != "$uid" ]; then
     echo "error: $kind/$name replacement uid=${current_uid:-unknown} retained after ambiguous delete of captured uid=$uid resourceVersion=$rv" >&2
-    bounded_delete_failure "$kind/$name" reconcile replacement "$timeout" "$elapsed" "$uid"
+    bounded_delete_failure "$kind/$name" reconcile replacement "$timeout" "$elapsed" "$uid" "$deadline"
     return $?
   fi
   echo "error: $kind/$name captured uid=$uid remains at resourceVersion=${current_rv:-unknown} after delete-$phase failure=$class" >&2
-  bounded_delete_failure "$kind/$name" "$phase" "$class" "$timeout" "$elapsed" "$uid"
+  bounded_delete_failure "$kind/$name" "$phase" "$class" "$timeout" "$elapsed" "$uid" "$deadline"
 }
 
 resource_api_path() {
@@ -349,7 +349,16 @@ resource_api_path() {
 
 delete_owned_resource() {
   local scope=$1 kind=$2 name=$3 timeout=$4 record expected uid rv path output started deadline class request_seconds remaining reserve wait_budget
-  record=$(live_resource_record "$scope" "$kind" "$name")
+  started=$(date -u '+%s')
+  deadline=$((started + timeout))
+  request_seconds=$(operation_request_seconds "$deadline") || {
+    bounded_delete_failure "$kind/$name" observe timeout "$timeout" 0 unknown "$deadline"
+    return $?
+  }
+  if ! record=$(live_resource_record "$scope" "$kind" "$name" "${request_seconds}s"); then
+    bounded_delete_failure "$kind/$name" observe transport "$timeout" 0 unknown "$deadline"
+    return $?
+  fi
   [ -n "$record" ] || return 0
   expected="$name"$'\t'"agent-os"$'\t'"$INSTALLATION_ID"
   if [ "$(printf '%s' "$record" | cut -f1-3)" != "$expected" ]; then
@@ -360,10 +369,8 @@ delete_owned_resource() {
   rv=$(printf '%s' "$record" | cut -f5)
   [ -n "$uid" ] && [ -n "$rv" ] || { echo "error: $kind '$name' lacks deletion preconditions" >&2; exit 2; }
   path=$(resource_api_path "$scope" "$kind" "$name")
-  started=$(date -u '+%s')
-  deadline=$((started + timeout))
   request_seconds=$(operation_request_seconds "$deadline") || {
-    bounded_delete_failure "$kind/$name" request timeout "$timeout" 0 "$uid"
+    bounded_delete_failure "$kind/$name" request timeout "$timeout" 0 "$uid" "$deadline"
     return $?
   }
   if ! output=$(printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s","resourceVersion":"%s"}}\n' "$uid" "$rv" | \
@@ -454,22 +461,23 @@ delete_namespace_rbac() {
 }
 
 resource_observation() {
-  local scope=$1 kind=$2 name=$3
+  local scope=$1 kind=$2 name=$3 request_timeout=${4:-} request_args=()
+  [ -z "$request_timeout" ] || request_args=(--request-timeout="$request_timeout")
   if [ "$kind" = StatefulSet ]; then
-    "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get "$kind" "$name" --ignore-not-found \
+    "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" "${request_args[@]}" get "$kind" "$name" --ignore-not-found \
       -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.uid}{"\t"}{.metadata.labels.agent-os\.dev/operation-id}{"\t"}{"\t"}{.metadata.finalizers}{"\t"}{.spec.replicas}{"\t"}{.status.currentReplicas}{"\t"}{.status.readyReplicas}{"\t"}{.status.updatedReplicas}{"\t"}{.status.availableReplicas}{"\t"}{.status.currentRevision}{"\t"}{.status.updateRevision}{"\t"}{.metadata.generation}{"\t"}{.status.observedGeneration}'
     return
   fi
   if [ "$kind" = Pod ]; then
-    "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get "$kind" "$name" --ignore-not-found \
+    "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" "${request_args[@]}" get "$kind" "$name" --ignore-not-found \
       -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.uid}{"\t"}{.metadata.labels.agent-os\.dev/operation-id}{"\t"}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\t"}{.metadata.finalizers}{"\t"}{range .status.containerStatuses[*]}{.name}{"="}{.state.waiting.reason}{.state.terminated.reason}{","}{end}'
     return
   fi
   if [ "$scope" = cluster ]; then
-    "$KUBECTL" --context "$CONTEXT" get "$kind" "$name" --ignore-not-found \
+    "$KUBECTL" --context "$CONTEXT" "${request_args[@]}" get "$kind" "$name" --ignore-not-found \
       -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.uid}{"\t"}{.metadata.labels.agent-os\.dev/operation-id}{"\t"}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\t"}{.metadata.finalizers}'
   else
-    "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get "$kind" "$name" --ignore-not-found \
+    "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" "${request_args[@]}" get "$kind" "$name" --ignore-not-found \
       -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.uid}{"\t"}{.metadata.labels.agent-os\.dev/operation-id}{"\t"}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\t"}{.metadata.finalizers}'
   fi
 }
@@ -510,16 +518,23 @@ report_partial_observation() {
 }
 
 report_rollback_failure() {
-  local target_name=$1 target_revision=$2 state references lease deadline
-  echo "incomplete: rollback target=$target_name revision=$target_revision did not complete" >&2
-  if state=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" get statefulset agent-os-firstmate -o json 2>/dev/null) && \
+  local target_name=$1 target_revision=$2 target_uid=$3 target_digest=$4 checkpoint_operation=$5 checkpoint_name=$6 checkpoint_uid=$7
+  local state references lease deadline record
+  echo "incomplete: rollback target=$target_name revision=$target_revision target-uid=$target_uid target-digest=$target_digest checkpoint-operation=$checkpoint_operation checkpoint-target=$checkpoint_name checkpoint-uid=$checkpoint_uid did not complete" >&2
+  deadline=$(lock_default_deadline)
+  if state=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get statefulset agent-os-firstmate -o json 2>/dev/null) && \
     references=$(printf '%s' "$state" | jq -er '[.status.currentRevision, .status.updateRevision] | select(all(.[]; type == "string" and length > 0)) | @tsv' 2>/dev/null); then
     echo "rollback observed: current-revision=$(printf '%s' "$references" | cut -f1) update-revision=$(printf '%s' "$references" | cut -f2)" >&2
   else
     echo "rollback observed: StatefulSet revision evidence unavailable" >&2
   fi
-  report_partial_observation Pod agent-os-firstmate-0 namespaced
-  deadline=$(lock_default_deadline)
+  if ! record=$(resource_observation namespaced Pod agent-os-firstmate-0 "${RESOURCE_REQUEST_CEILING_SECONDS}s" 2>/dev/null); then
+    echo "partial apply: Pod/agent-os-firstmate-0 observation=unavailable expected-operation=$OPERATION_ID" >&2
+  elif [ -n "$record" ]; then
+    echo "partial apply: Pod/agent-os-firstmate-0 uid=$(printf '%s' "$record" | cut -f4) operation=$(printf '%s' "$record" | cut -f5) ready=$(printf '%s' "$record" | cut -f6) ownership=$(printf '%s' "$record" | cut -f2) installation=$(printf '%s' "$record" | cut -f3) finalizers=$(printf '%s' "$record" | cut -f7)" >&2
+  else
+    echo "partial apply: Pod/agent-os-firstmate-0 observed=absent expected-operation=$OPERATION_ID" >&2
+  fi
   if lease=$(lock_record "$deadline" 2>/dev/null) && [ -n "$lease" ]; then
     echo "rollback retained: lifecycle-lease=$LOCK uid=$(printf '%s' "$lease" | cut -f9) holder=$(printf '%s' "$lease" | cut -f5)" >&2
   else
@@ -527,8 +542,46 @@ report_rollback_failure() {
   fi
   printf 'safe recovery: %q --context %q -n %q rollout status statefulset/agent-os-firstmate --timeout=180s\n' \
     "$KUBECTL" "$CONTEXT" "$NAMESPACE" >&2
-  echo "safe recovery condition: continue only while updateRevision remains '$target_name'; do not invoke rollback again while revisions differ" >&2
+  echo "safe recovery condition: rerun rollback only while the persisted target digest remains '$target_digest'" >&2
   return 3
+}
+
+sha256_text() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi
+}
+
+template_digest() {
+  jq -cS . | sha256_text
+}
+
+owned_revision_by_digest() {
+  local revisions=$1 workload_uid=$2 digest=$3 preferred_uid=${4:-} item item_digest candidate='' candidate_revision=-1 item_revision item_uid
+  while IFS= read -r item; do
+    [ -n "$item" ] || continue
+    item_digest=$(printf '%s' "$item" | jq -cS '.data.spec.template' | template_digest)
+    [ "$item_digest" = "$digest" ] || continue
+    item_uid=$(printf '%s' "$item" | jq -r '.metadata.uid // empty')
+    if [ -n "$preferred_uid" ] && [ "$item_uid" = "$preferred_uid" ]; then
+      printf '%s' "$item"
+      return 0
+    fi
+    item_revision=$(printf '%s' "$item" | jq -r '.revision // -1')
+    if [ "$item_revision" -gt "$candidate_revision" ] 2>/dev/null; then
+      candidate=$item
+      candidate_revision=$item_revision
+    fi
+  done < <(printf '%s' "$revisions" | jq -c --arg uid "$workload_uid" '
+    .items[]
+    | select(any(.metadata.ownerReferences[]?;
+        .apiVersion == "apps/v1" and .kind == "StatefulSet" and
+        .name == "agent-os-firstmate" and .uid == $uid and .controller == true))
+    ')
+  [ -n "$candidate" ] || return 1
+  printf '%s' "$candidate"
 }
 
 partial_install_is_applicable() {
@@ -784,8 +837,16 @@ uninstall_command() {
 }
 
 report_retained_observation() {
-  local kind=$1 name=$2 scope=$3 record managed installation uid operation ready finalizers identity expected details
-  if ! record=$(resource_observation "$scope" "$kind" "$name"); then
+  local kind=$1 name=$2 scope=$3 deadline=${4:-} record managed installation uid operation ready finalizers identity expected details request_seconds
+  if [ -n "$deadline" ]; then
+    request_seconds=$(operation_request_seconds "$deadline") || {
+      echo "retained-unverified: $kind/$name evidence deadline exhausted; no further deletion attempted" >&2
+      return 0
+    }
+  else
+    request_seconds=$RESOURCE_REQUEST_CEILING_SECONDS
+  fi
+  if ! record=$(resource_observation "$scope" "$kind" "$name" "${request_seconds}s"); then
     echo "retained-unverified: $kind/$name could not be inspected; no further deletion attempted" >&2
     return 0
   fi
@@ -814,16 +875,16 @@ report_retained_observation() {
 }
 
 report_retained_resources() {
-  local failed_target=$1 phase=$2 class=$3 timeout=$4 elapsed=$5 uid=$6 file kind name scope
+  local failed_target=$1 phase=$2 class=$3 timeout=$4 elapsed=$5 uid=$6 deadline=${7:-} file kind name scope
   echo "failed-target: $failed_target uid=$uid delete-${phase}-failure=$class timeout=${timeout}s elapsed=${elapsed}s" >&2
   kind=${failed_target%%/*}
   name=${failed_target#*/}
   scope=namespaced
   [ "$kind" != Namespace ] || scope=cluster
-  report_retained_observation "$kind" "$name" "$scope"
-  report_retained_observation Pod agent-os-firstmate-0 namespaced
-  report_retained_observation Role agent-os-firstmate-runtime namespaced
-  report_retained_observation RoleBinding agent-os-firstmate-runtime namespaced
+  report_retained_observation "$kind" "$name" "$scope" "$deadline"
+  report_retained_observation Pod agent-os-firstmate-0 namespaced "$deadline"
+  report_retained_observation Role agent-os-firstmate-runtime namespaced "$deadline"
+  report_retained_observation RoleBinding agent-os-firstmate-runtime namespaced "$deadline"
   while IFS= read -r file; do
     [ -n "$file" ] || continue
     kind=$(rendered_resource_field "$file" kind)
@@ -836,7 +897,7 @@ report_retained_resources() {
         ;;
       *) scope=namespaced ;;
     esac
-    report_retained_observation "$kind" "$name" "$scope"
+    report_retained_observation "$kind" "$name" "$scope" "$deadline"
   done < <(find "$OUT" -type f -name '*.yaml' -print)
   echo "safe retry: $(uninstall_command)" >&2
   echo "cluster cleanup if required: $(cleanup_command)" >&2
@@ -856,11 +917,11 @@ delete_failure_class() {
 
 bounded_delete_failure() {
   local target=$1 phase=${2:-wait} class=${3:-timeout} timeout=${4:-180}
-  local elapsed=${5:-$timeout} uid=${6:-unknown} prefix kind name scope
+  local elapsed=${5:-$timeout} uid=${6:-unknown} deadline=${7:-} prefix kind name scope
   [ "$COMMAND" = uninstall ] && prefix=incomplete || prefix=error
   echo "$prefix: delete-${phase}-failure=$class target=$target uid=$uid timeout=${timeout}s elapsed=${elapsed}s" >&2
   if [ "$COMMAND" = uninstall ]; then
-    report_retained_resources "$target" "$phase" "$class" "$timeout" "$elapsed" "$uid"
+    report_retained_resources "$target" "$phase" "$class" "$timeout" "$elapsed" "$uid" "$deadline"
     return 3
   fi
   kind=${target%%/*}
@@ -869,7 +930,7 @@ bounded_delete_failure() {
   case "$kind" in
     ClusterRoleBinding|Namespace) scope=cluster ;;
   esac
-  report_retained_observation "$kind" "$name" "$scope"
+  report_retained_observation "$kind" "$name" "$scope" "$deadline"
   if [ "$COMMAND" = cleanup-cluster-rbac ]; then
     echo "safe retry: $(cleanup_command)" >&2
   fi
@@ -1080,15 +1141,53 @@ case "$COMMAND" in
         | select(.metadata.uid == $uid and .metadata.resourceVersion == $rv)
         | select(.metadata.labels["app.kubernetes.io/managed-by"] == "agent-os")
         | select(.metadata.annotations["agent-os.dev/installation-id"] == $installation)
-        | [.status.currentRevision, .status.updateRevision]
-        | select(all(.[]; type == "string" and length > 0))
+        | [.status.currentRevision, .status.updateRevision,
+           (.metadata.annotations["agent-os.dev/rollback-operation"] // ""),
+           (.metadata.annotations["agent-os.dev/rollback-target-name"] // ""),
+           (.metadata.annotations["agent-os.dev/rollback-target-uid"] // ""),
+           (.metadata.annotations["agent-os.dev/rollback-target-digest"] // "")]
+        | select((.[0:2]) | all(.[]; type == "string" and length > 0))
         | @tsv
       ') || { echo "error: StatefulSet changed before rollback revision resolution" >&2; exit 3; }
     rollback_current_revision=$(printf '%s' "$rollback_references" | cut -f1)
     rollback_update_revision=$(printf '%s' "$rollback_references" | cut -f2)
-    rollback_selection=$(printf '%s' "$rollback_revisions" | jq -ce \
-      --arg current "$rollback_current_revision" --arg update "$rollback_update_revision" \
-      --arg uid "$rollback_uid" --arg rv "$rollback_rv" '
+    rollback_checkpoint_operation=$(printf '%s' "$rollback_references" | cut -f3)
+    rollback_checkpoint_name=$(printf '%s' "$rollback_references" | cut -f4)
+    rollback_checkpoint_uid=$(printf '%s' "$rollback_references" | cut -f5)
+    rollback_checkpoint_digest=$(printf '%s' "$rollback_references" | cut -f6)
+    if [ -n "$rollback_checkpoint_operation$rollback_checkpoint_name$rollback_checkpoint_uid$rollback_checkpoint_digest" ]; then
+      if [ -z "$rollback_checkpoint_operation" ] || [ -z "$rollback_checkpoint_name" ] || \
+        [ -z "$rollback_checkpoint_uid" ] || ! [[ "$rollback_checkpoint_digest" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "error: rollback checkpoint is incomplete or malformed; retained" >&2
+        exit 3
+      fi
+      rollback_target=$(printf '%s' "$rollback_revisions" | jq -ce --arg name "$rollback_update_revision" --arg uid "$rollback_uid" '
+        [.items[] | select(.metadata.name == $name) | select(any(.metadata.ownerReferences[]?;
+          .apiVersion == "apps/v1" and .kind == "StatefulSet" and .name == "agent-os-firstmate" and .uid == $uid and .controller == true))]
+        | select(length == 1) | .[0]' 2>/dev/null) || rollback_target=''
+      if [ -n "$rollback_target" ]; then
+        rollback_update_digest=$(printf '%s' "$rollback_target" | jq -cS '.data.spec.template' | template_digest)
+        [ "$rollback_update_digest" = "$rollback_checkpoint_digest" ] || rollback_target=''
+      fi
+      if [ -z "$rollback_target" ]; then
+        rollback_target=$(owned_revision_by_digest "$rollback_revisions" "$rollback_uid" \
+          "$rollback_checkpoint_digest" "$rollback_checkpoint_uid") || {
+          echo "error: rollback checkpoint target content is unavailable; retained" >&2
+          exit 3
+        }
+      fi
+      rollback_target_name=$(printf '%s' "$rollback_target" | jq -r '.metadata.name')
+      rollback_target_uid=$(printf '%s' "$rollback_target" | jq -r '.metadata.uid')
+      rollback_target_revision=$(printf '%s' "$rollback_target" | jq -r '.revision')
+      rollback_target_digest=$rollback_checkpoint_digest
+      rollback_mode='patch'
+      if [ "$rollback_update_revision" = "$rollback_target_name" ]; then
+        rollback_mode=resume
+      fi
+    else
+      rollback_selection=$(printf '%s' "$rollback_revisions" | jq -ce \
+        --arg current "$rollback_current_revision" --arg update "$rollback_update_revision" \
+        --arg uid "$rollback_uid" '
         def owned:
           any(.metadata.ownerReferences[]?;
             .apiVersion == "apps/v1" and .kind == "StatefulSet" and
@@ -1102,22 +1201,48 @@ case "$COMMAND" in
         | $update_items[0] as $update_revision
         | select($current_revision.revision | type == "number")
         | select($update_revision.revision | type == "number")
-        | (if $current != $update and $update_revision.revision < $current_revision.revision then
-             {mode:"resume", target:$update_revision}
-           elif $current != $update then
-             {mode:"patch", target:$current_revision}
+        | (if $current != $update then
+             {target:$current_revision}
            else
-             {mode:"patch", target:($owned | map(select((.revision | type) == "number" and .revision < $update_revision.revision)) | sort_by(.revision) | last)}
+             {target:($owned | map(select((.revision | type) == "number" and .revision < $update_revision.revision)) | sort_by(.revision) | last)}
            end) as $selection
-        | select($selection.target != null and ($selection.target.data | type) == "object")
-        | {mode:$selection.mode, targetName:$selection.target.metadata.name, targetRevision:$selection.target.revision,
-           patch:($selection.target.data * {metadata:{uid:$uid,resourceVersion:$rv}})}
+        | select($selection.target != null and ($selection.target.data.spec.template | type) == "object")
+        | $selection.target
       ') || { echo "error: no exact-owned previous ControllerRevision is available for rollback" >&2; exit 2; }
-    rollback_mode=$(printf '%s' "$rollback_selection" | jq -r '.mode')
-    rollback_target_name=$(printf '%s' "$rollback_selection" | jq -r '.targetName')
-    rollback_target_revision=$(printf '%s' "$rollback_selection" | jq -r '.targetRevision')
-    rollback_patch=$(printf '%s' "$rollback_selection" | jq -c '.patch')
+      rollback_target_name=$(printf '%s' "$rollback_selection" | jq -r '.metadata.name')
+      rollback_target_uid=$(printf '%s' "$rollback_selection" | jq -r '.metadata.uid')
+      rollback_target_revision=$(printf '%s' "$rollback_selection" | jq -r '.revision')
+      rollback_target_digest=$(printf '%s' "$rollback_selection" | jq -cS '.data.spec.template' | template_digest)
+      rollback_target=$rollback_selection
+      rollback_checkpoint_operation=$OPERATION_ID
+      rollback_checkpoint_name=$rollback_target_name
+      rollback_checkpoint_uid=$rollback_target_uid
+      rollback_checkpoint_patch=$(jq -cn \
+        --arg uid "$rollback_uid" --arg rv "$rollback_rv" --arg operation "$rollback_checkpoint_operation" \
+        --arg name "$rollback_target_name" --arg targetUid "$rollback_target_uid" --arg digest "$rollback_target_digest" \
+        '{metadata:{uid:$uid,resourceVersion:$rv,annotations:{"agent-os.dev/rollback-operation":$operation,"agent-os.dev/rollback-target-name":$name,"agent-os.dev/rollback-target-uid":$targetUid,"agent-os.dev/rollback-target-digest":$digest}}}')
+      if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" patch StatefulSet agent-os-firstmate \
+        --type=merge -p "$rollback_checkpoint_patch" >/dev/null; then
+        echo "error: rollback checkpoint CAS conflicted; no template mutation attempted" >&2
+        exit 3
+      fi
+      rollback_mode='patch'
+      rollback_state=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" \
+        --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get statefulset agent-os-firstmate -o json)
+      rollback_rv=$(printf '%s' "$rollback_state" | jq -er \
+        --arg uid "$rollback_uid" --arg operation "$rollback_checkpoint_operation" \
+        --arg name "$rollback_checkpoint_name" --arg targetUid "$rollback_checkpoint_uid" \
+        --arg digest "$rollback_target_digest" '
+        select(.metadata.uid == $uid)
+        | select(.metadata.annotations["agent-os.dev/rollback-operation"] == $operation)
+        | select(.metadata.annotations["agent-os.dev/rollback-target-name"] == $name)
+        | select(.metadata.annotations["agent-os.dev/rollback-target-uid"] == $targetUid)
+        | select(.metadata.annotations["agent-os.dev/rollback-target-digest"] == $digest)
+        | .metadata.resourceVersion') || { echo "error: rollback checkpoint did not persist exactly" >&2; exit 3; }
+    fi
     if [ "$rollback_mode" = patch ]; then
+      rollback_patch=$(printf '%s' "$rollback_target" | jq -c --arg uid "$rollback_uid" --arg rv "$rollback_rv" \
+        '.data * {metadata:{uid:$uid,resourceVersion:$rv}}')
       if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" patch StatefulSet agent-os-firstmate \
         --type=strategic -p "$rollback_patch" >/dev/null; then
         echo "error: StatefulSet rollback CAS conflicted; no rollout-undo fallback attempted" >&2
@@ -1131,7 +1256,54 @@ case "$COMMAND" in
       fi
     fi
     if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" rollout status statefulset/agent-os-firstmate --timeout=180s; then
-      report_rollback_failure "$rollback_target_name" "$rollback_target_revision"
+      report_rollback_failure "$rollback_target_name" "$rollback_target_revision" "$rollback_target_uid" "$rollback_target_digest" \
+        "$rollback_checkpoint_operation" "$rollback_checkpoint_name" "$rollback_checkpoint_uid"
+      exit 3
+    fi
+    rollback_verify_state=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" \
+      --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get statefulset agent-os-firstmate -o json) || {
+      echo "error: rollback verification StatefulSet evidence unavailable; checkpoint retained target-digest=$rollback_target_digest" >&2
+      exit 3
+    }
+    rollback_verify_refs=$(printf '%s' "$rollback_verify_state" | jq -er \
+      --arg uid "$rollback_uid" --arg installation "$INSTALLATION_ID" \
+      --arg operation "$rollback_checkpoint_operation" --arg name "$rollback_checkpoint_name" \
+      --arg targetUid "$rollback_checkpoint_uid" --arg digest "$rollback_target_digest" '
+      select(.metadata.uid == $uid)
+      | select(.metadata.labels["app.kubernetes.io/managed-by"] == "agent-os")
+      | select(.metadata.annotations["agent-os.dev/installation-id"] == $installation)
+      | select(.metadata.annotations["agent-os.dev/rollback-operation"] == $operation)
+      | select(.metadata.annotations["agent-os.dev/rollback-target-name"] == $name)
+      | select(.metadata.annotations["agent-os.dev/rollback-target-uid"] == $targetUid)
+      | select(.metadata.annotations["agent-os.dev/rollback-target-digest"] == $digest)
+      | [.status.currentRevision,.status.updateRevision,.metadata.resourceVersion] | @tsv') || {
+      echo "error: rollback verification mismatch: StatefulSet identity or checkpoint changed; retained target-digest=$rollback_target_digest" >&2
+      exit 3
+    }
+    rollback_revisions=$("$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" \
+      --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" get controllerrevisions.apps -o json) || {
+      echo "error: rollback verification revision evidence unavailable; checkpoint retained target-digest=$rollback_target_digest" >&2
+      exit 3
+    }
+    for rollback_verify_name in "$(printf '%s' "$rollback_verify_refs" | cut -f1)" "$(printf '%s' "$rollback_verify_refs" | cut -f2)"; do
+      rollback_verify_revision=$(printf '%s' "$rollback_revisions" | jq -ce --arg name "$rollback_verify_name" --arg uid "$rollback_uid" '
+        [.items[] | select(.metadata.name == $name) | select(any(.metadata.ownerReferences[]?;
+          .apiVersion == "apps/v1" and .kind == "StatefulSet" and .name == "agent-os-firstmate" and .uid == $uid and .controller == true))]
+        | select(length == 1) | .[0]') || {
+        echo "error: rollback verification mismatch: revision '$rollback_verify_name' is unavailable or foreign; retained target-digest=$rollback_target_digest" >&2
+        exit 3
+      }
+      rollback_verify_digest=$(printf '%s' "$rollback_verify_revision" | jq -cS '.data.spec.template' | template_digest)
+      if [ "$rollback_verify_digest" != "$rollback_target_digest" ]; then
+        echo "error: rollback verification mismatch: revision '$rollback_verify_name' content differs; retained target-digest=$rollback_target_digest" >&2
+        exit 3
+      fi
+    done
+    rollback_clear_patch=$(jq -cn --arg uid "$rollback_uid" --arg rv "$(printf '%s' "$rollback_verify_refs" | cut -f3)" \
+      '{metadata:{uid:$uid,resourceVersion:$rv,annotations:{"agent-os.dev/rollback-operation":null,"agent-os.dev/rollback-target-name":null,"agent-os.dev/rollback-target-uid":null,"agent-os.dev/rollback-target-digest":null}}}')
+    if ! "$KUBECTL" --context "$CONTEXT" -n "$NAMESPACE" patch StatefulSet agent-os-firstmate \
+      --type=merge -p "$rollback_clear_patch" >/dev/null; then
+      echo "error: rollback completed but checkpoint clear CAS conflicted; retained target-digest=$rollback_target_digest" >&2
       exit 3
     fi
     ;;

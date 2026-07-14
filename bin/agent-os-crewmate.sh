@@ -51,6 +51,9 @@ LOCK_CLOCK_SKEW_SECONDS=${AGENT_OS_LOCK_CLOCK_SKEW_SECONDS:-5}
 LOCK_ACQUIRE_SECONDS=${AGENT_OS_LOCK_ACQUIRE_SECONDS:-30}
 LOCK_REQUEST_CEILING_SECONDS=${AGENT_OS_LOCK_REQUEST_CEILING_SECONDS:-5}
 RESOURCE_REQUEST_CEILING_SECONDS=${AGENT_OS_RESOURCE_REQUEST_CEILING_SECONDS:-5}
+DELETE_OUTCOME=
+DELETE_CAPTURED_UID=
+DELETE_OBSERVED_UID=
 
 for seconds in "$LOCK_DURATION_SECONDS" "$LOCK_CLOCK_SKEW_SECONDS" "$LOCK_ACQUIRE_SECONDS" "$LOCK_REQUEST_CEILING_SECONDS" "$RESOURCE_REQUEST_CEILING_SECONDS"; do
   case "$seconds" in ''|*[!0-9]*) echo "error: lifecycle Lease timing must use whole seconds" >&2; exit 2 ;; esac
@@ -71,12 +74,22 @@ resource_identity() {
 }
 
 pod_record() {
-  kube get pod "$POD" --ignore-not-found \
+  local deadline=${1:-} request_args=()
+  if [ -n "$deadline" ]; then
+    request_seconds=$(resource_request_seconds "$deadline") || return 124
+    request_args=(--request-timeout="${request_seconds}s")
+  fi
+  kube "${request_args[@]}" get pod "$POD" --ignore-not-found \
     -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.labels.agent-os\.dev/operation-id}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}{"\t"}{range .spec.volumes[?(@.name=="home")]}{.persistentVolumeClaim.claimName}{end}'
 }
 
 pvc_record() {
-  kube get pvc "$PVC" --ignore-not-found \
+  local deadline=${1:-} request_args=()
+  if [ -n "$deadline" ]; then
+    request_seconds=$(resource_request_seconds "$deadline") || return 124
+    request_args=(--request-timeout="${request_seconds}s")
+  fi
+  kube "${request_args[@]}" get pvc "$PVC" --ignore-not-found \
     -o 'jsonpath={.metadata.name}{"\t"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\t"}{.metadata.labels.agent-os\.dev/crewmate}{"\t"}{.metadata.annotations.agent-os\.dev/installation-id}{"\t"}{.metadata.annotations.agent-os\.dev/checkpoint-state}{"\t"}{.metadata.annotations.agent-os\.dev/checkpoint-at}{"\t"}{.metadata.annotations.agent-os\.dev/quiesced-operation}{"\t"}{.metadata.annotations.agent-os\.dev/checkpoint-operation}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}'
 }
 
@@ -183,33 +196,123 @@ finish_lifecycle() {
 trap finish_lifecycle EXIT
 trap lock_renewal_failed TERM
 
+resource_request_seconds() {
+  local deadline=$1 remaining seconds
+  remaining=$((deadline - $(date -u '+%s')))
+  [ "$remaining" -gt 0 ] || return 1
+  seconds=$RESOURCE_REQUEST_CEILING_SECONDS
+  [ "$seconds" -le "$remaining" ] || seconds=$remaining
+  [ "$seconds" -gt 0 ] || return 1
+  printf '%s' "$seconds"
+}
+
+resource_mutation_seconds() {
+  local deadline=$1 remaining seconds
+  remaining=$((deadline - $(date -u '+%s') - 1))
+  [ "$remaining" -gt 0 ] || return 1
+  seconds=$RESOURCE_REQUEST_CEILING_SECONDS
+  [ "$seconds" -le "$remaining" ] || seconds=$remaining
+  [ "$seconds" -gt 0 ] || return 1
+  printf '%s' "$seconds"
+}
+
+delete_owned_crewmate_resource() {
+  local kind=$1 name=$2 expected_uid=${3:-} expected_rv=${4:-} expected_operation=${5:-}
+  local started deadline record identity uid rv path request_seconds current current_uid wait_seconds delete_ok=0
+  started=$(date -u '+%s')
+  deadline=$((started + 180))
+  DELETE_OUTCOME=unknown
+  DELETE_CAPTURED_UID=$expected_uid
+  DELETE_OBSERVED_UID=unavailable
+  case "$kind" in
+    pod) record=$(pod_record "$deadline") || { echo "error: pod/$name observation unavailable before bounded deletion captured uid=${expected_uid:-unknown}" >&2; return 3; } ;;
+    pvc) record=$(pvc_record "$deadline") || { echo "error: pvc/$name observation unavailable before bounded deletion captured uid=${expected_uid:-unknown}" >&2; return 3; } ;;
+    *) return 2 ;;
+  esac
+  if [ -z "$record" ]; then
+    DELETE_OUTCOME=absent
+    DELETE_OBSERVED_UID=absent
+    echo "confirmed absent: $kind/$name captured uid=${expected_uid:-absent}" >&2
+    return 0
+  fi
+  identity=$(printf '%s' "$record" | cut -f1-4)
+  if { [ "$kind" = pod ] && [ "$identity" != "$EXPECTED_POD" ]; } || \
+    { [ "$kind" = pvc ] && [ "$identity" != "$EXPECTED_PVC" ]; }; then
+    echo "error: $kind/$name ownership changed before deletion; retained" >&2
+    return 2
+  fi
+  if [ "$kind" = pod ]; then
+    [ -z "$expected_operation" ] || [ "$(printf '%s' "$record" | cut -f5)" = "$expected_operation" ] || {
+      echo "error: pod/$name replacement or ownership mismatch retained; operation identity changed before deletion" >&2
+      return 3
+    }
+    uid=$(printf '%s' "$record" | cut -f6)
+    rv=$(printf '%s' "$record" | cut -f7)
+    path="/api/v1/namespaces/$NAMESPACE/pods/$name"
+  else
+    uid=$(printf '%s' "$record" | cut -f9)
+    rv=$(printf '%s' "$record" | cut -f10)
+    path="/api/v1/namespaces/$NAMESPACE/persistentvolumeclaims/$name"
+  fi
+  DELETE_CAPTURED_UID=$uid
+  [ -n "$uid" ] && [ -n "$rv" ] || { echo "error: $kind/$name lacks deletion preconditions" >&2; return 2; }
+  if [ -n "$expected_uid" ] && [ "$uid" != "$expected_uid" ]; then
+    DELETE_OUTCOME=replacement-retained
+    DELETE_CAPTURED_UID=$expected_uid
+    DELETE_OBSERVED_UID=$uid
+    echo "error: $kind/$name replacement uid=$uid retained; captured uid=$expected_uid" >&2
+    return 3
+  fi
+  [ -z "$expected_rv" ] || [ "$rv" = "$expected_rv" ] || {
+    DELETE_OUTCOME=original-retained
+    DELETE_OBSERVED_UID=$uid
+    echo "error: $kind/$name resourceVersion changed before deletion; retained" >&2
+    return 3
+  }
+  request_seconds=$(resource_mutation_seconds "$deadline") || {
+    echo "error: $kind/$name deletion deadline left no reconciliation reserve; retained uid=$uid" >&2
+    return 3
+  }
+  if printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s","resourceVersion":"%s"}}\n' "$uid" "$rv" | \
+    kube --request-timeout="${request_seconds}s" delete --raw "$path" -f - >/dev/null; then
+    delete_ok=1
+  fi
+  if [ "$delete_ok" -eq 1 ]; then
+    wait_seconds=$(resource_mutation_seconds "$deadline") || wait_seconds=0
+    if [ "$wait_seconds" -gt 0 ]; then
+      kube --request-timeout="${wait_seconds}s" wait --for=delete "$kind/$name" --timeout="${wait_seconds}s" >/dev/null 2>&1 || true
+    fi
+  fi
+  case "$kind" in
+    pod) current=$(pod_record "$deadline") || { echo "error: pod/$name deletion result unavailable; captured uid=$uid retained-state=unknown" >&2; return 3; } ;;
+    pvc) current=$(pvc_record "$deadline") || { echo "error: pvc/$name deletion result unavailable; captured uid=$uid retained-state=unknown" >&2; return 3; } ;;
+  esac
+  if [ -z "$current" ]; then
+    DELETE_OUTCOME=absent
+    DELETE_OBSERVED_UID=absent
+    echo "confirmed absent: $kind/$name captured uid=$uid" >&2
+    return 0
+  fi
+  if [ "$kind" = pod ]; then
+    current_uid=$(printf '%s' "$current" | cut -f6)
+  else
+    current_uid=$(printf '%s' "$current" | cut -f9)
+  fi
+  DELETE_OBSERVED_UID=$current_uid
+  if [ "$current_uid" != "$uid" ]; then
+    DELETE_OUTCOME=replacement-retained
+    echo "error: $kind/$name replacement uid=$current_uid retained; captured uid=$uid" >&2
+    return 3
+  fi
+  DELETE_OUTCOME=original-retained
+  echo "error: $kind/$name original uid=$uid remains after bounded deletion; retained" >&2
+  return 3
+}
+
 cleanup_new_owned_pod() {
-  local expected_uid=${1:-} after current identity after_operation after_uid
-  after=$(pod_record)
-  if [ -z "$after" ]; then
-    echo "partial state: crewmate create left no Pod; persistent home retained" >&2
-    return
-  fi
-  identity=$(printf '%s' "$after" | cut -f1-4)
-  after_operation=$(printf '%s' "$after" | cut -f5)
-  after_uid=$(printf '%s' "$after" | cut -f6)
-  if [ "$identity" != "$EXPECTED_POD" ] || [ "$after_operation" != "$OPERATION_ID" ] || \
-    [ -z "$after_uid" ] || { [ -n "$expected_uid" ] && [ "$after_uid" != "$expected_uid" ]; }; then
-    echo "partial state: replacement or ownership mismatch retained; persistent home retained" >&2
-    return
-  fi
-  current=$(pod_record)
-  if [ "$current" != "$after" ]; then
-    echo "partial state: Pod identity changed during cleanup; no Pod deleted and persistent home retained" >&2
-    return
-  fi
-  echo "partial state: removing newly created owned Pod '$POD' uid=$after_uid; persistent home retained" >&2
-  if ! printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s"}}\n' "$after_uid" | \
-    kube --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" delete --raw "/api/v1/namespaces/$NAMESPACE/pods/$POD" -f -; then
-    echo "partial state: UID-precondition rejected; replacement or ownership mismatch retained" >&2
-    return
-  fi
-  kube wait --for=delete "pod/$POD" --timeout=180s
+  local expected_uid=${1:-}
+  echo "partial state: reconciling newly created owned Pod '$POD' uid=${expected_uid:-observed}; persistent home retained" >&2
+  delete_owned_crewmate_resource pod "$POD" "$expected_uid" '' "$OPERATION_ID" || true
 }
 
 create_and_wait() {
@@ -329,24 +432,7 @@ preflight_existing_home() {
 }
 
 stop_owned_pod() {
-  local pod uid rv
-  pod=$(pod_record)
-  if [ -z "$pod" ]; then
-    return
-  fi
-  if [ "$(printf '%s' "$pod" | cut -f1-4)" != "$EXPECTED_POD" ]; then
-    echo "error: pod '$POD' does not have the exact crewmate installation identity" >&2
-    exit 2
-  fi
-  uid=$(printf '%s' "$pod" | cut -f6)
-  rv=$(printf '%s' "$pod" | cut -f7)
-  if [ -z "$uid" ] || [ -z "$rv" ]; then
-    echo "error: Pod deletion requires exact UID and resourceVersion evidence" >&2
-    exit 2
-  fi
-  printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s"}}\n' "$uid" | \
-    kube --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" delete --raw "/api/v1/namespaces/$NAMESPACE/pods/$POD" -f -
-  kube wait --for=delete "pod/$POD" --timeout=180s
+  delete_owned_crewmate_resource pod "$POD"
 }
 
 invalidate_checkpoint_evidence() {
@@ -397,10 +483,10 @@ quiesce_owned_home() {
 }
 
 record_purge() {
-  local phase=$1 checkpoint_at=$2 timestamp
+  local phase=$1 checkpoint_at=$2 outcome=${3:-requested} captured_uid=${4:-unknown} observed_uid=${5:-unknown} timestamp
   timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-  printf '%s\t%s\tnamespace=%s\tcrewmate=%s\tpod=%s\tpvc=%s\tcheckpoint-at=%s\n' \
-    "$timestamp" "$phase" "$NAMESPACE" "$ID" "$POD" "$PVC" "$checkpoint_at" >&3
+  printf '%s\t%s\tnamespace=%s\tcrewmate=%s\tpod=%s\tpvc=%s\tcheckpoint-at=%s\toutcome=%s\tcaptured-uid=%s\tobserved-uid=%s\n' \
+    "$timestamp" "$phase" "$NAMESPACE" "$ID" "$POD" "$PVC" "$checkpoint_at" "$outcome" "$captured_uid" "$observed_uid" >&3
 }
 
 case "$COMMAND" in
@@ -521,12 +607,14 @@ case "$COMMAND" in
     fi
     mkdir -p "$(dirname "$evidence_file")"
     exec 3>>"$evidence_file"
-    record_purge purge-requested "$checkpoint_at"
-    printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s","resourceVersion":"%s"}}\n' \
-      "$pvc_uid" "$pvc_rv" | \
-      kube --request-timeout="${RESOURCE_REQUEST_CEILING_SECONDS}s" delete --raw "/api/v1/namespaces/$NAMESPACE/persistentvolumeclaims/$PVC" -f -
-    kube wait --for=delete "pvc/$PVC" --timeout=180s
-    record_purge purge-complete "$checkpoint_at"
+    record_purge purge-requested "$checkpoint_at" requested "$pvc_uid" pending
+    if delete_owned_crewmate_resource pvc "$PVC" "$pvc_uid" "$pvc_rv"; then
+      record_purge purge-complete "$checkpoint_at" "$DELETE_OUTCOME" "$DELETE_CAPTURED_UID" "$DELETE_OBSERVED_UID"
+    else
+      purge_status=$?
+      record_purge "purge-incomplete-$DELETE_OUTCOME" "$checkpoint_at" "$DELETE_OUTCOME" "$DELETE_CAPTURED_UID" "$DELETE_OBSERVED_UID"
+      exit "$purge_status"
+    fi
     ;;
   delete)
     echo "error: delete is ambiguous; use stop to preserve the home or purge <crewmate-id> --yes" >&2
