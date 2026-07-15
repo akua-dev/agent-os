@@ -209,12 +209,6 @@ hash_file_for_test() {
   fi
 }
 
-install_pi_turnend_extension_fixture() {
-  local root=$1
-  mkdir -p "$root/.pi/extensions"
-  cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$root/.pi/extensions/fm-primary-turnend-guard.ts"
-}
-
 install_pi_watch_extension_fixture() {
   local root=$1
   mkdir -p "$root/.pi/extensions"
@@ -227,16 +221,9 @@ write_pi_watch_loaded_marker() {
   printf '%s\n%s\n' "$version" "$pid" > "$home/state/.pi-watch-extension-loaded"
 }
 
-write_pi_turnend_loaded_marker() {
-  local home=$1 root=$2 pid=$3 version
-  version=$(hash_file_for_test "$root/.pi/extensions/fm-primary-turnend-guard.ts")
-  printf '%s\n%s\n' "$version" "$pid" > "$home/state/.pi-turnend-extension-loaded"
-}
-
 write_pi_loaded_markers() {
   local home=$1 root=$2 pid=$3
   write_pi_watch_loaded_marker "$home" "$root" "$pid"
-  write_pi_turnend_loaded_marker "$home" "$root" "$pid"
 }
 
 # --- context digest: absent vs empty vs present -----------------------------
@@ -378,6 +365,46 @@ EOF
   [ "$missing_line" -lt "$fleet_line" ] || fail "actionable MISSING diagnostic was buried after the bulk fleet-state digest"
 
   pass "digest sections are ordered diagnostics-first, bulk-context-last"
+}
+
+test_herdr_backend_diagnostics_follow_real_session_start() {
+  local mode rec root home fakebin mask out
+  for mode in configured autodetected; do
+    rec=$(new_world "herdr-$mode")
+    IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+    make_fake_toolchain "$fakebin"
+    make_fake_ps_claude "$fakebin"
+    rm -f "$fakebin/tmux"
+    fm_fake_exit0 "$fakebin" herdr jq
+    printf '%s\n' manual > "$home/config/backlog-backend"
+    mask="$home/mask-tmux.bash"
+    cat > "$mask" <<'SH'
+command() {
+  if [ "${1:-}" = -v ] && [ "${2:-}" = tmux ]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+SH
+    if [ "$mode" = configured ]; then
+      printf '%s\n' herdr > "$home/config/backend"
+      out=$(TMUX='' HERDR_ENV='' BASH_ENV="$mask" run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+      assert_not_contains "$out" "NOTICE: auto-detected herdr runtime" \
+        "an explicit Herdr home should not be reported as auto-detected"
+    else
+      out=$(TMUX='' HERDR_ENV=1 BASH_ENV="$mask" run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+      assert_contains "$out" "NOTICE: auto-detected herdr runtime (HERDR_ENV=1)" \
+        "session start did not preserve the Herdr runtime auto-detection fallback"
+    fi
+    assert_contains "$out" "SESSION START - $home" "the real session-start path did not run in the throwaway home"
+    assert_not_contains "$out" "MISSING: tmux" "Herdr session start falsely required masked tmux"
+    assert_not_contains "$out" "MISSING: herdr" "Herdr session start missed its available session CLI"
+    assert_not_contains "$out" "MISSING: jq" "Herdr session start missed its available JSON dependency"
+    assert_not_contains "$out" "MISSING: treehouse" "Herdr session start missed its available worktree provider"
+  done
+  pass "session start: configured and auto-detected Herdr homes never require tmux"
 }
 
 # --- status tail bounding -----------------------------------------------------
@@ -585,7 +612,8 @@ EOF
   assert_contains "$out" "SUPERVISION OPERATING INSTRUCTIONS - primary harness: pi" "pi supervision block missing"
   assert_contains "$out" "Mode: Pi extension background wake." "pi snippet missing from session start"
   assert_contains "$out" "PI_WATCH_EXTENSION: not loaded" "pi extension load diagnostic missing"
-  assert_contains "$out" "restart plain pi so $root/.pi/extensions/fm-primary-turnend-guard.ts and $root/.pi/extensions/fm-primary-pi-watch.ts auto-load" "pi extension load diagnostic omits the turn-end guard extension"
+  assert_contains "$out" "restart Pi outside its composer with --approve -e '$root/.pi/extensions/fm-primary-pi-watch.ts'" "pi extension load diagnostic omits the quoted watcher extension"
+  assert_not_contains "$out" ".pi-turnend-extension-loaded" "pi extension diagnostic still requires the deleted turn-end marker"
 
   wake_line=$(printf '%s\n' "$out" | grep -n '^WAKE QUEUE$' | head -1 | cut -d: -f1)
   sup_line=$(printf '%s\n' "$out" | grep -n '^SUPERVISION OPERATING INSTRUCTIONS' | head -1 | cut -d: -f1)
@@ -607,11 +635,9 @@ EOF
   sleep 300 &
   holder_pid=$!
   make_fake_ps_pi_holder "$fakebin" "$holder_pid"
-  install_pi_turnend_extension_fixture "$root"
   install_pi_watch_extension_fixture "$root"
   marker="$home/state/.pi-watch-extension-loaded"
   printf 'stale-extension-version\n%s\n' "$holder_pid" > "$marker"
-  write_pi_turnend_loaded_marker "$home" "$root" "$holder_pid"
   touch -t 203001010000 "$marker" 2>/dev/null || touch "$marker"
 
   out=$(FM_FAKE_HARNESS=pi run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
@@ -634,7 +660,6 @@ EOF
   sleep 300 &
   holder_pid=$!
   make_fake_ps_pi_holder "$fakebin" "$holder_pid"
-  install_pi_turnend_extension_fixture "$root"
   install_pi_watch_extension_fixture "$root"
 
   write_pi_loaded_markers "$home" "$root" "$holder_pid"
@@ -648,31 +673,6 @@ EOF
   pass "session start accepts current Pi markers written before lock acquisition"
 }
 
-test_pi_diagnostic_rejects_missing_turnend_guard_marker() {
-  local rec root home fakebin out holder_pid
-  rec=$(new_world pi-missing-turnend-marker)
-  IFS='|' read -r root home fakebin <<EOF
-$rec
-EOF
-  make_fake_toolchain "$fakebin"
-
-  sleep 300 &
-  holder_pid=$!
-  make_fake_ps_pi_holder "$fakebin" "$holder_pid"
-  install_pi_turnend_extension_fixture "$root"
-  install_pi_watch_extension_fixture "$root"
-
-  write_pi_watch_loaded_marker "$home" "$root" "$holder_pid"
-
-  out=$(FM_FAKE_HARNESS=pi run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
-  kill "$holder_pid" 2>/dev/null || true
-  wait "$holder_pid" 2>/dev/null || true
-
-  assert_contains "$out" "PI_WATCH_EXTENSION: not loaded" "pi diagnostic trusted a session without the turn-end guard extension"
-
-  pass "session start rejects Pi sessions missing the turn-end guard marker"
-}
-
 test_pi_diagnostic_rejects_previous_session_loaded_marker() {
   local rec root home fakebin out marker version holder_pid
   rec=$(new_world pi-previous-session-loaded-marker)
@@ -684,12 +684,10 @@ EOF
   sleep 300 &
   holder_pid=$!
   make_fake_ps_pi_holder "$fakebin" "$holder_pid"
-  install_pi_turnend_extension_fixture "$root"
   install_pi_watch_extension_fixture "$root"
   marker="$home/state/.pi-watch-extension-loaded"
   version=$(hash_file_for_test "$root/.pi/extensions/fm-primary-pi-watch.ts")
   printf '%s\n999999\n' "$version" > "$marker"
-  write_pi_turnend_loaded_marker "$home" "$root" "$holder_pid"
 
   out=$(FM_FAKE_HARNESS=pi run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
   kill "$holder_pid" 2>/dev/null || true
@@ -703,6 +701,7 @@ EOF
 test_context_digest_absent_empty_present
 test_lock_refusal_read_only_path
 test_output_ordering_diagnostics_lead
+test_herdr_backend_diagnostics_follow_real_session_start
 test_status_tail_bounding
 test_orphan_status_logs_are_printed
 test_endpoint_liveness_tmux
@@ -714,5 +713,4 @@ test_next_step_afk_delegates_to_daemon
 test_supervision_block_exactly_one_and_pi_diagnostic
 test_pi_diagnostic_rejects_stale_loaded_marker
 test_pi_diagnostic_accepts_prelock_loaded_marker
-test_pi_diagnostic_rejects_missing_turnend_guard_marker
 test_pi_diagnostic_rejects_previous_session_loaded_marker

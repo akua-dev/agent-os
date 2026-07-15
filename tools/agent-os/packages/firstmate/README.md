@@ -14,6 +14,8 @@ akua render \
 ```
 
 Inspect the YAML before applying it with `kubectl`.
+The package has no credential input or automatic Secret mount.
+Grant runtime credentials separately through an explicitly reviewed Kubernetes Secret mapping on the target workload.
 The example digest is deliberately non-installable until the first public Agent OS image release exists.
 Replace it only with that release's published digest.
 

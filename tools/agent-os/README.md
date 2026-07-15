@@ -27,6 +27,6 @@ bun run src/cli.ts address inspect /k8s/in-cluster/namespace/agent-os/mate/task-
 
 The portable Agent OS package under `packages/firstmate/` renders the persistent Firstmate topology without an Akua account or credential.
 Mate creation uses its internal runtime template instead of a separately installable package.
-The scoped official `Effect-TS/skills` installation guides typed Effect workflows; its Effect source checkout is local and ignored rather than committed as a snapshot.
+The Effect source checkout is local and ignored rather than committed as a snapshot.
 
 See `AGENTS.md` in this directory for the tool-specific development rules.

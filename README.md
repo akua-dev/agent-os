@@ -42,15 +42,14 @@ This is how small teams build and operate entire companies with agents — the p
 firstmate is not a model, not a harness, not a skill, not an MCP server, and not a CLI.
 firstmate is an agent distro for running a crew of agents.
 An agent distro is a portable directory of instructions, skills, tooling, policies, and state conventions that turns a general-purpose agent into a specialized one.
-There is no app to install: the cloned repo is the distro - `AGENTS.md`, bundled firstmate skills, and helper scripts that any terminal coding agent can follow.
+For local terminal use, there is no separate app to install: the cloned repo is the distro - `AGENTS.md`, bundled firstmate skills, and helper scripts that any terminal coding agent can follow.
 Launching a supported harness inside it instantiates your first mate - and makes you the captain.
 
-This Agent OS fork also packages the distro for Kubernetes: one persistent
-first mate can allocate isolated, persistent crewmate containers using ordinary
-`kubectl`, while Herdr keeps every agent terminal visible. Follow the
-[Agent OS Kubernetes quickstart](docs/kubernetes.md) to render the one public
-package for any conformant cluster. OrbStack is a local test profile of that
-same package, not a separate installer.
+This Agent OS fork also packages the distro for Kubernetes.
+One persistent first mate can allocate isolated, persistent crewmate containers using ordinary `kubectl`, while Herdr keeps every agent terminal visible.
+Follow the [Agent OS Kubernetes quickstart](docs/kubernetes.md) to render the one public package for any conformant cluster.
+OrbStack is a local test profile of that same package, not a separate installer.
+`SOURCE_PROVENANCE.json` records the exact source inputs, licenses, merge order, and exclusions for this distro.
 
 Agent OS works on Kubernetes and is better with Akua.
 The portable core can be built and tested on local OrbStack without an Akua account, API key, managed control plane, or Akua-hosted worker, and is intended for any conformant Kubernetes cluster.
@@ -64,7 +63,7 @@ Akua adds the preferred credential-to-cluster bootstrap, managed capacity, ident
 - **Two task shapes** - ship tasks deliver a change; scout tasks investigate, plan, reproduce, or audit and leave a report.
 - **Explicit project modes** - each project ships via `no-mistakes`, `direct-PR`, or `local-only`, with an optional `+yolo` autonomy flag.
 - **Optional secondmates** - opt in to persistent domain supervisors that run from isolated firstmate homes with their own `FM_HOME`, state, projects, and session lock, supervising project clones or a project-less firstmate-repo domain, kept on the primary firstmate version by guarded local fast-forwards and checked for live agent processes at session start.
-- **Event-driven, zero-token supervision** - a bash watcher sleeps on the fleet and wakes the first mate only when something needs you; verified primary harnesses also get a turn-end backstop that blocks or follows up on a blind stop when work is in flight and supervision is not live.
+- **Event-driven, zero-token supervision** - a bash watcher sleeps on the fleet and wakes the first mate only when something needs you; Claude Code, Codex, OpenCode, and Grok also get a turn-end backstop that blocks or follows up on a blind stop when work is in flight and supervision is not live, while Pi remains watcher-only.
 - **Optional X mode** - opt in with one local `.env` token so firstmate can answer your public `@myfirstmate` mentions, act on normal reversible mention requests through the same lifecycle as chat requests, acknowledge spawned work, and post up to three public-safe completion follow-ups within seven days for genuine milestones and the final outcome without changing non-X behavior; dry-run preview records would-be replies and dismissals locally before go-live.
 - **Guarded by construction** - the first mate is read-only over your projects outside guarded clone refreshes, safe branch pruning, and approved `local-only` fast-forward merges; crewmates make every project change behind your merge approval.
 - **Restart-proof** - all state lives on disk and in the active session backend (tmux by hard default, herdr or cmux when selected or auto-detected, zellij/orca when explicitly selected); kill the session anytime and the next one reconciles, including confirmed-dead secondmate agents, and carries on.
@@ -77,7 +76,7 @@ Full detail on every feature lives in [docs/architecture.md](docs/architecture.m
 
 - A verified agent harness: Claude Code, Grok, Pi, Codex, or OpenCode.
 - Git and the GitHub CLI, authenticated through `gh auth login`.
-- tmux, for the reference session backend.
+- The selected runtime backend's tools; tmux is the default and reference backend, while [`docs/configuration.md`](docs/configuration.md#toolchain) owns the requirements for every backend.
 
 The first mate detects and offers to install everything else.
 
@@ -85,7 +84,7 @@ The first mate detects and offers to install everything else.
 
 **Claude Code, Grok, and Pi are equal co-primary recommendations** for running the primary firstmate session.
 Claude Code and Grok use background-notify wake cycles; Pi uses its tracked primary watcher extension.
-All three have verified turn-end guard paths when launched with their documented setup.
+Claude Code and Grok also have verified turn-end guard paths, while Pi supervision remains watcher-only.
 Pick whichever one matches your subscription and workflow.
 
 Codex and OpenCode are also verified and supported as primary harnesses; Codex uses bounded foreground checkpoints, and OpenCode uses a TUI plugin, so both carry more harness-specific supervision tradeoffs than the three co-primaries.
@@ -119,7 +118,7 @@ pi
 ```
 
 For Grok, `--trust` is needed once per clone so project hooks and the turn-end guard load; `/hooks-trust` inside Grok works too.
-For Pi, approve the project trust prompt once per clone on first launch so both tracked `.pi/extensions/*.ts` files auto-load.
+For Pi, approve the project trust prompt once per clone on first launch so the tracked watcher extension auto-loads.
 
 ### Talk to it
 
@@ -199,7 +198,7 @@ Firstmate's skills live in two separate places with different audiences:
 
 ## Documentation
 
-- [docs/kubernetes.md](docs/kubernetes.md) - run the Agent OS controller and isolated crewmates on local OrbStack Kubernetes.
+- [docs/kubernetes.md](docs/kubernetes.md) - install a persistent Firstmate and isolated crewmates on Kubernetes, with OrbStack as the local test profile.
 - [docs/acceptance.md](docs/acceptance.md) - requirement-to-evidence ledger for the full distributed Agent OS proof.
 - [docs/architecture.md](docs/architecture.md) - how the crew, supervision, worktrees, secondmates, and project modes work.
 - [docs/configuration.md](docs/configuration.md) - environment variables, `FM_HOME`, runtime backend selection, optional X mode, the files you set, and harness support.
@@ -210,7 +209,7 @@ Firstmate's skills live in two separate places with different audiences:
 - [docs/orca-backend.md](docs/orca-backend.md) - setup guide for the experimental Orca backend, plus its lifecycle notes and known gaps.
 - [docs/cmux-backend.md](docs/cmux-backend.md) - setup guide for the experimental cmux backend, plus its verification notes and known gaps.
 - [docs/codex-app-backend.md](docs/codex-app-backend.md) - Codex App backend boundary, evidence, and rollout contract.
-- [docs/turnend-guard.md](docs/turnend-guard.md) - the primary session's structural "no turn ends blind" backstop: verified per-harness hook mechanisms, scoping, loop safety, and fail-open tradeoffs.
+- [docs/turnend-guard.md](docs/turnend-guard.md) - the primary session's structural "no turn ends blind" backstop: hook mechanisms, scoping, loop safety, and fail-open tradeoffs.
 - [docs/supervision-protocols/](docs/supervision-protocols/) - rendered primary-harness watcher protocols for Claude, Codex, OpenCode, Pi, Grok, and unknown harness fallback.
 - [docs/scripts.md](docs/scripts.md) - the `bin/` toolbelt reference.
 - [`AGENTS.md`](AGENTS.md) - the distro's core instruction file and the first mate's full operating manual.
