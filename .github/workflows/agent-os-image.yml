@@ -473,8 +473,8 @@ jobs:
             done < "$CLAIM_CHAIN_FILE"
             decision=$(bin/agent-os-candidate-state.sh "$chain_state")
             IFS=$'\t' read -r candidate_action artifact_owner paired_build_owner <<EOF
-$decision
-EOF
+          $decision
+          EOF
             case "$candidate_action" in
               build)
                 artifact_owner=$CLAIM_OWNER

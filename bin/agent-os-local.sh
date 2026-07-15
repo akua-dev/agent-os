@@ -31,10 +31,10 @@ local_image_tag() {
 }
 
 render_profile_inputs() {
-  local image=$1 inputs=$2
-  awk -v image="$image" -v namespace="$NAMESPACE" '
+  local image=$1 inputs=$2 rendered_namespace=$NAMESPACE
+  awk -v image="$image" -v rendered_namespace="$rendered_namespace" '
     $1 == "image:" { print "image: " image; next }
-    $1 == "namespace:" { print "namespace: " namespace; next }
+    $1 == "namespace:" { print "namespace: " rendered_namespace; next }
     { print }
   ' "$PROFILE" > "$inputs"
 }
