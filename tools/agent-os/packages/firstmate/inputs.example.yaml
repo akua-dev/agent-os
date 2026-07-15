@@ -1,6 +1,5 @@
 namespace: agent-os
-installationId: 1f4e02ba-66c8-4b41-bfaf-8eea87c85455
-# Replace only with the immutable digest emitted by the protected-main image workflow.
+# Replace only with the immutable digest emitted by an Agent OS release.
 image: ghcr.io/akua-dev/agent-os@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 imagePullPolicy: IfNotPresent
 rbac: namespace
