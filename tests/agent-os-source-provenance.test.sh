@@ -101,47 +101,13 @@ assert_grep 'SOURCE_REVISION=${{ github.sha }}' "$ROOT/.github/workflows/agent-o
 # shellcheck disable=SC2016 # Match literal GitHub expression.
 assert_grep 'SOURCE_VERSION=${{ steps.metadata.outputs.version }}' "$ROOT/.github/workflows/agent-os-image.yml" \
   "image workflow must bind the OCI version label to metadata-action"
-assert_grep 'workflows: ["CI"]' "$ROOT/.github/workflows/agent-os-image.yml" \
-  "image publication must run only after the full CI workflow"
-assert_grep "github.event.workflow_run.conclusion == 'success'" "$ROOT/.github/workflows/agent-os-image.yml" \
-  "image publication must require successful CI"
-assert_grep "github.event.workflow_run.event == 'push'" "$ROOT/.github/workflows/agent-os-image.yml" \
-  "image publication must reject non-push CI runs"
-assert_grep "github.event.workflow_run.head_branch == 'main'" "$ROOT/.github/workflows/agent-os-image.yml" \
-  "image publication must require protected main"
+assert_grep 'uses: ./.github/workflows/ci.yml' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "image publication must run the reusable full CI workflow"
+assert_grep 'needs: [behavior, provenance, validate]' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "image publication must require behavior, provenance, and image validation"
 # shellcheck disable=SC2016 # Match literal GitHub expression.
-assert_grep 'ref: ${{ github.event.workflow_run.head_sha }}' "$ROOT/.github/workflows/agent-os-image.yml" \
-  "publication checkout must use the exact CI-approved commit"
-# shellcheck disable=SC2016 # Match literal GitHub expression.
-assert_grep 'SOURCE_REVISION=${{ github.event.workflow_run.head_sha }}' "$ROOT/.github/workflows/agent-os-image.yml" \
-  "published OCI provenance must use the exact CI-approved commit"
-assert_grep "github.event_name == 'workflow_run' && 'publish-main'" "$ROOT/.github/workflows/agent-os-image.yml" \
-  "protected-main publications must share one canceling concurrency group"
-assert_grep 'git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main' \
-  "$ROOT/.github/workflows/agent-os-image.yml" \
-  "publication must refresh protected main immediately before publishing"
-# shellcheck disable=SC2016 # Match literal shell source.
-assert_grep 'current_main=$(git rev-parse refs/remotes/origin/main)' \
-  "$ROOT/.github/workflows/agent-os-image.yml" \
-  "publication must resolve the current protected-main commit"
-# shellcheck disable=SC2016 # Match literal shell source.
-assert_grep 'if [ "$CI_HEAD_SHA" != "$current_main" ]; then' "$ROOT/.github/workflows/agent-os-image.yml" \
-  "publication must reject an out-of-order stale CI run"
-# shellcheck disable=SC2016 # Match literal GitHub expression.
-assert_grep 'outputs: type=oci,dest=${{ runner.temp }}/agent-os-image.tar' \
-  "$ROOT/.github/workflows/agent-os-image.yml" \
-  "publication must stage a verified multi-architecture OCI archive"
-assert_grep 'skopeo copy --all --preserve-digests' "$ROOT/.github/workflows/agent-os-image.yml" \
-  "publication must copy only the staged OCI archive after the freshness gate"
-assert_no_grep 'push: true' "$ROOT/.github/workflows/agent-os-image.yml" \
-  "publication must not combine a long build with its registry mutation"
-build_line=$(grep -n 'name: Build verified OCI archive' "$ROOT/.github/workflows/agent-os-image.yml" | cut -d: -f1)
-freshness_line=$(grep -n 'name: Reject stale protected-main runs' "$ROOT/.github/workflows/agent-os-image.yml" | cut -d: -f1)
-publish_line=$(grep -n 'skopeo copy --all --preserve-digests' "$ROOT/.github/workflows/agent-os-image.yml" | head -1 | cut -d: -f1)
-[ "$build_line" -lt "$freshness_line" ] && [ "$freshness_line" -lt "$publish_line" ] \
-  || fail "protected-main freshness must be checked after build and immediately before publication"
-assert_no_grep 'tags: ["v*"]' "$ROOT/.github/workflows/agent-os-image.yml" \
-  "arbitrary tag pushes must not trigger publication"
+assert_grep 'REF_PROTECTED: ${{ github.ref_protected }}' "$ROOT/.github/workflows/agent-os-image.yml" \
+  "protected-main publication must bind GitHub's branch-protection result"
 for action in \
   'actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10' \
   'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02' \
