@@ -1,0 +1,7 @@
+# Local profile for OrbStack's image store and isolated demo cluster.
+namespace: agent-os-demo
+image: agent-os:dev
+imagePullPolicy: Never
+allowMutableImage: true
+rbac: cluster-admin
+storage: 20Gi

@@ -1,0 +1,12 @@
+**
+!Dockerfile
+!image/
+image/**
+!image/debian.sources
+!image/npm/
+image/npm/**
+!image/npm/package.json
+!image/npm/package-lock.json
+!image/agent-os-source.tar
+!image/agent-os-bootstrap.tar
+!image/agent-os-source.attestation

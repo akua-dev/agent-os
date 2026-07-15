@@ -1,0 +1,18 @@
+metadata:
+  annotations:
+    agent-os.dev/akua-auth-secret: null
+    agent-os.dev/akua-auth-rejected-record: null
+spec:
+  template:
+    spec:
+      containers:
+        - name: firstmate
+          env:
+            - name: AKUA_AUTH_HEADER_FILE
+              $patch: delete
+          volumeMounts:
+            - mountPath: /var/run/secrets/agent-os/akua
+              $patch: delete
+      volumes:
+        - name: akua-auth
+          $patch: delete

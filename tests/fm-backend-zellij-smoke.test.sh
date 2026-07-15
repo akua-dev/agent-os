@@ -20,6 +20,19 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fail() { printf 'not ok - %s\n' "$1" >&2; cleanup_all; exit 1; }
 pass() { printf 'ok - %s\n' "$1"; }
 
+wait_for_tmp_current_path() {  # <target>
+  local target=$1 actual="" deadline=$((SECONDS + 15))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    actual=$(fm_backend_zellij_current_path "$target") || actual=""
+    case "$actual" in
+      */tmp) printf '%s' "$actual"; return 0 ;;
+    esac
+    sleep 0.2
+  done
+  printf '%s' "$actual"
+  return 1
+}
+
 command -v zellij >/dev/null 2>&1 || { echo "skip: zellij not found"; exit 0; }
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the zellij adapter)"; exit 0; }
 
@@ -126,8 +139,7 @@ pass "real zellij: capture supports viewport-sized reads and larger full-scrollb
 # --- current_path -------------------------------------------------------------
 
 fm_backend_zellij_send_text_line "$TARGET" "cd /tmp"
-sleep 0.3
-p=$(fm_backend_zellij_current_path "$TARGET") || fail "current_path failed"
+p=$(wait_for_tmp_current_path "$TARGET") || fail "current_path failed"
 case "$p" in
   */tmp) : ;;
   *) fail "real zellij: current_path did not report the pane's cwd after cd /tmp, got '$p'" ;;

@@ -65,6 +65,7 @@ Never add an agent name as co-author.
 `FM_HOME` selects the operational home for a firstmate instance.
 When it is unset, most scripts use this repo root as the home, which is today's behavior.
 When it is set, scripts still use their own `bin/` from the repo they live in, but operational dirs come from `$FM_HOME`: `state/`, `data/`, `config/`, and `projects/`.
+When `FM_HOME` is set, never create or read operational state through repo-relative `state/`, `data/`, `config/`, or `projects/` paths; use `$FM_HOME/...` or firstmate scripts that resolve it.
 Existing overrides remain compatible: `FM_STATE_OVERRIDE` can still point at a custom state dir, and `FM_ROOT_OVERRIDE` still behaves like the old whole-root override when `FM_HOME` is unset.
 `bin/fm-send.sh` is the fail-closed exception: it requires `FM_HOME` to be set so target resolution is always scoped to an explicit firstmate home.
 Each secondmate gets its own persistent `FM_HOME`, so its local state, backlog, projects, and session lock are isolated from the main firstmate.
@@ -756,7 +757,7 @@ Adjust the other sections only when the task genuinely deviates from the standar
 firstmate is its own repo behind the no-mistakes gate, so improvements to `AGENTS.md`, `bin/`, `.agents/skills/`, and public `skills/` reach `main` and then wait for each running firstmate to pull them.
 Only `AGENTS.md`, `bin/`, and `.agents/skills/` are a running firstmate instruction surface; public `skills/` is tracked for installers and is not loaded by firstmate.
 When the captain invokes `/updatefirstmate` or asks to update firstmate, load the `/updatefirstmate` skill.
-It performs only fast-forward self-updates of firstmate and registered secondmate homes, re-reads `AGENTS.md` when needed, nudges updated live secondmates, and never touches anything under `projects/`.
+That skill owns the source-policy split: mutable checkouts update by guarded fast-forward, while immutable candidate/release images refuse in-place source updates and move only through an image-digest upgrade.
 
 ## 13. Agent-only reference skills
 
@@ -770,6 +771,8 @@ These skills are not captain-invocable; they are conditional operating reference
 - `fmx-respond` - load on an `x-mention <request_id>` `check:` wake to handle the mention, on an `x-mode-error ...` `check:` wake to report the X-mode configuration blocker, and on any milestone or terminal wake for an X-mode-linked task before posting its completion follow-up; relevant only when X mode is on.
 - `firstmate-codexapp` - load before coordinating a visible Codex Desktop thread, evaluating a Codex App backend request, or reconciling Codex Desktop host-tool smoke evidence for Firstmate work.
 - `firstmate-coding-guidelines` - load before changing firstmate's shared, tracked material, as defined by section 1's list, whether editing directly or briefing a crewmate for a firstmate-repo task.
+- `kubernetes-fleet` - load before creating, supervising, recovering, or deleting Kubernetes-backed crewmates.
+- `akua-intelligence-bootstrap` - load before provisioning, recovering, or handing off a Firstmate in an Akua-managed intelligence cluster.
 
 ## 14. X mode
 

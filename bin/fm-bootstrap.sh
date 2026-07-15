@@ -43,8 +43,10 @@
 #          "treehouse get --lease" support.
 #          no-mistakes is also MISSING when its installed version is older than
 #          1.31.2.
-#          tasks-axi and quota-axi are required bootstrap tools (same class as
-#          lavish-axi). tasks-axi is also version and feature gated (0.1.1+
+#          Akua is optional and required only when an Agent OS Kubernetes or
+#          Akua integration path invokes it.
+#          tasks-axi and quota-axi are required bootstrap tools in the same class as
+#          lavish-axi. tasks-axi is also version and feature gated (0.1.1+
 #          with update --archive-body and mv [<id>...]); an installed but incompatible build
 #          reports MISSING like no-mistakes. When
 #          config/backlog-backend is not manual and tasks-axi is compatible,
@@ -314,6 +316,7 @@ install_cmd() {
     tmux|node|git|gh|curl|jq|orca) echo "brew install $1  # or the platform's package manager" ;;
     treehouse) echo "curl -fsSL https://kunchenguid.github.io/treehouse/install.sh | sh" ;;
     no-mistakes) echo "curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh | sh" ;;
+    akua) echo "curl -fsSL https://cli.akua.dev/install | sh" ;;
     gh-axi|chrome-devtools-axi|lavish-axi) echo "npm install -g $1 && $1 setup hooks" ;;
     tasks-axi|quota-axi) echo "npm install -g $1" ;;
     *) return 1 ;;

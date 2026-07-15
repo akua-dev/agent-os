@@ -1,0 +1,21 @@
+metadata:
+  annotations:
+    agent-os.dev/akua-auth-secret: __AKUA_AUTH_SECRET__
+    agent-os.dev/akua-auth-rejected-record: null
+spec:
+  template:
+    spec:
+      containers:
+        - name: firstmate
+          env:
+            - name: AKUA_AUTH_HEADER_FILE
+              value: /var/run/secrets/agent-os/akua/authorization
+          volumeMounts:
+            - name: akua-auth
+              mountPath: /var/run/secrets/agent-os/akua
+              readOnly: true
+      volumes:
+        - name: akua-auth
+          secret:
+            secretName: __AKUA_AUTH_SECRET__
+            defaultMode: 256

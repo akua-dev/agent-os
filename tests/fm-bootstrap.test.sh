@@ -27,7 +27,7 @@ TMP_ROOT=$(fm_test_tmproot fm-bootstrap-tests)
 make_fake_toolchain() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
-  fm_fake_exit0 "$fakebin" tmux node gh-axi chrome-devtools-axi lavish-axi
+  fm_fake_exit0 "$fakebin" tmux node akua gh-axi chrome-devtools-axi lavish-axi
   cat > "$fakebin/gh" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = auth ] && [ "${2:-}" = status ]; then
@@ -327,6 +327,20 @@ SH
   pass "bootstrap requires git with an install instruction"
 }
 
+test_akua_is_optional_for_routine_bootstrap() {
+  local case_dir fakebin out
+  case_dir="$TMP_ROOT/akua-optional"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  rm -f "$fakebin/akua"
+
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  [ -z "$out" ] || fail "routine bootstrap must not require optional Akua tooling, got: $out"
+  pass "routine bootstrap leaves Akua tooling optional"
+}
+
 test_orca_backend_gates_orca_tool_only_when_selected() {
   local case_dir fakebin out missing_orca
   missing_orca="MISSING: orca (install: brew install orca  # or the platform's package manager)"
@@ -495,6 +509,7 @@ ROWS
 test_bootstrap_reporting
 test_no_mistakes_min_version
 test_git_is_required_with_supported_install_instruction
+test_akua_is_optional_for_routine_bootstrap
 test_orca_backend_gates_orca_tool_only_when_selected
 test_fleet_sync_timeout_scales_with_origin_backed_project_count
 test_fleet_sync_timeout_floor_preserves_small_fleets

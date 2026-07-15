@@ -45,6 +45,17 @@ An agent distro is a portable directory of instructions, skills, tooling, polici
 There is no app to install: the cloned repo is the distro - `AGENTS.md`, bundled firstmate skills, and helper scripts that any terminal coding agent can follow.
 Launching a supported harness inside it instantiates your first mate - and makes you the captain.
 
+This Agent OS fork also packages the distro for Kubernetes: one persistent
+first mate can allocate isolated, persistent crewmate containers using ordinary
+`kubectl`, while Herdr keeps every agent terminal visible. Follow the
+[Agent OS Kubernetes quickstart](docs/kubernetes.md) to render the one public
+package for any conformant cluster. OrbStack is a local test profile of that
+same package, not a separate installer.
+
+Agent OS works on Kubernetes and is better with Akua.
+The portable core can be built and tested on local OrbStack without an Akua account, API key, managed control plane, or Akua-hosted worker, and is intended for any conformant Kubernetes cluster.
+Akua adds the preferred credential-to-cluster bootstrap, managed capacity, identity and secret primitives, and guarded product delivery; it is an integration advantage, not a dependency of the core runtime.
+
 ## Features
 
 - **One liaison** - you talk only to the first mate; it dispatches, supervises, escalates only real decisions, and reports plain outcomes.
@@ -171,7 +182,7 @@ Claude and grok use the slash form shown here; codex uses the same names with `$
 | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `/afk`             | Enter away-mode supervision: the sub-supervisor self-handles routine wakes in bash, escalates captain-relevant events and bounded declared-external-wait rechecks as batched digests, and actively alerts if delivery wedges while you step away |
 | `/bearings`        | Generate a "pick up where I left off" status report from the read-only fleet snapshot - backlog, per-task crew state, open PRs, scout reports, pending decisions, and date-gated queued work - written to a dated file in `data/` and surfaced concisely in chat; read-mostly, mutates no task state |
-| `/updatefirstmate` | Self-update the running firstmate and its secondmates to the latest from origin with fast-forward-only pulls, then re-read instructions and nudge secondmates |
+| `/updatefirstmate` | Update mutable-source firstmates by guarded fast-forward; immutable candidate/release installs report that they require an image-digest upgrade |
 | `/stow`            | Sweep the session for uncaptured durable knowledge, route each finding to its disk home per AGENTS.md, file undone next steps to the backlog, and report what is now safe to reset |
 
 Agent-only reference skills live under `.agents/skills/` and are loaded by firstmate at the trigger points named in [`AGENTS.md`](AGENTS.md).
@@ -188,6 +199,8 @@ Firstmate's skills live in two separate places with different audiences:
 
 ## Documentation
 
+- [docs/kubernetes.md](docs/kubernetes.md) - run the Agent OS controller and isolated crewmates on local OrbStack Kubernetes.
+- [docs/acceptance.md](docs/acceptance.md) - requirement-to-evidence ledger for the full distributed Agent OS proof.
 - [docs/architecture.md](docs/architecture.md) - how the crew, supervision, worktrees, secondmates, and project modes work.
 - [docs/configuration.md](docs/configuration.md) - environment variables, `FM_HOME`, runtime backend selection, optional X mode, the files you set, and harness support.
 - [docs/wedge-alarm.md](docs/wedge-alarm.md) - configure the active alert for a wedged away-mode escalation delivery.

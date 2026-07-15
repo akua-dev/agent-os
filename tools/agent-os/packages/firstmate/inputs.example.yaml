@@ -1,0 +1,6 @@
+namespace: agent-os
+# Replace only with the immutable digest emitted by an Agent OS release.
+image: ghcr.io/akua-dev/agent-os@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+imagePullPolicy: IfNotPresent
+rbac: namespace
+storage: 20Gi

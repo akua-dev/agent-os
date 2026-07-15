@@ -218,10 +218,8 @@ The refresh also prunes local branches whose remote is gone and that no worktree
 
 ## Self-updates stay safe
 
-`/updatefirstmate` fast-forwards the running firstmate repo and registered secondmate homes from `origin`, then re-reads updated instructions and nudges updated secondmates without touching project clones.
-The update is fast-forward only: dirty, diverged, offline, and off-default targets are reported and left untouched.
-The origin-based updater and the local secondmate sync share the same guarded fast-forward helper; only the origin mode fetches.
-The mechanics are owned by the `/updatefirstmate` skill and firstmate's operating manual in [`AGENTS.md`](../AGENTS.md) (self-update).
+The [`/updatefirstmate` skill](../.agents/skills/updatefirstmate/SKILL.md) owns the source-policy contract and procedure.
+Mutable-source installations use guarded origin fast-forwards, while immutable candidate/release images refuse in-place source changes and update only through a new image digest.
 
 ## Restart-proof
 
